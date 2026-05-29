@@ -26,6 +26,9 @@ enum Command {
     /// Compare two still images decoded by the image crate.
     #[command(alias = "i")]
     Image(ImageCmd),
+    /// Report still-image statistics, color balance, histograms, and tendencies.
+    #[command(alias = "s", alias = "stat")]
+    Stats(StatsCmd),
     /// Compare two videos by piping RGBA frames from ffmpeg stdout.
     #[cfg(feature = "ffmpeg")]
     #[command(alias = "v")]
@@ -62,11 +65,25 @@ struct ImageCmd {
     #[arg(long)]
     json: bool,
     /// Include per-image statistics, color balance, histograms, and tendencies.
-    #[arg(long)]
+    #[arg(short, long)]
     stats: bool,
     /// Number of histogram bins to emit when --stats is used.
     #[arg(long, default_value_t = 16)]
     histogram_bins: usize,
+    #[command(flatten)]
+    output: OutputArgs,
+}
+
+#[derive(Debug, Args)]
+struct StatsCmd {
+    /// Input image.
+    input: PathBuf,
+    /// Number of histogram bins to emit.
+    #[arg(long, default_value_t = 16)]
+    histogram_bins: usize,
+    /// Print JSON instead of text.
+    #[arg(long)]
+    json: bool,
     #[command(flatten)]
     output: OutputArgs,
 }
@@ -92,7 +109,7 @@ struct CompareCmd {
     #[arg(long, default_value = "psnr,ssim,mse,mae,maxae")]
     metrics: String,
     /// Include image statistics, color balance, histograms, and tendencies.
-    #[arg(long)]
+    #[arg(short, long)]
     stats: bool,
     /// Number of histogram bins to emit when --stats is used.
     #[arg(long, default_value_t = 16)]
@@ -309,6 +326,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Compare(cmd) => run_compare(cmd),
         Command::Image(cmd) => run_image(cmd),
+        Command::Stats(cmd) => run_stats(cmd),
         #[cfg(feature = "ffmpeg")]
         Command::Video(cmd) => run_video(cmd),
         #[cfg(feature = "ffmpeg")]
@@ -319,6 +337,15 @@ fn main() -> Result<()> {
         Command::Preview(cmd) => run_preview(cmd),
         Command::Tui(cmd) => run_tui(cmd),
     }
+}
+
+fn run_stats(cmd: StatsCmd) -> Result<()> {
+    run_image_stats(
+        &cmd.input,
+        cmd.histogram_bins,
+        output_format(cmd.json, cmd.output.format),
+        &cmd.output,
+    )
 }
 
 fn run_compare(cmd: CompareCmd) -> Result<()> {

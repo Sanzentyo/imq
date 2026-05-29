@@ -38,8 +38,9 @@ Compare images or videos with automatic handling based on file extensions:
 ```bash
 cargo run --bin imq -- compare reference.png distorted.webp --metrics psnr,ssim,mse,mae,maxae
 cargo run --bin imq -- compare reference.mp4 distorted.mp4 --every 30 --max-frames 120
-cargo run --bin imq -- compare image.png --stats --format yaml
-cargo run --bin imq -- compare reference.png distorted.webp --stats --format json
+cargo run --bin imq -- c image.png -s --format yaml
+cargo run --bin imq -- compare reference.png distorted.webp -s --format json
+cargo run --bin imq -- stats image.png --format toml
 ```
 
 Explicit still-image comparison remains available:
@@ -59,11 +60,11 @@ cargo run --bin imq -- video reference.mp4 distorted.mp4 --width 1920 --height 1
 cargo run --bin imq -- video reference.mp4 distorted.mp4 --format toml --output video-report.toml
 ```
 
-Structured output is available on `compare`, `image`, `video`, `probe`, and
-`formats` with `--format text|json|yaml|toml|csv`; `--json` is kept as an alias
-for `--format json`. Use `--output PATH` to write the selected representation to
-a file. Use `--sqlite PATH` to append reports, metric rows, probe rows, image
-statistics, and format hints to SQLite tables.
+Structured output is available on `compare`, `stats`, `image`, `video`, `probe`,
+and `formats` with `--format text|json|yaml|toml|csv`; `--json` is kept as an
+alias for `--format json`. Use `--output PATH` to write the selected
+representation to a file. Use `--sqlite PATH` to append reports, metric rows,
+probe rows, image statistics, and format hints to SQLite tables.
 
 Extract one decoded video frame:
 

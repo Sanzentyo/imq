@@ -25,15 +25,17 @@ ffprobe -version
 ## Compare Automatically
 
 Prefer `compare` for ordinary use; it chooses still-image or video comparison
-from file extensions. Use `--stats` to add image statistics, color balance,
+from file extensions. Use `--stats`/`-s` to add image statistics, color balance,
 histograms, and visual tendency labels. With a single image plus `--stats`,
-`compare` reports statistics without requiring a distorted image.
+`compare` reports statistics without requiring a distorted image. Use `stats`
+(`stat`/`s`) when only image statistics are needed.
 
 ```bash
 imq compare reference.png distorted.png --metrics psnr,ssim,mse,mae,maxae
+imq c reference.png distorted.png -s --format json
 imq compare reference.mp4 distorted.mp4 --every 30 --max-frames 120
-imq compare image.png --stats --format yaml
-imq compare reference.png distorted.png --stats --format json
+imq compare image.png -s --format yaml
+imq stats image.png --format toml
 ```
 
 ## Compare Still Images
@@ -56,11 +58,11 @@ Metric domains:
 
 Use `imq formats` to list the image adapter's supported format hints.
 
-Structured output is supported by `compare`, `image`, `video`, `probe`, and
-`formats` with `--format text|json|yaml|toml|csv`. `--json` is a compatibility
-alias for `--format json`. Use `--output PATH` to write the selected
-representation to a file, and `--sqlite PATH` to append reports, metric rows,
-probe rows, image statistics, and format hints to a SQLite database.
+Structured output is supported by `compare`, `stats`, `image`, `video`, `probe`,
+and `formats` with `--format text|json|yaml|toml|csv`. `--json` is a
+compatibility alias for `--format json`. Use `--output PATH` to write the
+selected representation to a file, and `--sqlite PATH` to append reports, metric
+rows, probe rows, image statistics, and format hints to a SQLite database.
 
 ## Compare Videos
 
