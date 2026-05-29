@@ -116,12 +116,14 @@ mode prefers Kitty graphics protocol for terminals such as Ghostty, then Sixel,
 then ANSI blocks. Use `--display kitty`, `--display sixel`, `IMQ_KITTY=1`,
 `IMQ_NO_KITTY=1`, `IMQ_SIXEL=1`, or `IMQ_NO_SIXEL=1` to override detection.
 `--fit contain|cover|stretch` controls aspect handling. Video thumbnails are
-extracted through `ffmpeg`. Preview generation does not upscale past source
-dimensions. In the TUI, pressing `+` at the selected file's source dimensions
-switches to `max`, and `max` uses each newly selected file's own maximum preview
-resolution. `--decode
-auto` tries detected hardware decode backends and falls back to CPU unless the
-build uses the `cpu-only` feature.
+extracted through `ffmpeg`. When a small source needs to fill the terminal-based
+display area, preview uses nearest-neighbor enlargement so source pixels become
+larger; shrink paths use `fast_image_resize`. In the TUI, the initial preview
+resolution is derived from the current preview panel area and terminal font
+size. Pressing `+` at the selected file's source dimensions switches to `max`,
+and `max` uses each newly selected file's own maximum preview resolution.
+`--decode auto` tries detected hardware decode backends and falls back to CPU
+unless the build uses the `cpu-only` feature.
 
 Subcommand aliases are available: `i` for `image`, `v` for `video`, `p` for
 `preview`, `t` for `tui`, `fmt` for `formats`, and `x`/`extract` for

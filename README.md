@@ -117,11 +117,14 @@ default than ANSI block rendering, without an artificial fixed maximum. Auto
 mode prefers Kitty graphics protocol for terminals such as Ghostty, then Sixel,
 then ANSI blocks. Use `--display kitty`, `--display sixel`, `IMQ_KITTY=1`,
 `IMQ_NO_KITTY=1`, `IMQ_SIXEL=1`, or `IMQ_NO_SIXEL=1` to override auto
-detection. Fit modes are
-`contain`, `cover`, and `stretch`. Preview generation does not upscale past the
-source image dimensions. In the TUI, use `+`/`-` to change preview resolution
-and `f` to cycle the fit mode; pressing `+` at the source dimensions switches to
-`max`, which keeps using each selected file's own maximum preview resolution.
+detection. Fit modes are `contain`, `cover`, and `stretch`. When `preview` needs
+to enlarge a small source to fill the terminal-derived display area, it uses
+nearest-neighbor scaling so source pixels become larger instead of blurred.
+Shrink paths use `fast_image_resize`. In the TUI, the initial preview
+resolution is derived from the current preview panel area and terminal font
+size; use `+`/`-` to change preview resolution and `f` to cycle the fit mode.
+Pressing `+` at the source dimensions switches to `max`, which keeps using each
+selected file's own maximum preview resolution.
 The TUI queries the terminal for native image support and renders through Kitty,
 Sixel, or iTerm2 protocols when available, falling back to half-blocks. Decoded
 previews are resized with `fast_image_resize` and cached in memory; use

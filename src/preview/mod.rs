@@ -164,8 +164,16 @@ fn dynamic_to_preview(
     source: String,
 ) -> PreviewImage {
     let (width, height) = image.dimensions();
-    let max_width = max_width.clamp(1, width.max(1));
-    let max_height = max_height.clamp(1, height.max(1));
+    let max_width = if max_width == u32::MAX {
+        width.max(1)
+    } else {
+        max_width.max(1)
+    };
+    let max_height = if max_height == u32::MAX {
+        height.max(1)
+    } else {
+        max_height.max(1)
+    };
     let resized = match fit {
         FitMode::Contain => {
             let scale =
@@ -201,6 +209,26 @@ fn dynamic_to_preview(
 }
 
 fn fast_resize_rgb(image: &DynamicImage, target_width: u32, target_height: u32) -> DynamicImage {
+    let source_width = image.width();
+    let source_height = image.height();
+    if target_width >= source_width && target_height >= source_height {
+        return image.resize_exact(target_width, target_height, FilterType::Nearest);
+    }
+
+    let shrink_width = target_width.min(source_width);
+    let shrink_height = target_height.min(source_height);
+    let shrunk = if shrink_width < source_width || shrink_height < source_height {
+        fir_resize_rgb(image, shrink_width, shrink_height)
+    } else {
+        image.clone()
+    };
+    if target_width > shrink_width || target_height > shrink_height {
+        return shrunk.resize_exact(target_width, target_height, FilterType::Nearest);
+    }
+    shrunk
+}
+
+fn fir_resize_rgb(image: &DynamicImage, target_width: u32, target_height: u32) -> DynamicImage {
     let src = DynamicImage::ImageRgb8(image.to_rgb8());
     let mut dst = DynamicImage::new_rgb8(target_width, target_height);
     let mut resizer = Resizer::new();
@@ -234,16 +262,11 @@ mod tests {
     }
 
     #[test]
-    fn preview_does_not_upscale_past_source() {
+    fn preview_upscales_with_nearest_neighbor() {
         let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(8, 6, Rgb([255, 0, 0])));
-        let preview = dynamic_to_preview(
-            image,
-            u32::MAX,
-            u32::MAX,
-            FitMode::Contain,
-            "test".to_string(),
-        );
-        assert_eq!((preview.width, preview.height), (8, 6));
+        let preview = dynamic_to_preview(image, 16, 16, FitMode::Contain, "test".to_string());
+        assert_eq!((preview.width, preview.height), (16, 12));
         assert_eq!((preview.source_width, preview.source_height), (8, 6));
+        assert!(preview.pixels.iter().all(|pixel| *pixel == [255, 0, 0]));
     }
 }

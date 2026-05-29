@@ -1477,7 +1477,14 @@ fn run_preview(cmd: PreviewCmd) -> Result<()> {
         bail!("at least one input path is required");
     }
     let (columns, rows) = preview_layout(cmd.inputs.len(), cmd.rows, cmd.cols);
-    let default_size = default_preview_size(columns, rows);
+    let display = match cmd.display {
+        PreviewDisplayArg::Auto => DisplayMode::Auto,
+        PreviewDisplayArg::Kitty => DisplayMode::Kitty,
+        PreviewDisplayArg::Sixel => DisplayMode::Sixel,
+        PreviewDisplayArg::Ansi => DisplayMode::Ansi,
+        PreviewDisplayArg::None => DisplayMode::None,
+    };
+    let default_size = default_preview_size(columns, rows, cmd.display);
     let size = cmd.size.unwrap_or(PreviewSize {
         width: cmd.width.unwrap_or(default_size.width),
         height: cmd.height.unwrap_or(default_size.height),
@@ -1508,13 +1515,6 @@ fn run_preview(cmd: PreviewCmd) -> Result<()> {
         eprintln!("[{}] {}", index + 1, input.display());
     }
     let image = montage_previews(&previews, Some(rows), Some(columns));
-    let display = match cmd.display {
-        PreviewDisplayArg::Auto => DisplayMode::Auto,
-        PreviewDisplayArg::Kitty => DisplayMode::Kitty,
-        PreviewDisplayArg::Sixel => DisplayMode::Sixel,
-        PreviewDisplayArg::Ansi => DisplayMode::Ansi,
-        PreviewDisplayArg::None => DisplayMode::None,
-    };
     print!("{}", render_preview(&image, display));
     Ok(())
 }
@@ -1550,12 +1550,20 @@ fn preview_layout(count: usize, rows: Option<usize>, cols: Option<usize>) -> (us
 }
 
 #[cfg_attr(not(feature = "preview"), allow(dead_code))]
-fn default_preview_size(columns: usize, rows: usize) -> PreviewSize {
-    let sixel = {
+fn default_preview_size(columns: usize, rows: usize, display: PreviewDisplayArg) -> PreviewSize {
+    #[cfg(not(feature = "preview"))]
+    let _ = display;
+    let native_pixels = {
         #[cfg(feature = "preview")]
         {
-            let capabilities = imq::preview::terminal_capabilities();
-            capabilities.kitty || capabilities.sixel
+            match display {
+                PreviewDisplayArg::Kitty | PreviewDisplayArg::Sixel => true,
+                PreviewDisplayArg::Auto => {
+                    let capabilities = imq::preview::terminal_capabilities();
+                    capabilities.kitty || capabilities.sixel
+                }
+                PreviewDisplayArg::Ansi | PreviewDisplayArg::None => false,
+            }
         }
         #[cfg(not(feature = "preview"))]
         {
@@ -1580,7 +1588,7 @@ fn default_preview_size(columns: usize, rows: usize) -> PreviewSize {
         .checked_div(rows as u32)
         .unwrap_or(24)
         .max(8);
-    let (x_scale, y_scale) = if sixel { (8, 16) } else { (1, 2) };
+    let (x_scale, y_scale) = if native_pixels { (10, 20) } else { (1, 2) };
     PreviewSize {
         width: cell_width.saturating_mul(x_scale),
         height: cell_height.saturating_mul(y_scale),
@@ -1832,6 +1840,7 @@ mod tui_app {
             metrics_csv: String,
             preview_picker: Picker,
             preview_cache_capacity: usize,
+            preview_resolution: PreviewResolution,
         ) -> Result<Self> {
             let cwd = initial_cwd(
                 initial_dir.as_deref(),
@@ -1847,10 +1856,7 @@ mod tui_app {
                 preview_protocol: None,
                 preview_picker,
                 preview_cache: PreviewCache::new(preview_cache_capacity),
-                preview_resolution: PreviewResolution::Fixed {
-                    width: 192,
-                    height: 96,
-                },
+                preview_resolution,
                 preview_fit: imq::preview::FitMode::Contain,
                 cwd,
                 entries: Vec::new(),
@@ -2139,6 +2145,11 @@ mod tui_app {
         let preview_picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
+        let terminal_size = terminal.size()?;
+        let preview_resolution = default_tui_preview_resolution(
+            Rect::new(0, 0, terminal_size.width, terminal_size.height),
+            &preview_picker,
+        );
         let mut app = match App::new(
             reference,
             distorted,
@@ -2146,6 +2157,7 @@ mod tui_app {
             metrics_csv,
             preview_picker,
             preview_cache_capacity,
+            preview_resolution,
         ) {
             Ok(app) => app,
             Err(err) => {
@@ -2384,7 +2396,7 @@ mod tui_app {
         frame.render_widget(inner, area);
         if let Some(protocol) = &mut app.preview_protocol {
             frame.render_stateful_widget(
-                StatefulImage::default().resize(Resize::Fit(None)),
+                StatefulImage::default().resize(Resize::Scale(None)),
                 content_area,
                 protocol,
             );
@@ -2436,6 +2448,34 @@ mod tui_app {
             .for_each(|pixel| raw.extend_from_slice(pixel));
         image::RgbImage::from_raw(preview.width, preview.height, raw)
             .map(image::DynamicImage::ImageRgb8)
+    }
+
+    fn default_tui_preview_resolution(
+        terminal_area: Rect,
+        preview_picker: &Picker,
+    ) -> PreviewResolution {
+        let body = Layout::default()
+            .direction(LayoutDirection::Vertical)
+            .constraints([
+                Constraint::Length(7),
+                Constraint::Min(5),
+                Constraint::Length(2),
+            ])
+            .split(terminal_area);
+        let columns = Layout::default()
+            .direction(LayoutDirection::Horizontal)
+            .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+            .split(body[1]);
+        let right = Layout::default()
+            .direction(LayoutDirection::Vertical)
+            .constraints([Constraint::Length(17), Constraint::Min(5)])
+            .split(columns[1]);
+        let content_area = panel_block(" preview ").inner(right[0]);
+        let font_size = preview_picker.font_size();
+        PreviewResolution::Fixed {
+            width: u32::from(content_area.width.max(1)) * u32::from(font_size.width.max(1)),
+            height: u32::from(content_area.height.max(1)) * u32::from(font_size.height.max(1)),
+        }
     }
 
     fn fitted_preview_cells(preview: &imq::preview::PreviewImage, area: Rect) -> (u32, u32) {
