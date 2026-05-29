@@ -62,7 +62,9 @@ cargo run --bin imq -- tui
 
 The TUI shows a colorized metric table and an image file browser. Use the
 browser to move through folders and assign images to the reference/distorted
-slots without restarting the program.
+slots without restarting the program. It supports Vim-style navigation:
+`j`/`k` move, `h` goes to the parent directory, `l` opens/selects, and `g`/`G`
+jump to the first/last entry.
 
 List still-image formats exposed by the image adapter:
 

@@ -90,7 +90,9 @@ imq tui
 
 The TUI includes a file browser. Use it to move through folders and set
 reference/distorted images without restarting. When testing non-interactively,
-run it in a PTY and send `q` or Esc to exit.
+run it in a PTY and send `q` or Esc to exit. Vim-style navigation is supported:
+`j`/`k` move, `h` goes to the parent directory, `l` opens/selects, and `g`/`G`
+jump to the first/last entry.
 
 ## GPU and NN Features
 

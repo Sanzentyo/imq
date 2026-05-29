@@ -606,6 +606,26 @@ mod tui_app {
             self.move_selection(delta * step);
         }
 
+        fn first_selection(&mut self) {
+            self.selected = 0;
+            self.sync_list_state();
+            self.update_preview();
+        }
+
+        fn last_selection(&mut self) {
+            self.selected = self.entries.len().saturating_sub(1);
+            self.sync_list_state();
+            self.update_preview();
+        }
+
+        fn parent_directory(&mut self) {
+            if let Some(parent) = self.cwd.parent() {
+                self.cwd = parent.to_path_buf();
+                self.selected = 0;
+                self.refresh_entries();
+            }
+        }
+
         fn open_or_select(&mut self) {
             let Some(entry) = self.entries.get(self.selected).cloned() else {
                 return;
@@ -756,10 +776,14 @@ mod tui_app {
                 render_metrics(frame, right[1], &app);
 
                 let footer = Paragraph::new(Line::from(vec![
-                    Span::styled("Up/Down", Style::default().fg(Color::Cyan)),
+                    Span::styled("j/k", Style::default().fg(Color::Cyan)),
                     Span::raw(" move  "),
+                    Span::styled("h/l", Style::default().fg(Color::Green)),
+                    Span::raw(" back/open  "),
                     Span::styled("Enter", Style::default().fg(Color::Green)),
                     Span::raw(" open/set  "),
+                    Span::styled("g/G", Style::default().fg(Color::Cyan)),
+                    Span::raw(" top/end  "),
                     Span::styled("Tab", Style::default().fg(Color::Yellow)),
                     Span::raw(" target  "),
                     Span::styled("r/d", Style::default().fg(Color::Yellow)),
@@ -773,11 +797,14 @@ mod tui_app {
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break Ok::<(), anyhow::Error>(()),
-                    KeyCode::Up => app.move_selection(-1),
-                    KeyCode::Down => app.move_selection(1),
+                    KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
+                    KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
                     KeyCode::PageUp => app.page_selection(-1),
                     KeyCode::PageDown => app.page_selection(1),
-                    KeyCode::Enter => app.open_or_select(),
+                    KeyCode::Home | KeyCode::Char('g') => app.first_selection(),
+                    KeyCode::End | KeyCode::Char('G') => app.last_selection(),
+                    KeyCode::Left | KeyCode::Char('h') => app.parent_directory(),
+                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => app.open_or_select(),
                     KeyCode::Tab => {
                         app.active_slot = app.active_slot.toggle();
                         app.status = format!("Target: {}", app.active_slot.label());
