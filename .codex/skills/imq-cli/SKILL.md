@@ -1,6 +1,6 @@
 ---
 name: imq-cli
-description: Use the `imq` command-line tool for full-reference image and video quality evaluation. Trigger when Codex needs to compare reference/distorted images or videos, compute PSNR/SSIM/MSE/RMSE/MAE/maxAE, produce JSON metric reports, list supported still-image formats, probe video metadata, extract video frames, or run the optional TUI.
+description: Use the `imq` command-line tool for full-reference image and video quality evaluation. Trigger when Codex needs to compare reference/distorted images or videos, compute PSNR/SSIM/MSE/RMSE/MAE/maxAE, produce JSON metric reports, list supported still-image formats, probe video metadata, extract video frames, or run the TUI.
 ---
 
 # imq CLI
@@ -65,10 +65,10 @@ imq extract-frame input.mp4 150 frame-150.png
 
 ## TUI
 
-The `tui` subcommand requires the `tui` feature in the source repo:
+The `tui` subcommand is enabled by default:
 
 ```bash
-cargo run --quiet --features tui --bin imq -- tui reference.png distorted.png
+imq tui reference.png distorted.png
 ```
 
 When testing non-interactively, run it in a PTY and send `q` or Esc to exit.

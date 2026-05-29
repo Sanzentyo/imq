@@ -19,7 +19,7 @@ path = "src/bin/imq.rs"
 required-features = ["cli"]
 
 [features]
-default = ["std", "serde", "image-codecs", "cli"]
+default = ["std", "serde", "image-codecs", "cli", "tui"]
 std = []
 serde = ["dep:serde", "dep:serde_json"]
 image-codecs = ["dep:image"]

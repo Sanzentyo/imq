@@ -27,7 +27,7 @@ The crate is intended as a practical starting point for full-reference evaluatio
 | `cli` | `imq` binary. |
 | `tui` | Ratatui/crossterm interactive frontend. |
 
-Default features are `std`, `serde`, `image-codecs`, and `cli`.
+Default features are `std`, `serde`, `image-codecs`, `cli`, and `tui`.
 
 ## CLI examples
 
@@ -54,7 +54,7 @@ cargo run --bin imq -- extract-frame input.mov 150 frame-150.png
 Run the TUI:
 
 ```bash
-cargo run --features tui --bin imq -- tui reference.png distorted.png
+cargo run --bin imq -- tui reference.png distorted.png
 ```
 
 List still-image formats exposed by the image adapter:
