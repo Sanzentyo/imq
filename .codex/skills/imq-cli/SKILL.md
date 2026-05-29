@@ -78,10 +78,11 @@ imq preview --decode cpu clip.mp4
 
 Multiple inputs are arranged as a montage. Use `--rows` or `--cols` to control
 the layout. Omit `--size` to derive preview dimensions from terminal size and
-display mode, or pass `--size WIDTHxHEIGHT`; Sixel auto mode gets a higher
-pixel-resolution default than ANSI blocks. Use `IMQ_SIXEL=1` or
-`IMQ_NO_SIXEL=1` to override detection. `--fit contain|cover|stretch` controls
-aspect handling. Video thumbnails are extracted through `ffmpeg`; `--decode
+display mode, or pass `--size WIDTHxHEIGHT`; known Sixel terminals get a higher
+pixel-resolution default than ANSI blocks. Use `--display sixel`,
+`IMQ_SIXEL=1`, or `IMQ_NO_SIXEL=1` to override detection. `--fit
+contain|cover|stretch` controls aspect handling. Video thumbnails are extracted
+through `ffmpeg`; `--decode
 auto` tries detected hardware decode backends and falls back to CPU unless the
 build uses the `cpu-only` feature.
 

@@ -1128,23 +1128,68 @@ mod tui_app {
         ));
         let content_area = inner.inner(area);
         frame.render_widget(inner, area);
-        let max_rows = u32::from(content_area.height).min(preview.height);
-        let max_cols = u32::from(content_area.width / 2).min(preview.width);
-        for y in 0..max_rows {
-            let spans = (0..max_cols).map(|x| {
-                let [r, g, b] = preview.pixel(x, y);
-                Span::styled("██", Style::default().fg(Color::Rgb(r, g, b)))
+        let (display_cols, display_pixel_rows) = fitted_preview_cells(preview, content_area);
+        if display_cols == 0 || display_pixel_rows == 0 {
+            return;
+        }
+        let x_offset = (content_area.width.saturating_sub(display_cols as u16)) / 2;
+        let y_offset = (content_area
+            .height
+            .saturating_sub(display_pixel_rows.div_ceil(2) as u16))
+            / 2;
+        for y in (0..display_pixel_rows).step_by(2) {
+            let spans = (0..display_cols).map(|x| {
+                let top = sample_preview_pixel(preview, x, y, display_cols, display_pixel_rows);
+                let bottom = sample_preview_pixel(
+                    preview,
+                    x,
+                    (y + 1).min(display_pixel_rows.saturating_sub(1)),
+                    display_cols,
+                    display_pixel_rows,
+                );
+                Span::styled(
+                    "▀",
+                    Style::default()
+                        .fg(Color::Rgb(top[0], top[1], top[2]))
+                        .bg(Color::Rgb(bottom[0], bottom[1], bottom[2])),
+                )
             });
             frame.render_widget(
                 Paragraph::new(Line::from(spans.collect::<Vec<_>>())),
                 Rect {
-                    x: content_area.x,
-                    y: content_area.y + y as u16,
-                    width: content_area.width,
+                    x: content_area.x + x_offset,
+                    y: content_area.y + y_offset + (y / 2) as u16,
+                    width: display_cols as u16,
                     height: 1,
                 },
             );
         }
+    }
+
+    fn fitted_preview_cells(preview: &imq::preview::PreviewImage, area: Rect) -> (u32, u32) {
+        let max_width = u32::from(area.width);
+        let max_height = u32::from(area.height).saturating_mul(2);
+        if max_width == 0 || max_height == 0 || preview.width == 0 || preview.height == 0 {
+            return (0, 0);
+        }
+        let scale = (max_width as f64 / f64::from(preview.width))
+            .min(max_height as f64 / f64::from(preview.height));
+        let width = (f64::from(preview.width) * scale).round() as u32;
+        let height = (f64::from(preview.height) * scale).round() as u32;
+        (width.clamp(1, max_width), height.clamp(1, max_height))
+    }
+
+    fn sample_preview_pixel(
+        preview: &imq::preview::PreviewImage,
+        x: u32,
+        y: u32,
+        display_width: u32,
+        display_height: u32,
+    ) -> [u8; 3] {
+        let source_x = (u64::from(x) * u64::from(preview.width) / u64::from(display_width)) as u32;
+        let source_y =
+            (u64::from(y) * u64::from(preview.height) / u64::from(display_height)) as u32;
+        preview.pixel(source_x, source_y)
     }
 
     fn compare_paths(

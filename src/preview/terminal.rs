@@ -42,7 +42,6 @@ pub fn terminal_capabilities() -> TerminalCapabilities {
         && (std::env::var_os("IMQ_SIXEL").is_some()
             || term.contains("sixel")
             || term.contains("mlterm")
-            || term.contains("xterm")
             || term_program.contains("ghostty")
             || term_program.contains("wezterm")
             || term_program.contains("windows_terminal")
