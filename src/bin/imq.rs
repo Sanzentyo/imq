@@ -544,6 +544,8 @@ fn montage_previews(
     PreviewImage {
         width,
         height,
+        source_width: width,
+        source_height: height,
         pixels,
         source: "montage".to_string(),
     }
@@ -645,14 +647,19 @@ mod tui_app {
         metrics: Vec<MetricOutput>,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PreviewResolution {
+        Fixed { width: u32, height: u32 },
+        Max,
+    }
+
     struct App {
         reference: Option<PathBuf>,
         distorted: Option<PathBuf>,
         metrics_csv: String,
         comparison: Option<Comparison>,
         preview: Option<imq::preview::PreviewImage>,
-        preview_width: u32,
-        preview_height: u32,
+        preview_resolution: PreviewResolution,
         preview_fit: imq::preview::FitMode,
         cwd: PathBuf,
         entries: Vec<FileEntry>,
@@ -680,8 +687,10 @@ mod tui_app {
                 metrics_csv,
                 comparison: None,
                 preview: None,
-                preview_width: 192,
-                preview_height: 96,
+                preview_resolution: PreviewResolution::Fixed {
+                    width: 192,
+                    height: 96,
+                },
                 preview_fit: imq::preview::FitMode::Contain,
                 cwd,
                 entries: Vec::new(),
@@ -850,9 +859,10 @@ mod tui_app {
                 self.preview = None;
                 return;
             }
+            let (width, height) = self.requested_preview_size();
             let options = imq::preview::PreviewOptions {
-                width: self.preview_width,
-                height: self.preview_height,
+                width,
+                height,
                 fit: self.preview_fit,
                 ..Default::default()
             };
@@ -866,21 +876,43 @@ mod tui_app {
         }
 
         fn resize_preview(&mut self, larger: bool) {
-            if larger {
-                self.preview_width = self
-                    .preview_width
-                    .saturating_add((self.preview_width / 4).max(1));
-                self.preview_height = self
-                    .preview_height
-                    .saturating_add((self.preview_height / 4).max(1));
-            } else {
-                self.preview_width = (self.preview_width * 4 / 5).max(16);
-                self.preview_height = (self.preview_height * 4 / 5).max(8);
-            }
-            self.status = format!(
-                "Preview size: {}x{}",
-                self.preview_width, self.preview_height
-            );
+            self.preview_resolution = match (larger, self.preview_resolution, self.preview.as_ref())
+            {
+                (true, PreviewResolution::Fixed { width, height }, Some(preview)) => {
+                    let next_width = width.saturating_add((width / 4).max(1));
+                    let next_height = height.saturating_add((height / 4).max(1));
+                    if next_width >= preview.source_width || next_height >= preview.source_height {
+                        PreviewResolution::Max
+                    } else {
+                        PreviewResolution::Fixed {
+                            width: next_width,
+                            height: next_height,
+                        }
+                    }
+                }
+                (true, PreviewResolution::Fixed { width, height }, None) => {
+                    PreviewResolution::Fixed {
+                        width: width.saturating_add((width / 4).max(1)),
+                        height: height.saturating_add((height / 4).max(1)),
+                    }
+                }
+                (true, PreviewResolution::Max, _) => PreviewResolution::Max,
+                (false, PreviewResolution::Fixed { width, height }, _) => {
+                    PreviewResolution::Fixed {
+                        width: (width * 4 / 5).max(16),
+                        height: (height * 4 / 5).max(8),
+                    }
+                }
+                (false, PreviewResolution::Max, Some(preview)) => PreviewResolution::Fixed {
+                    width: (preview.source_width * 4 / 5).max(16),
+                    height: (preview.source_height * 4 / 5).max(8),
+                },
+                (false, PreviewResolution::Max, None) => PreviewResolution::Fixed {
+                    width: 192,
+                    height: 96,
+                },
+            };
+            self.status = format!("Preview size: {}", self.preview_resolution_label());
             self.update_preview();
         }
 
@@ -892,6 +924,23 @@ mod tui_app {
             };
             self.status = format!("Preview fit: {}", fit_label(self.preview_fit));
             self.update_preview();
+        }
+
+        fn requested_preview_size(&self) -> (u32, u32) {
+            match self.preview_resolution {
+                PreviewResolution::Fixed { width, height } => (width, height),
+                PreviewResolution::Max => (u32::MAX, u32::MAX),
+            }
+        }
+
+        fn preview_resolution_label(&self) -> String {
+            match (self.preview_resolution, self.preview.as_ref()) {
+                (PreviewResolution::Fixed { width, height }, _) => format!("{width}x{height}"),
+                (PreviewResolution::Max, Some(preview)) => {
+                    format!("max {}x{}", preview.source_width, preview.source_height)
+                }
+                (PreviewResolution::Max, None) => "max".to_string(),
+            }
         }
     }
 
@@ -1127,10 +1176,9 @@ mod tui_app {
             return;
         };
         let inner = panel_block(format!(
-            " preview: {} {}x{} {} ",
+            " preview: {} {} {} ",
             preview.source,
-            app.preview_width,
-            app.preview_height,
+            app.preview_resolution_label(),
             fit_label(app.preview_fit)
         ));
         let content_area = inner.inner(area);

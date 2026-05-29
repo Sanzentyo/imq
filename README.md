@@ -91,8 +91,10 @@ mode prefers Kitty graphics protocol for terminals such as Ghostty, then Sixel,
 then ANSI blocks. Use `--display kitty`, `--display sixel`, `IMQ_KITTY=1`,
 `IMQ_NO_KITTY=1`, `IMQ_SIXEL=1`, or `IMQ_NO_SIXEL=1` to override auto
 detection. Fit modes are
-`contain`, `cover`, and `stretch`. In the TUI, use `+`/`-` to change preview
-resolution and `f` to cycle the fit mode.
+`contain`, `cover`, and `stretch`. Preview generation does not upscale past the
+source image dimensions. In the TUI, use `+`/`-` to change preview resolution
+and `f` to cycle the fit mode; pressing `+` at the source dimensions switches to
+`max`, which keeps using each selected file's own maximum preview resolution.
 
 Common subcommand aliases are available: `i` for `image`, `v` for `video`, `p`
 for `preview`, `t` for `tui`, `fmt` for `formats`, and `x`/`extract` for

@@ -111,14 +111,14 @@ pub fn thumbnail_png(path: &Path, options: &PreviewOptions) -> Result<ThumbnailF
     };
 
     match decode {
-        DecodeMode::Cpu => run_thumbnail(&options.ffmpeg, path, None).map(|bytes| ThumbnailFrame {
+        DecodeMode::Cpu => run_thumbnail(options, path, None).map(|bytes| ThumbnailFrame {
             bytes,
             source: "ffmpeg cpu".to_string(),
         }),
         DecodeMode::Auto | DecodeMode::Hardware => {
             let report = detect_hw_accels(&options.ffmpeg);
             for accel in report.detected {
-                if let Ok(bytes) = run_thumbnail(&options.ffmpeg, path, Some(accel)) {
+                if let Ok(bytes) = run_thumbnail(options, path, Some(accel)) {
                     return Ok(ThumbnailFrame {
                         bytes,
                         source: format!("ffmpeg {}", accel.as_str()),
@@ -126,14 +126,12 @@ pub fn thumbnail_png(path: &Path, options: &PreviewOptions) -> Result<ThumbnailF
                 }
             }
             if decode == DecodeMode::Hardware {
-                run_thumbnail(&options.ffmpeg, path, Some(HwAccel::all()[0])).map(|bytes| {
-                    ThumbnailFrame {
-                        bytes,
-                        source: "ffmpeg hardware".to_string(),
-                    }
+                run_thumbnail(options, path, Some(HwAccel::all()[0])).map(|bytes| ThumbnailFrame {
+                    bytes,
+                    source: "ffmpeg hardware".to_string(),
                 })
             } else {
-                run_thumbnail(&options.ffmpeg, path, None).map(|bytes| ThumbnailFrame {
+                run_thumbnail(options, path, None).map(|bytes| ThumbnailFrame {
                     bytes,
                     source: "ffmpeg cpu fallback".to_string(),
                 })
@@ -160,29 +158,29 @@ fn detect_hw_accels_uncached(ffmpeg: &Path) -> Vec<HwAccel> {
         .collect()
 }
 
-fn run_thumbnail(ffmpeg: &Path, path: &Path, accel: Option<HwAccel>) -> Result<Vec<u8>> {
-    let mut command = Command::new(ffmpeg);
+fn run_thumbnail(options: &PreviewOptions, path: &Path, accel: Option<HwAccel>) -> Result<Vec<u8>> {
+    let mut command = Command::new(&options.ffmpeg);
     command.args(["-hide_banner", "-loglevel", "error"]);
     if let Some(accel) = accel {
         command.args(["-hwaccel", accel.as_str()]);
     }
-    command.args(["-ss", "0"]).arg("-i").arg(path).args([
-        "-frames:v",
-        "1",
-        "-vf",
-        "scale=320:-1:force_original_aspect_ratio=decrease",
-        "-f",
-        "image2pipe",
-        "-vcodec",
-        "png",
-        "pipe:1",
-    ]);
+    command.args(["-ss", "0"]).arg("-i").arg(path);
+    command.args(["-frames:v", "1"]);
+    if options.width != u32::MAX && options.height != u32::MAX {
+        let filter = format!(
+            "scale={}:{}:force_original_aspect_ratio=decrease",
+            options.width.max(1),
+            options.height.max(1)
+        );
+        command.args(["-vf", filter.as_str()]);
+    }
+    command.args(["-f", "image2pipe", "-vcodec", "png", "pipe:1"]);
     let output = command.output()?;
     if output.status.success() && !output.stdout.is_empty() {
         Ok(output.stdout)
     } else {
         Err(process_failed(
-            ffmpeg,
+            &options.ffmpeg,
             output.status.to_string(),
             output.stderr,
         ))

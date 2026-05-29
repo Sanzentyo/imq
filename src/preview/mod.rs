@@ -40,6 +40,10 @@ pub struct PreviewImage {
     pub width: u32,
     /// Height in pixels/cells.
     pub height: u32,
+    /// Natural source width before preview resizing.
+    pub source_width: u32,
+    /// Natural source height before preview resizing.
+    pub source_height: u32,
     /// Row-major RGB pixels.
     pub pixels: Vec<[u8; 3]>,
     /// Decoder path used to produce the preview.
@@ -159,8 +163,8 @@ fn dynamic_to_preview(
     source: String,
 ) -> PreviewImage {
     let (width, height) = image.dimensions();
-    let max_width = max_width.max(1);
-    let max_height = max_height.max(1);
+    let max_width = max_width.clamp(1, width.max(1));
+    let max_height = max_height.clamp(1, height.max(1));
     let resized = match fit {
         FitMode::Contain => {
             let scale =
@@ -188,6 +192,8 @@ fn dynamic_to_preview(
     PreviewImage {
         width: target_width,
         height: target_height,
+        source_width: width,
+        source_height: height,
         pixels,
         source,
     }
@@ -198,5 +204,34 @@ fn process_failed(program: &Path, status: String, stderr: Vec<u8>) -> Error {
         program: program.display().to_string(),
         status,
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{Rgb, RgbImage};
+
+    #[test]
+    fn preview_tracks_source_dimensions() {
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(8, 6, Rgb([255, 0, 0])));
+        let preview = dynamic_to_preview(image, 4, 4, FitMode::Contain, "test".to_string());
+        assert_eq!(preview.source_width, 8);
+        assert_eq!(preview.source_height, 6);
+        assert_eq!((preview.width, preview.height), (4, 3));
+    }
+
+    #[test]
+    fn preview_does_not_upscale_past_source() {
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(8, 6, Rgb([255, 0, 0])));
+        let preview = dynamic_to_preview(
+            image,
+            u32::MAX,
+            u32::MAX,
+            FitMode::Contain,
+            "test".to_string(),
+        );
+        assert_eq!((preview.width, preview.height), (8, 6));
+        assert_eq!((preview.source_width, preview.source_height), (8, 6));
     }
 }
