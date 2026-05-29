@@ -463,6 +463,16 @@ fn preview_layout(count: usize, rows: Option<usize>, cols: Option<usize>) -> (us
 
 #[cfg_attr(not(feature = "preview"), allow(dead_code))]
 fn default_preview_size(columns: usize, rows: usize) -> PreviewSize {
+    let sixel = {
+        #[cfg(feature = "preview")]
+        {
+            imq::preview::terminal_capabilities().sixel
+        }
+        #[cfg(not(feature = "preview"))]
+        {
+            false
+        }
+    };
     let terminal_width = std::env::var("COLUMNS")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
@@ -472,17 +482,19 @@ fn default_preview_size(columns: usize, rows: usize) -> PreviewSize {
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(40);
     let gap = 2 * columns.saturating_sub(1) as u32;
+    let cell_width = terminal_width
+        .saturating_sub(gap)
+        .checked_div(columns as u32)
+        .unwrap_or(80)
+        .max(16);
+    let cell_height = (terminal_height.saturating_sub(rows.saturating_sub(1) as u32))
+        .checked_div(rows as u32)
+        .unwrap_or(24)
+        .max(8);
+    let (x_scale, y_scale) = if sixel { (8, 16) } else { (1, 2) };
     PreviewSize {
-        width: terminal_width
-            .saturating_sub(gap)
-            .checked_div(columns as u32)
-            .unwrap_or(80)
-            .max(16),
-        height: (terminal_height.saturating_sub(rows.saturating_sub(1) as u32))
-            .checked_div(rows as u32)
-            .unwrap_or(24)
-            .saturating_mul(2)
-            .max(12),
+        width: cell_width.saturating_mul(x_scale).min(1920),
+        height: cell_height.saturating_mul(y_scale).min(1080),
     }
 }
 
@@ -665,8 +677,8 @@ mod tui_app {
                 metrics_csv,
                 comparison: None,
                 preview: None,
-                preview_width: 96,
-                preview_height: 48,
+                preview_width: 192,
+                preview_height: 96,
                 preview_fit: imq::preview::FitMode::Contain,
                 cwd,
                 entries: Vec::new(),

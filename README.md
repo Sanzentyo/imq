@@ -84,7 +84,9 @@ cargo run --bin imq -- preview --decode cpu clip.mp4
 ```
 
 When `--size` is omitted, `preview` derives a per-item preview size from the
-terminal dimensions and the requested montage rows/columns. Fit modes are
+terminal dimensions, display mode, and requested montage rows/columns. Sixel
+terminals get a higher pixel-resolution default than ANSI block rendering. Use
+`IMQ_SIXEL=1` or `IMQ_NO_SIXEL=1` to override auto detection. Fit modes are
 `contain`, `cover`, and `stretch`. In the TUI, use `+`/`-` to change preview
 resolution and `f` to cycle the fit mode.
 

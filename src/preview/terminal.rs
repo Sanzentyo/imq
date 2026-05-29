@@ -35,11 +35,22 @@ pub fn terminal_capabilities() -> TerminalCapabilities {
     let colorterm = std::env::var("COLORTERM")
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let sixel = std::env::var_os("IMQ_SIXEL").is_some()
-        || term.contains("sixel")
-        || term_program.contains("ghostty")
-        || term_program.contains("wezterm")
-        || std::env::var_os("KONSOLE_VERSION").is_some();
+    let wt_profile = std::env::var("WT_PROFILE_ID")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let sixel = std::env::var_os("IMQ_NO_SIXEL").is_none()
+        && (std::env::var_os("IMQ_SIXEL").is_some()
+            || term.contains("sixel")
+            || term.contains("mlterm")
+            || term.contains("xterm")
+            || term_program.contains("ghostty")
+            || term_program.contains("wezterm")
+            || term_program.contains("windows_terminal")
+            || wt_profile.contains("windows")
+            || std::env::var_os("WT_SESSION").is_some()
+            || std::env::var_os("KONSOLE_VERSION").is_some()
+            || std::env::var_os("MLTERM").is_some()
+            || std::env::var_os("RLOGIN").is_some());
     let truecolor = colorterm.contains("truecolor")
         || colorterm.contains("24bit")
         || term_program.contains("wezterm")
