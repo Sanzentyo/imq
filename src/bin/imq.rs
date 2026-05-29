@@ -4,9 +4,10 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use imq::adapters::image_crate;
 use imq::metrics::MetricSet;
-use imq::report::ComparisonReport;
+use imq::report::{ComparisonReport, VideoReport};
 use imq::{Dimensions, MetricOutput};
-use std::path::PathBuf;
+use serde::Serialize;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
 #[command(name = "imq")]
@@ -36,7 +37,7 @@ enum Command {
     Probe(ProbeCmd),
     /// Show image formats available through the image adapter.
     #[command(alias = "fmt")]
-    Formats,
+    Formats(FormatsCmd),
     /// Preview images or video thumbnails in the terminal.
     #[command(alias = "p")]
     Preview(PreviewCmd),
@@ -57,6 +58,8 @@ struct ImageCmd {
     /// Print JSON instead of a text table.
     #[arg(long)]
     json: bool,
+    #[command(flatten)]
+    output: OutputArgs,
 }
 
 #[derive(Debug, Args)]
@@ -101,6 +104,34 @@ struct PreviewCmd {
     /// ffmpeg executable for video thumbnails.
     #[arg(long, default_value = "ffmpeg")]
     ffmpeg: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct FormatsCmd {
+    #[command(flatten)]
+    output: OutputArgs,
+}
+
+#[derive(Debug, Args)]
+struct OutputArgs {
+    /// Structured output format.
+    #[arg(long, value_enum, default_value_t = OutputFormatArg::Text)]
+    format: OutputFormatArg,
+    /// Write output to a file instead of stdout.
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+    /// Append the report to a SQLite database.
+    #[arg(long)]
+    sqlite: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OutputFormatArg {
+    Text,
+    Json,
+    Yaml,
+    Toml,
+    Csv,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -167,6 +198,8 @@ struct VideoCmd {
     /// Print JSON instead of a text table.
     #[arg(long)]
     json: bool,
+    #[command(flatten)]
+    output: OutputArgs,
 }
 
 #[cfg(feature = "ffmpeg")]
@@ -203,6 +236,8 @@ struct ProbeCmd {
     /// Print JSON.
     #[arg(long)]
     json: bool,
+    #[command(flatten)]
+    output: OutputArgs,
 }
 
 fn main() -> Result<()> {
@@ -220,7 +255,7 @@ fn main() -> Result<()> {
         Command::ExtractFrame(cmd) => run_extract_frame(cmd),
         #[cfg(feature = "ffmpeg")]
         Command::Probe(cmd) => run_probe(cmd),
-        Command::Formats => run_formats(),
+        Command::Formats(cmd) => run_formats(cmd),
         Command::Preview(cmd) => run_preview(cmd),
         Command::Tui(cmd) => run_tui(cmd),
     }
@@ -252,17 +287,12 @@ fn run_image(cmd: ImageCmd) -> Result<()> {
         cmd.distorted.display().to_string(),
     );
 
-    if cmd.json {
-        println!("{}", report.to_json_pretty()?);
-    } else {
-        println!("reference : {}", cmd.reference.display());
-        println!("distorted : {}", cmd.distorted.display());
-        println!(
-            "size      : {}x{}",
-            report.dimensions.width, report.dimensions.height
-        );
-        print_metrics(&report.metrics);
-    }
+    write_sqlite_report(cmd.output.sqlite.as_deref(), SqlReport::Image(&report))?;
+    emit_comparison_report(
+        &report,
+        output_format(cmd.json, cmd.output.format),
+        &cmd.output,
+    )?;
     Ok(())
 }
 
@@ -287,19 +317,12 @@ fn run_video(cmd: VideoCmd) -> Result<()> {
         imq::video::compare_videos(&cmd.reference, &cmd.distorted, &ffmpeg, &compare, &metrics)
             .with_context(|| "video comparison failed")?;
 
-    if cmd.json {
-        println!("{}", report.to_json_pretty()?);
-    } else {
-        println!("reference       : {}", report.reference);
-        println!("distorted       : {}", report.distorted);
-        println!(
-            "size            : {}x{}",
-            report.dimensions.width, report.dimensions.height
-        );
-        println!("compared frames : {}", report.compared_frames);
-        println!("\nmean metrics");
-        print_metrics(&report.mean_metrics);
-    }
+    write_sqlite_report(cmd.output.sqlite.as_deref(), SqlReport::Video(&report))?;
+    emit_video_report(
+        &report,
+        output_format(cmd.json, cmd.output.format),
+        &cmd.output,
+    )?;
     Ok(())
 }
 
@@ -342,43 +365,562 @@ fn run_probe(cmd: ProbeCmd) -> Result<()> {
     };
     let info = imq::video::probe_video(&cmd.input, &options)
         .with_context(|| format!("failed to probe `{}`", cmd.input.display()))?;
-    if cmd.json {
-        println!("{}", serde_json::to_string_pretty(&info)?);
+    let report = ProbeReport {
+        input: cmd.input.display().to_string(),
+        info,
+    };
+    write_sqlite_probe(cmd.output.sqlite.as_deref(), &report)?;
+    emit_probe_report(
+        &report,
+        output_format(cmd.json, cmd.output.format),
+        &cmd.output,
+    )?;
+    Ok(())
+}
+
+fn run_formats(cmd: FormatsCmd) -> Result<()> {
+    let report = FormatsReport {
+        formats: image_crate::enabled_format_hint()
+            .iter()
+            .map(|format| (*format).to_string())
+            .collect(),
+    };
+    write_sqlite_formats(cmd.output.sqlite.as_deref(), &report)?;
+    emit_formats_report(&report, cmd.output.format, &cmd.output)?;
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct ProbeReport {
+    input: String,
+    info: imq::video::VideoInfo,
+}
+
+#[derive(Debug, Serialize)]
+struct FormatsReport {
+    formats: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct MetricCsvRow {
+    report_kind: &'static str,
+    reference: String,
+    distorted: String,
+    width: u32,
+    height: u32,
+    scope: &'static str,
+    frame_index: Option<u64>,
+    pts_seconds: Option<f64>,
+    metric: String,
+    score: f64,
+    unit: String,
+    direction: String,
+    details_json: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ProbeCsvRow {
+    input: String,
+    width: u32,
+    height: u32,
+    avg_frame_rate: Option<f64>,
+    nb_frames: Option<u64>,
+    codec_name: Option<String>,
+    duration_seconds: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct FormatCsvRow {
+    format: String,
+}
+
+struct MetricCsvContext {
+    report_kind: &'static str,
+    reference: String,
+    distorted: String,
+    width: u32,
+    height: u32,
+    scope: &'static str,
+    frame_index: Option<u64>,
+    pts_seconds: Option<f64>,
+}
+
+enum SqlReport<'a> {
+    Image(&'a ComparisonReport),
+    Video(&'a VideoReport),
+}
+
+struct SqlReportInsert<'a> {
+    kind: &'a str,
+    reference: Option<&'a str>,
+    distorted: Option<&'a str>,
+    width: u32,
+    height: u32,
+    compared_frames: Option<i64>,
+    payload_json: &'a str,
+}
+
+fn output_format(json: bool, format: OutputFormatArg) -> OutputFormatArg {
+    if json { OutputFormatArg::Json } else { format }
+}
+
+fn emit_comparison_report(
+    report: &ComparisonReport,
+    format: OutputFormatArg,
+    output: &OutputArgs,
+) -> Result<()> {
+    let content = match format {
+        OutputFormatArg::Text => render_comparison_text(report),
+        OutputFormatArg::Json => serde_json::to_string_pretty(report)?,
+        OutputFormatArg::Yaml => serde_yaml_ng::to_string(report)?,
+        OutputFormatArg::Toml => toml::to_string_pretty(report)?,
+        OutputFormatArg::Csv => csv_string(comparison_csv_rows(report))?,
+    };
+    write_output(output.output.as_deref(), &content)
+}
+
+fn emit_video_report(
+    report: &VideoReport,
+    format: OutputFormatArg,
+    output: &OutputArgs,
+) -> Result<()> {
+    let content = match format {
+        OutputFormatArg::Text => render_video_text(report),
+        OutputFormatArg::Json => serde_json::to_string_pretty(report)?,
+        OutputFormatArg::Yaml => serde_yaml_ng::to_string(report)?,
+        OutputFormatArg::Toml => toml::to_string_pretty(report)?,
+        OutputFormatArg::Csv => csv_string(video_csv_rows(report))?,
+    };
+    write_output(output.output.as_deref(), &content)
+}
+
+fn emit_probe_report(
+    report: &ProbeReport,
+    format: OutputFormatArg,
+    output: &OutputArgs,
+) -> Result<()> {
+    let content = match format {
+        OutputFormatArg::Text => render_probe_text(report),
+        OutputFormatArg::Json => serde_json::to_string_pretty(report)?,
+        OutputFormatArg::Yaml => serde_yaml_ng::to_string(report)?,
+        OutputFormatArg::Toml => toml::to_string_pretty(report)?,
+        OutputFormatArg::Csv => csv_string([ProbeCsvRow {
+            input: report.input.clone(),
+            width: report.info.width,
+            height: report.info.height,
+            avg_frame_rate: report.info.avg_frame_rate,
+            nb_frames: report.info.nb_frames,
+            codec_name: report.info.codec_name.clone(),
+            duration_seconds: report.info.duration_seconds,
+        }])?,
+    };
+    write_output(output.output.as_deref(), &content)
+}
+
+fn emit_formats_report(
+    report: &FormatsReport,
+    format: OutputFormatArg,
+    output: &OutputArgs,
+) -> Result<()> {
+    let content = match format {
+        OutputFormatArg::Text => render_formats_text(report),
+        OutputFormatArg::Json => serde_json::to_string_pretty(report)?,
+        OutputFormatArg::Yaml => serde_yaml_ng::to_string(report)?,
+        OutputFormatArg::Toml => toml::to_string_pretty(report)?,
+        OutputFormatArg::Csv => csv_string(report.formats.iter().map(|format| FormatCsvRow {
+            format: format.clone(),
+        }))?,
+    };
+    write_output(output.output.as_deref(), &content)
+}
+
+fn write_output(path: Option<&Path>, content: &str) -> Result<()> {
+    if let Some(path) = path {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create `{}`", parent.display()))?;
+        }
+        std::fs::write(path, content)
+            .with_context(|| format!("failed to write `{}`", path.display()))?;
     } else {
-        println!("file      : {}", cmd.input.display());
-        println!("size      : {}x{}", info.width, info.height);
-        println!(
-            "codec     : {}",
-            info.codec_name.as_deref().unwrap_or("unknown")
-        );
-        println!(
-            "fps       : {}",
-            info.avg_frame_rate
-                .map(|v| format!("{v:.6}"))
-                .unwrap_or_else(|| "unknown".to_string())
-        );
-        println!(
-            "frames    : {}",
-            info.nb_frames
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "unknown".to_string())
-        );
-        println!(
-            "duration  : {}",
-            info.duration_seconds
-                .map(|v| format!("{v:.3}s"))
-                .unwrap_or_else(|| "unknown".to_string())
-        );
+        print!("{content}");
     }
     Ok(())
 }
 
-fn run_formats() -> Result<()> {
-    println!("image crate adapter format hint:");
-    for f in image_crate::enabled_format_hint() {
-        println!("- {f}");
+fn csv_string<T, I>(rows: I) -> Result<String>
+where
+    T: Serialize,
+    I: IntoIterator<Item = T>,
+{
+    let mut writer = csv::Writer::from_writer(Vec::new());
+    for row in rows {
+        writer.serialize(row)?;
+    }
+    Ok(String::from_utf8(writer.into_inner()?)?)
+}
+
+fn render_comparison_text(report: &ComparisonReport) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "reference : {}\n",
+        report.reference.as_deref().unwrap_or("<none>")
+    ));
+    output.push_str(&format!(
+        "distorted : {}\n",
+        report.distorted.as_deref().unwrap_or("<none>")
+    ));
+    output.push_str(&format!(
+        "size      : {}x{}\n",
+        report.dimensions.width, report.dimensions.height
+    ));
+    output.push_str(&render_metrics(&report.metrics));
+    output
+}
+
+fn render_video_text(report: &VideoReport) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("reference       : {}\n", report.reference));
+    output.push_str(&format!("distorted       : {}\n", report.distorted));
+    output.push_str(&format!(
+        "size            : {}x{}\n",
+        report.dimensions.width, report.dimensions.height
+    ));
+    output.push_str(&format!("compared frames : {}\n", report.compared_frames));
+    output.push_str("\nmean metrics\n");
+    output.push_str(&render_metrics(&report.mean_metrics));
+    output
+}
+
+fn render_probe_text(report: &ProbeReport) -> String {
+    let info = &report.info;
+    let mut output = String::new();
+    output.push_str(&format!("file      : {}\n", report.input));
+    output.push_str(&format!("size      : {}x{}\n", info.width, info.height));
+    output.push_str(&format!(
+        "codec     : {}\n",
+        info.codec_name.as_deref().unwrap_or("unknown")
+    ));
+    output.push_str(&format!(
+        "fps       : {}\n",
+        info.avg_frame_rate
+            .map(|value| format!("{value:.6}"))
+            .unwrap_or_else(|| "unknown".to_string())
+    ));
+    output.push_str(&format!(
+        "frames    : {}\n",
+        info.nb_frames
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    ));
+    output.push_str(&format!(
+        "duration  : {}\n",
+        info.duration_seconds
+            .map(|value| format!("{value:.3}s"))
+            .unwrap_or_else(|| "unknown".to_string())
+    ));
+    output
+}
+
+fn render_formats_text(report: &FormatsReport) -> String {
+    let mut output = String::from("image crate adapter format hint:\n");
+    report
+        .formats
+        .iter()
+        .for_each(|format| output.push_str(&format!("- {format}\n")));
+    output
+}
+
+fn render_metrics(metrics: &[MetricOutput]) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "{:<18} {:>16}  {:<20}  direction\n",
+        "metric", "score", "unit"
+    ));
+    output.push_str(&format!(
+        "{:-<18} {:-<16}  {:-<20}  {:-<12}\n",
+        "", "", "", ""
+    ));
+    metrics.iter().for_each(|metric| {
+        output.push_str(&format!(
+            "{:<18} {:>16.8}  {:<20}  {:?}\n",
+            metric.name, metric.score, metric.unit, metric.direction
+        ));
+    });
+    output
+}
+
+fn comparison_csv_rows(report: &ComparisonReport) -> Vec<MetricCsvRow> {
+    metric_csv_rows(
+        &MetricCsvContext {
+            report_kind: "image",
+            reference: report.reference.clone().unwrap_or_default(),
+            distorted: report.distorted.clone().unwrap_or_default(),
+            width: report.dimensions.width,
+            height: report.dimensions.height,
+            scope: "image",
+            frame_index: None,
+            pts_seconds: None,
+        },
+        &report.metrics,
+    )
+}
+
+fn video_csv_rows(report: &VideoReport) -> Vec<MetricCsvRow> {
+    let mean_rows = metric_csv_rows(
+        &MetricCsvContext {
+            report_kind: "video",
+            reference: report.reference.clone(),
+            distorted: report.distorted.clone(),
+            width: report.dimensions.width,
+            height: report.dimensions.height,
+            scope: "mean",
+            frame_index: None,
+            pts_seconds: None,
+        },
+        &report.mean_metrics,
+    );
+    let frame_rows = report.frames.iter().flat_map(|frame| {
+        metric_csv_rows(
+            &MetricCsvContext {
+                report_kind: "video",
+                reference: report.reference.clone(),
+                distorted: report.distorted.clone(),
+                width: report.dimensions.width,
+                height: report.dimensions.height,
+                scope: "frame",
+                frame_index: Some(frame.frame_index),
+                pts_seconds: frame.pts_seconds,
+            },
+            &frame.metrics,
+        )
+    });
+    mean_rows.into_iter().chain(frame_rows).collect()
+}
+
+fn metric_csv_rows(ctx: &MetricCsvContext, metrics: &[MetricOutput]) -> Vec<MetricCsvRow> {
+    metrics
+        .iter()
+        .map(|metric| MetricCsvRow {
+            report_kind: ctx.report_kind,
+            reference: ctx.reference.clone(),
+            distorted: ctx.distorted.clone(),
+            width: ctx.width,
+            height: ctx.height,
+            scope: ctx.scope,
+            frame_index: ctx.frame_index,
+            pts_seconds: ctx.pts_seconds,
+            metric: metric.name.clone(),
+            score: metric.score,
+            unit: metric.unit.clone(),
+            direction: format!("{:?}", metric.direction),
+            details_json: serde_json::to_string(&metric.details).unwrap_or_default(),
+        })
+        .collect()
+}
+
+fn write_sqlite_report(path: Option<&Path>, report: SqlReport<'_>) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let conn = open_sqlite(path)?;
+    init_sqlite(&conn)?;
+    match report {
+        SqlReport::Image(report) => {
+            let payload = serde_json::to_string(report)?;
+            let report_id = insert_sqlite_report(
+                &conn,
+                &SqlReportInsert {
+                    kind: "image",
+                    reference: report.reference.as_deref(),
+                    distorted: report.distorted.as_deref(),
+                    width: report.dimensions.width,
+                    height: report.dimensions.height,
+                    compared_frames: None,
+                    payload_json: &payload,
+                },
+            )?;
+            insert_sqlite_metrics(&conn, report_id, "image", None, None, &report.metrics)?;
+        }
+        SqlReport::Video(report) => {
+            let payload = serde_json::to_string(report)?;
+            let report_id = insert_sqlite_report(
+                &conn,
+                &SqlReportInsert {
+                    kind: "video",
+                    reference: Some(&report.reference),
+                    distorted: Some(&report.distorted),
+                    width: report.dimensions.width,
+                    height: report.dimensions.height,
+                    compared_frames: Some(sql_u64(report.compared_frames)),
+                    payload_json: &payload,
+                },
+            )?;
+            insert_sqlite_metrics(&conn, report_id, "mean", None, None, &report.mean_metrics)?;
+            for frame in &report.frames {
+                insert_sqlite_metrics(
+                    &conn,
+                    report_id,
+                    "frame",
+                    Some(sql_u64(frame.frame_index)),
+                    frame.pts_seconds,
+                    &frame.metrics,
+                )?;
+            }
+        }
     }
     Ok(())
+}
+
+fn write_sqlite_probe(path: Option<&Path>, report: &ProbeReport) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let conn = open_sqlite(path)?;
+    init_sqlite(&conn)?;
+    conn.execute(
+        "INSERT INTO imq_probe_reports \
+         (input, width, height, avg_frame_rate, nb_frames, codec_name, duration_seconds, payload_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            report.input.as_str(),
+            i64::from(report.info.width),
+            i64::from(report.info.height),
+            report.info.avg_frame_rate,
+            report.info.nb_frames.map(sql_u64),
+            report.info.codec_name.as_deref(),
+            report.info.duration_seconds,
+            serde_json::to_string(report)?,
+        ],
+    )?;
+    Ok(())
+}
+
+fn write_sqlite_formats(path: Option<&Path>, report: &FormatsReport) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let mut conn = open_sqlite(path)?;
+    init_sqlite(&conn)?;
+    let tx = conn.transaction()?;
+    for format in &report.formats {
+        tx.execute(
+            "INSERT OR IGNORE INTO imq_formats (format) VALUES (?1)",
+            rusqlite::params![format],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn open_sqlite(path: &Path) -> Result<rusqlite::Connection> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create `{}`", parent.display()))?;
+    }
+    rusqlite::Connection::open(path)
+        .with_context(|| format!("failed to open SQLite database `{}`", path.display()))
+}
+
+fn init_sqlite(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS imq_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            reference TEXT,
+            distorted TEXT,
+            width INTEGER NOT NULL,
+            height INTEGER NOT NULL,
+            compared_frames INTEGER,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS imq_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_id INTEGER NOT NULL REFERENCES imq_reports(id) ON DELETE CASCADE,
+            scope TEXT NOT NULL,
+            frame_index INTEGER,
+            pts_seconds REAL,
+            name TEXT NOT NULL,
+            score REAL NOT NULL,
+            unit TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            details_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS imq_probe_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            input TEXT NOT NULL,
+            width INTEGER NOT NULL,
+            height INTEGER NOT NULL,
+            avg_frame_rate REAL,
+            nb_frames INTEGER,
+            codec_name TEXT,
+            duration_seconds REAL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS imq_formats (
+            format TEXT PRIMARY KEY
+        );",
+    )?;
+    Ok(())
+}
+
+fn insert_sqlite_report(conn: &rusqlite::Connection, report: &SqlReportInsert<'_>) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO imq_reports \
+         (kind, reference, distorted, width, height, compared_frames, payload_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            report.kind,
+            report.reference,
+            report.distorted,
+            i64::from(report.width),
+            i64::from(report.height),
+            report.compared_frames,
+            report.payload_json
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+fn insert_sqlite_metrics(
+    conn: &rusqlite::Connection,
+    report_id: i64,
+    scope: &str,
+    frame_index: Option<i64>,
+    pts_seconds: Option<f64>,
+    metrics: &[MetricOutput],
+) -> Result<()> {
+    for metric in metrics {
+        conn.execute(
+            "INSERT INTO imq_metrics \
+             (report_id, scope, frame_index, pts_seconds, name, score, unit, direction, details_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                report_id,
+                scope,
+                frame_index,
+                pts_seconds,
+                metric.name.as_str(),
+                metric.score,
+                metric.unit.as_str(),
+                format!("{:?}", metric.direction),
+                serde_json::to_string(&metric.details)?,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn sql_u64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 #[cfg(feature = "preview")]
@@ -574,20 +1116,6 @@ fn parse_optional_scale(width: Option<u32>, height: Option<u32>) -> Result<Optio
         (Some(w), Some(h)) => Ok(Some(Dimensions::new(w, h)?)),
         (None, None) => Ok(None),
         _ => bail!("--width and --height must be specified together"),
-    }
-}
-
-fn print_metrics(metrics: &[MetricOutput]) {
-    println!(
-        "{:<18} {:>16}  {:<20}  direction",
-        "metric", "score", "unit"
-    );
-    println!("{:-<18} {:-<16}  {:-<20}  {:-<12}", "", "", "", "");
-    for metric in metrics {
-        println!(
-            "{:<18} {:>16.8}  {:<20}  {:?}",
-            metric.name, metric.score, metric.unit, metric.direction
-        );
     }
 }
 

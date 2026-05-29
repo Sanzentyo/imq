@@ -38,6 +38,8 @@ Compare still images:
 ```bash
 cargo run --bin imq -- image reference.png distorted.webp --metrics psnr,ssim,mse,mae,maxae
 cargo run --bin imq -- image reference.png distorted.webp --metrics psnr:color,mse:all --json
+cargo run --bin imq -- image reference.png distorted.webp --format yaml --output report.yaml
+cargo run --bin imq -- image reference.png distorted.webp --format csv --sqlite reports.sqlite
 ```
 
 Compare videos by decoding RGBA frames with `ffmpeg`:
@@ -45,7 +47,15 @@ Compare videos by decoding RGBA frames with `ffmpeg`:
 ```bash
 cargo run --bin imq -- video reference.mp4 distorted.mp4 --every 30 --max-frames 120
 cargo run --bin imq -- video reference.mp4 distorted.mp4 --width 1920 --height 1080 --json
+cargo run --bin imq -- video reference.mp4 distorted.mp4 --format toml --output video-report.toml
 ```
+
+Structured output is available on `image`, `video`, `probe`, and `formats` with
+`--format text|json|yaml|toml|csv`; `--json` is kept as an alias for
+`--format json`. Use `--output PATH` to write the selected representation to a
+file. Use `--sqlite PATH` to append reports and metric rows to a SQLite database
+through tables such as `imq_reports`, `imq_metrics`, `imq_probe_reports`, and
+`imq_formats`.
 
 Extract one decoded video frame:
 

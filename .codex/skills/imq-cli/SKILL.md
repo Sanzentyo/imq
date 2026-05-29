@@ -29,6 +29,8 @@ Use `image` for decoded still images:
 ```bash
 imq image reference.png distorted.png --metrics psnr,ssim,mse,mae,maxae
 imq image reference.png distorted.png --metrics psnr:color,mse:all --json
+imq image reference.png distorted.png --format yaml --output report.yaml
+imq image reference.png distorted.png --format csv --sqlite reports.sqlite
 ```
 
 Metric domains:
@@ -40,6 +42,12 @@ Metric domains:
 
 Use `imq formats` to list the image adapter's supported format hints.
 
+Structured output is supported by `image`, `video`, `probe`, and `formats` with
+`--format text|json|yaml|toml|csv`. `--json` is a compatibility alias for
+`--format json`. Use `--output PATH` to write the selected representation to a
+file, and `--sqlite PATH` to append reports and metric rows to a SQLite
+database.
+
 ## Compare Videos
 
 Video commands require working `ffmpeg` and `ffprobe` executables. Use `video` for frame-by-frame RGBA decoding through ffmpeg:
@@ -47,6 +55,7 @@ Video commands require working `ffmpeg` and `ffprobe` executables. Use `video` f
 ```bash
 imq video reference.mp4 distorted.mp4 --metrics psnr,ssim,mse --every 30 --max-frames 120
 imq video reference.mp4 distorted.mp4 --width 1920 --height 1080 --json
+imq video reference.mp4 distorted.mp4 --format toml --output video-report.toml
 ```
 
 Rules:
