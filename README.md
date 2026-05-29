@@ -77,6 +77,7 @@ Preview images or video thumbnails in the terminal:
 
 ```bash
 cargo run --bin imq -- preview image.png
+cargo run --bin imq -- p image.png
 cargo run --bin imq -- preview --display sixel --cols 2 a.png b.png clip.mp4
 cargo run --bin imq -- preview --size 120x60 --fit cover image.png
 cargo run --bin imq -- preview --decode cpu clip.mp4
@@ -86,6 +87,10 @@ When `--size` is omitted, `preview` derives a per-item preview size from the
 terminal dimensions and the requested montage rows/columns. Fit modes are
 `contain`, `cover`, and `stretch`. In the TUI, use `+`/`-` to change preview
 resolution and `f` to cycle the fit mode.
+
+Common subcommand aliases are available: `i` for `image`, `v` for `video`, `p`
+for `preview`, `t` for `tui`, `fmt` for `formats`, and `x`/`extract` for
+`extract-frame`.
 
 ## Codex skill
 

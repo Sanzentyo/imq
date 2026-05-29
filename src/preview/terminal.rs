@@ -37,6 +37,7 @@ pub fn terminal_capabilities() -> TerminalCapabilities {
         .to_ascii_lowercase();
     let sixel = std::env::var_os("IMQ_SIXEL").is_some()
         || term.contains("sixel")
+        || term_program.contains("ghostty")
         || term_program.contains("wezterm")
         || std::env::var_os("KONSOLE_VERSION").is_some();
     let truecolor = colorterm.contains("truecolor")

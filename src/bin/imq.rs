@@ -20,21 +20,28 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Compare two still images decoded by the image crate.
+    #[command(alias = "i")]
     Image(ImageCmd),
     /// Compare two videos by piping RGBA frames from ffmpeg stdout.
     #[cfg(feature = "ffmpeg")]
+    #[command(alias = "v")]
     Video(VideoCmd),
     /// Decode one video frame with ffmpeg and save it as PNG.
     #[cfg(feature = "ffmpeg")]
+    #[command(alias = "x", alias = "extract")]
     ExtractFrame(ExtractFrameCmd),
     /// Probe a video stream with ffprobe.
     #[cfg(feature = "ffmpeg")]
+    #[command(alias = "info")]
     Probe(ProbeCmd),
     /// Show image formats available through the image adapter.
+    #[command(alias = "fmt")]
     Formats,
     /// Preview images or video thumbnails in the terminal.
+    #[command(alias = "p")]
     Preview(PreviewCmd),
     /// Interactive terminal comparison view.
+    #[command(alias = "t")]
     Tui(TuiCmd),
 }
 

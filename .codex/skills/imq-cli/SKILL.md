@@ -70,6 +70,7 @@ appears to support it and ANSI color blocks otherwise.
 
 ```bash
 imq preview image.png
+imq p image.png
 imq preview --display sixel --cols 2 a.png b.png clip.mp4
 imq preview --size 120x60 --fit cover image.png
 imq preview --decode cpu clip.mp4
@@ -81,6 +82,10 @@ or pass `--size WIDTHxHEIGHT`; `--fit contain|cover|stretch` controls aspect
 handling. Video thumbnails are extracted through `ffmpeg`; `--decode auto` tries
 detected hardware decode backends and falls back to CPU unless the build uses
 the `cpu-only` feature.
+
+Subcommand aliases are available: `i` for `image`, `v` for `video`, `p` for
+`preview`, `t` for `tui`, `fmt` for `formats`, and `x`/`extract` for
+`extract-frame`.
 
 ## TUI
 
