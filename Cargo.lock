@@ -3095,6 +3095,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "approx",
+ "base64 0.22.1",
  "burn",
  "bytemuck",
  "clap",

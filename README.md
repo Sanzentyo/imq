@@ -78,15 +78,18 @@ Preview images or video thumbnails in the terminal:
 ```bash
 cargo run --bin imq -- preview image.png
 cargo run --bin imq -- p image.png
-cargo run --bin imq -- preview --display sixel --cols 2 a.png b.png clip.mp4
+cargo run --bin imq -- preview --display kitty --cols 2 a.png b.png clip.mp4
 cargo run --bin imq -- preview --size 120x60 --fit cover image.png
 cargo run --bin imq -- preview --decode cpu clip.mp4
 ```
 
 When `--size` is omitted, `preview` derives a per-item preview size from the
 terminal dimensions, display mode, and requested montage rows/columns. Known
-Sixel terminals get a higher pixel-resolution default than ANSI block rendering.
-Use `--display sixel`, `IMQ_SIXEL=1`, or `IMQ_NO_SIXEL=1` to override auto
+native graphics terminals and Sixel terminals get a higher pixel-resolution
+default than ANSI block rendering, without an artificial fixed maximum. Auto
+mode prefers Kitty graphics protocol for terminals such as Ghostty, then Sixel,
+then ANSI blocks. Use `--display kitty`, `--display sixel`, `IMQ_KITTY=1`,
+`IMQ_NO_KITTY=1`, `IMQ_SIXEL=1`, or `IMQ_NO_SIXEL=1` to override auto
 detection. Fit modes are
 `contain`, `cover`, and `stretch`. In the TUI, use `+`/`-` to change preview
 resolution and `f` to cycle the fit mode.

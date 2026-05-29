@@ -1,12 +1,16 @@
 //! Terminal image rendering helpers.
 
 use super::PreviewImage;
+use base64::Engine;
+use image::ImageEncoder;
 
 /// Terminal preview display mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisplayMode {
-    /// Prefer Sixel when supported, otherwise ANSI truecolor blocks.
+    /// Prefer native terminal graphics, then Sixel, otherwise ANSI truecolor blocks.
     Auto,
+    /// Emit Kitty graphics protocol escape sequences.
+    Kitty,
     /// Emit Sixel escape sequences.
     Sixel,
     /// Emit ANSI truecolor half-blocks.
@@ -18,6 +22,8 @@ pub enum DisplayMode {
 /// Runtime terminal capability hints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalCapabilities {
+    /// Whether Kitty graphics protocol appears to be supported.
+    pub kitty: bool,
     /// Whether Sixel appears to be supported.
     pub sixel: bool,
     /// Whether ANSI truecolor appears to be supported.
@@ -38,6 +44,12 @@ pub fn terminal_capabilities() -> TerminalCapabilities {
     let wt_profile = std::env::var("WT_PROFILE_ID")
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let kitty = std::env::var_os("IMQ_NO_KITTY").is_none()
+        && (std::env::var_os("IMQ_KITTY").is_some()
+            || std::env::var_os("KITTY_WINDOW_ID").is_some()
+            || term_program.contains("ghostty")
+            || term_program.contains("kitty")
+            || term_program.contains("wezterm"));
     let sixel = std::env::var_os("IMQ_NO_SIXEL").is_none()
         && (std::env::var_os("IMQ_SIXEL").is_some()
             || term.contains("sixel")
@@ -55,7 +67,34 @@ pub fn terminal_capabilities() -> TerminalCapabilities {
         || term_program.contains("wezterm")
         || term_program.contains("iterm")
         || std::env::var_os("WT_SESSION").is_some();
-    TerminalCapabilities { sixel, truecolor }
+    TerminalCapabilities {
+        kitty,
+        sixel,
+        truecolor,
+    }
+}
+
+/// Renders an image through the Kitty graphics protocol as inline PNG data.
+pub fn render_kitty(image: &PreviewImage) -> String {
+    let png = encode_png(image);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(png);
+    let mut out = String::new();
+    let mut offset = 0;
+    let chunk_size = 4096;
+    while offset < encoded.len() {
+        let end = (offset + chunk_size).min(encoded.len());
+        let more = u8::from(end < encoded.len());
+        if offset == 0 {
+            out.push_str(&format!("\x1b_Ga=T,f=100,m={more};"));
+        } else {
+            out.push_str(&format!("\x1b_Gm={more};"));
+        }
+        out.push_str(&encoded[offset..end]);
+        out.push_str("\x1b\\");
+        offset = end;
+    }
+    out.push('\n');
+    out
 }
 
 /// Renders an image as ANSI truecolor half-blocks.
@@ -140,4 +179,23 @@ fn quantize(rgb: [u8; 3]) -> [u8; 3] {
 
 fn color_index(r: u8, g: u8, b: u8) -> u16 {
     u16::from(r) * 36 + u16::from(g) * 6 + u16::from(b)
+}
+
+fn encode_png(image: &PreviewImage) -> Vec<u8> {
+    let mut rgb = Vec::with_capacity(image.pixels.len() * 3);
+    image
+        .pixels
+        .iter()
+        .for_each(|pixel| rgb.extend_from_slice(pixel));
+    let mut png = Vec::new();
+    let encoder = image::codecs::png::PngEncoder::new(&mut png);
+    encoder
+        .write_image(
+            &rgb,
+            image.width,
+            image.height,
+            image::ExtendedColorType::Rgb8,
+        )
+        .expect("encoding RGB preview as PNG should not fail");
+    png
 }

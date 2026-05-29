@@ -106,6 +106,7 @@ struct PreviewCmd {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum PreviewDisplayArg {
     Auto,
+    Kitty,
     Sixel,
     Ansi,
     None,
@@ -423,6 +424,7 @@ fn run_preview(cmd: PreviewCmd) -> Result<()> {
     let image = montage_previews(&previews, Some(rows), Some(columns));
     let display = match cmd.display {
         PreviewDisplayArg::Auto => DisplayMode::Auto,
+        PreviewDisplayArg::Kitty => DisplayMode::Kitty,
         PreviewDisplayArg::Sixel => DisplayMode::Sixel,
         PreviewDisplayArg::Ansi => DisplayMode::Ansi,
         PreviewDisplayArg::None => DisplayMode::None,
@@ -466,7 +468,8 @@ fn default_preview_size(columns: usize, rows: usize) -> PreviewSize {
     let sixel = {
         #[cfg(feature = "preview")]
         {
-            imq::preview::terminal_capabilities().sixel
+            let capabilities = imq::preview::terminal_capabilities();
+            capabilities.kitty || capabilities.sixel
         }
         #[cfg(not(feature = "preview"))]
         {
@@ -493,8 +496,8 @@ fn default_preview_size(columns: usize, rows: usize) -> PreviewSize {
         .max(8);
     let (x_scale, y_scale) = if sixel { (8, 16) } else { (1, 2) };
     PreviewSize {
-        width: cell_width.saturating_mul(x_scale).min(1920),
-        height: cell_height.saturating_mul(y_scale).min(1080),
+        width: cell_width.saturating_mul(x_scale),
+        height: cell_height.saturating_mul(y_scale),
     }
 }
 
@@ -864,8 +867,12 @@ mod tui_app {
 
         fn resize_preview(&mut self, larger: bool) {
             if larger {
-                self.preview_width = (self.preview_width + self.preview_width / 4).min(512);
-                self.preview_height = (self.preview_height + self.preview_height / 4).min(256);
+                self.preview_width = self
+                    .preview_width
+                    .saturating_add((self.preview_width / 4).max(1));
+                self.preview_height = self
+                    .preview_height
+                    .saturating_add((self.preview_height / 4).max(1));
             } else {
                 self.preview_width = (self.preview_width * 4 / 5).max(16);
                 self.preview_height = (self.preview_height * 4 / 5).max(8);

@@ -71,18 +71,20 @@ appears to support it and ANSI color blocks otherwise.
 ```bash
 imq preview image.png
 imq p image.png
-imq preview --display sixel --cols 2 a.png b.png clip.mp4
+imq preview --display kitty --cols 2 a.png b.png clip.mp4
 imq preview --size 120x60 --fit cover image.png
 imq preview --decode cpu clip.mp4
 ```
 
 Multiple inputs are arranged as a montage. Use `--rows` or `--cols` to control
 the layout. Omit `--size` to derive preview dimensions from terminal size and
-display mode, or pass `--size WIDTHxHEIGHT`; known Sixel terminals get a higher
-pixel-resolution default than ANSI blocks. Use `--display sixel`,
-`IMQ_SIXEL=1`, or `IMQ_NO_SIXEL=1` to override detection. `--fit
-contain|cover|stretch` controls aspect handling. Video thumbnails are extracted
-through `ffmpeg`; `--decode
+display mode, or pass `--size WIDTHxHEIGHT`; known native graphics terminals and
+Sixel terminals get a higher pixel-resolution default than ANSI blocks. Auto
+mode prefers Kitty graphics protocol for terminals such as Ghostty, then Sixel,
+then ANSI blocks. Use `--display kitty`, `--display sixel`, `IMQ_KITTY=1`,
+`IMQ_NO_KITTY=1`, `IMQ_SIXEL=1`, or `IMQ_NO_SIXEL=1` to override detection.
+`--fit contain|cover|stretch` controls aspect handling. Video thumbnails are
+extracted through `ffmpeg`; `--decode
 auto` tries detected hardware decode backends and falls back to CPU unless the
 build uses the `cpu-only` feature.
 

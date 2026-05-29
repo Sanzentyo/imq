@@ -121,11 +121,15 @@ pub fn preview_video(path: &Path, options: &PreviewOptions) -> Result<PreviewIma
 /// Renders a preview as terminal text/escape sequences.
 pub fn render_preview(image: &PreviewImage, mode: DisplayMode) -> String {
     match mode {
+        DisplayMode::Kitty => terminal::render_kitty(image),
         DisplayMode::Sixel => terminal::render_sixel(image),
         DisplayMode::Ansi => terminal::render_ansi_blocks(image),
         DisplayMode::None => String::new(),
         DisplayMode::Auto => {
-            if terminal_capabilities().sixel {
+            let capabilities = terminal_capabilities();
+            if capabilities.kitty {
+                terminal::render_kitty(image)
+            } else if capabilities.sixel {
                 terminal::render_sixel(image)
             } else {
                 terminal::render_ansi_blocks(image)
