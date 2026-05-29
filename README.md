@@ -58,6 +58,7 @@ Run the TUI:
 ```bash
 cargo run --bin imq -- tui reference.png distorted.png
 cargo run --bin imq -- tui
+cargo run --bin imq -- tui ./images
 ```
 
 The TUI shows a colorized metric table and an image file browser. Use the

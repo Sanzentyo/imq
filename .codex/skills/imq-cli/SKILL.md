@@ -86,6 +86,7 @@ The `tui` subcommand is enabled by default:
 ```bash
 imq tui reference.png distorted.png
 imq tui
+imq tui ./images
 ```
 
 The TUI includes a file browser. Use it to move through folders and set

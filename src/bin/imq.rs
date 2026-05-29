@@ -54,7 +54,7 @@ struct ImageCmd {
 
 #[derive(Debug, Args)]
 struct TuiCmd {
-    /// Reference/original image.
+    /// Reference/original image, or an initial directory when DISTORTED is omitted.
     reference: Option<PathBuf>,
     /// Distorted/test image.
     distorted: Option<PathBuf>,
@@ -442,7 +442,13 @@ fn montage_previews(
 fn run_tui(cmd: TuiCmd) -> Result<()> {
     #[cfg(feature = "tui")]
     {
-        tui_app::run(cmd.reference, cmd.distorted, cmd.metrics)
+        let (reference, distorted, initial_dir) =
+            if cmd.distorted.is_none() && cmd.reference.as_ref().is_some_and(|p| p.is_dir()) {
+                (None, None, cmd.reference)
+            } else {
+                (cmd.reference, cmd.distorted, None)
+            };
+        tui_app::run(reference, distorted, initial_dir, cmd.metrics)
     }
     #[cfg(not(feature = "tui"))]
     {
@@ -547,9 +553,14 @@ mod tui_app {
         fn new(
             reference: Option<PathBuf>,
             distorted: Option<PathBuf>,
+            initial_dir: Option<PathBuf>,
             metrics_csv: String,
         ) -> Result<Self> {
-            let cwd = initial_cwd(reference.as_deref(), distorted.as_deref())?;
+            let cwd = initial_cwd(
+                initial_dir.as_deref(),
+                reference.as_deref(),
+                distorted.as_deref(),
+            )?;
             let mut app = Self {
                 reference,
                 distorted,
@@ -741,9 +752,10 @@ mod tui_app {
     pub fn run(
         reference: Option<PathBuf>,
         distorted: Option<PathBuf>,
+        initial_dir: Option<PathBuf>,
         metrics_csv: String,
     ) -> Result<()> {
-        let mut app = App::new(reference, distorted, metrics_csv)?;
+        let mut app = App::new(reference, distorted, initial_dir, metrics_csv)?;
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
@@ -1000,7 +1012,14 @@ mod tui_app {
         })
     }
 
-    fn initial_cwd(reference: Option<&Path>, distorted: Option<&Path>) -> Result<PathBuf> {
+    fn initial_cwd(
+        initial_dir: Option<&Path>,
+        reference: Option<&Path>,
+        distorted: Option<&Path>,
+    ) -> Result<PathBuf> {
+        if let Some(path) = initial_dir {
+            return Ok(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+        }
         let candidate = reference.or(distorted);
         if let Some(path) = candidate.and_then(Path::parent) {
             if !path.as_os_str().is_empty() {
