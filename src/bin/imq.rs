@@ -73,12 +73,18 @@ struct PreviewCmd {
     /// Video decode policy.
     #[arg(long, value_enum, default_value_t = PreviewDecodeArg::Auto)]
     decode: PreviewDecodeArg,
-    /// Maximum cell width for each input.
-    #[arg(long, default_value_t = 48)]
-    width: u32,
-    /// Maximum cell height for each input.
-    #[arg(long, default_value_t = 24)]
-    height: u32,
+    /// Preview size for each input, for example 120x60.
+    #[arg(long, value_parser = parse_preview_size)]
+    size: Option<PreviewSize>,
+    /// Maximum preview width for each input. Overridden by --size.
+    #[arg(long)]
+    width: Option<u32>,
+    /// Maximum preview height for each input. Overridden by --size.
+    #[arg(long)]
+    height: Option<u32>,
+    /// Fit policy for the requested preview size.
+    #[arg(long, value_enum, default_value_t = PreviewFitArg::Contain)]
+    fit: PreviewFitArg,
     /// Number of montage rows.
     #[arg(long)]
     rows: Option<usize>,
@@ -103,6 +109,20 @@ enum PreviewDecodeArg {
     Auto,
     Hardware,
     Cpu,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PreviewFitArg {
+    Contain,
+    Cover,
+    Stretch,
+}
+
+#[cfg_attr(not(feature = "preview"), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+struct PreviewSize {
+    width: u32,
+    height: u32,
 }
 
 #[cfg(feature = "ffmpeg")]
@@ -355,19 +375,32 @@ fn run_formats() -> Result<()> {
 
 #[cfg(feature = "preview")]
 fn run_preview(cmd: PreviewCmd) -> Result<()> {
-    use imq::preview::{DecodeMode, DisplayMode, PreviewOptions, preview_path, render_preview};
+    use imq::preview::{
+        DecodeMode, DisplayMode, FitMode, PreviewOptions, preview_path, render_preview,
+    };
 
     if cmd.inputs.is_empty() {
         bail!("at least one input path is required");
     }
+    let (columns, rows) = preview_layout(cmd.inputs.len(), cmd.rows, cmd.cols);
+    let default_size = default_preview_size(columns, rows);
+    let size = cmd.size.unwrap_or(PreviewSize {
+        width: cmd.width.unwrap_or(default_size.width),
+        height: cmd.height.unwrap_or(default_size.height),
+    });
     let options = PreviewOptions {
-        width: cmd.width,
-        height: cmd.height,
+        width: size.width,
+        height: size.height,
         ffmpeg: cmd.ffmpeg,
         decode: match cmd.decode {
             PreviewDecodeArg::Auto => DecodeMode::Auto,
             PreviewDecodeArg::Hardware => DecodeMode::Hardware,
             PreviewDecodeArg::Cpu => DecodeMode::Cpu,
+        },
+        fit: match cmd.fit {
+            PreviewFitArg::Contain => FitMode::Contain,
+            PreviewFitArg::Cover => FitMode::Cover,
+            PreviewFitArg::Stretch => FitMode::Stretch,
         },
     };
     let mut previews = Vec::new();
@@ -380,7 +413,7 @@ fn run_preview(cmd: PreviewCmd) -> Result<()> {
     for (index, input) in cmd.inputs.iter().enumerate() {
         eprintln!("[{}] {}", index + 1, input.display());
     }
-    let image = montage_previews(&previews, cmd.rows, cmd.cols);
+    let image = montage_previews(&previews, Some(rows), Some(columns));
     let display = match cmd.display {
         PreviewDisplayArg::Auto => DisplayMode::Auto,
         PreviewDisplayArg::Sixel => DisplayMode::Sixel,
@@ -389,6 +422,61 @@ fn run_preview(cmd: PreviewCmd) -> Result<()> {
     };
     print!("{}", render_preview(&image, display));
     Ok(())
+}
+
+fn parse_preview_size(input: &str) -> std::result::Result<PreviewSize, String> {
+    let Some((width, height)) = input.split_once('x').or_else(|| input.split_once('X')) else {
+        return Err("expected WIDTHxHEIGHT, for example 120x60".to_string());
+    };
+    let width = width
+        .parse::<u32>()
+        .map_err(|_| "width must be a positive integer".to_string())?;
+    let height = height
+        .parse::<u32>()
+        .map_err(|_| "height must be a positive integer".to_string())?;
+    if width == 0 || height == 0 {
+        return Err("width and height must be non-zero".to_string());
+    }
+    Ok(PreviewSize { width, height })
+}
+
+#[cfg_attr(not(feature = "preview"), allow(dead_code))]
+fn preview_layout(count: usize, rows: Option<usize>, cols: Option<usize>) -> (usize, usize) {
+    let count = count.max(1);
+    let columns = cols
+        .or_else(|| rows.map(|r| count.div_ceil(r.max(1))))
+        .unwrap_or_else(|| (count as f64).sqrt().ceil() as usize)
+        .max(1);
+    let rows = rows
+        .unwrap_or_else(|| count.div_ceil(columns))
+        .max(count.div_ceil(columns))
+        .max(1);
+    (columns, rows)
+}
+
+#[cfg_attr(not(feature = "preview"), allow(dead_code))]
+fn default_preview_size(columns: usize, rows: usize) -> PreviewSize {
+    let terminal_width = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(120);
+    let terminal_height = std::env::var("LINES")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(40);
+    let gap = 2 * columns.saturating_sub(1) as u32;
+    PreviewSize {
+        width: terminal_width
+            .saturating_sub(gap)
+            .checked_div(columns as u32)
+            .unwrap_or(80)
+            .max(16),
+        height: (terminal_height.saturating_sub(rows.saturating_sub(1) as u32))
+            .checked_div(rows as u32)
+            .unwrap_or(24)
+            .saturating_mul(2)
+            .max(12),
+    }
 }
 
 #[cfg(not(feature = "preview"))]
@@ -541,6 +629,9 @@ mod tui_app {
         metrics_csv: String,
         comparison: Option<Comparison>,
         preview: Option<imq::preview::PreviewImage>,
+        preview_width: u32,
+        preview_height: u32,
+        preview_fit: imq::preview::FitMode,
         cwd: PathBuf,
         entries: Vec<FileEntry>,
         selected: usize,
@@ -567,6 +658,9 @@ mod tui_app {
                 metrics_csv,
                 comparison: None,
                 preview: None,
+                preview_width: 96,
+                preview_height: 48,
+                preview_fit: imq::preview::FitMode::Contain,
                 cwd,
                 entries: Vec::new(),
                 selected: 0,
@@ -735,8 +829,9 @@ mod tui_app {
                 return;
             }
             let options = imq::preview::PreviewOptions {
-                width: 34,
-                height: 14,
+                width: self.preview_width,
+                height: self.preview_height,
+                fit: self.preview_fit,
                 ..Default::default()
             };
             match imq::preview::preview_path(&entry.path, &options) {
@@ -746,6 +841,31 @@ mod tui_app {
                     self.status = format!("Preview failed: {err:#}");
                 }
             }
+        }
+
+        fn resize_preview(&mut self, larger: bool) {
+            if larger {
+                self.preview_width = (self.preview_width + self.preview_width / 4).min(512);
+                self.preview_height = (self.preview_height + self.preview_height / 4).min(256);
+            } else {
+                self.preview_width = (self.preview_width * 4 / 5).max(16);
+                self.preview_height = (self.preview_height * 4 / 5).max(8);
+            }
+            self.status = format!(
+                "Preview size: {}x{}",
+                self.preview_width, self.preview_height
+            );
+            self.update_preview();
+        }
+
+        fn cycle_preview_fit(&mut self) {
+            self.preview_fit = match self.preview_fit {
+                imq::preview::FitMode::Contain => imq::preview::FitMode::Cover,
+                imq::preview::FitMode::Cover => imq::preview::FitMode::Stretch,
+                imq::preview::FitMode::Stretch => imq::preview::FitMode::Contain,
+            };
+            self.status = format!("Preview fit: {}", fit_label(self.preview_fit));
+            self.update_preview();
         }
     }
 
@@ -796,6 +916,10 @@ mod tui_app {
                     Span::raw(" open/set  "),
                     Span::styled("g/G", Style::default().fg(Color::Cyan)),
                     Span::raw(" top/end  "),
+                    Span::styled("+/-", Style::default().fg(Color::Magenta)),
+                    Span::raw(" size  "),
+                    Span::styled("f", Style::default().fg(Color::Magenta)),
+                    Span::raw(" fit  "),
                     Span::styled("Tab", Style::default().fg(Color::Yellow)),
                     Span::raw(" target  "),
                     Span::styled("r/d", Style::default().fg(Color::Yellow)),
@@ -824,6 +948,9 @@ mod tui_app {
                     KeyCode::Char('r') => app.set_slot(Slot::Reference),
                     KeyCode::Char('d') => app.set_slot(Slot::Distorted),
                     KeyCode::Char('c') => app.compare_selected(),
+                    KeyCode::Char('+') | KeyCode::Char('=') => app.resize_preview(true),
+                    KeyCode::Char('-') => app.resize_preview(false),
+                    KeyCode::Char('f') => app.cycle_preview_fit(),
                     _ => {}
                 }
             }
@@ -973,7 +1100,13 @@ mod tui_app {
             frame.render_widget(empty, area);
             return;
         };
-        let inner = panel_block(format!(" preview: {} ", preview.source));
+        let inner = panel_block(format!(
+            " preview: {} {}x{} {} ",
+            preview.source,
+            app.preview_width,
+            app.preview_height,
+            fit_label(app.preview_fit)
+        ));
         let content_area = inner.inner(area);
         frame.render_widget(inner, area);
         let max_rows = u32::from(content_area.height).min(preview.height);
@@ -1149,6 +1282,14 @@ mod tui_app {
             "normalized_code^2" => "norm^2".to_string(),
             "normalized_code" => "norm".to_string(),
             other => other.to_string(),
+        }
+    }
+
+    fn fit_label(fit: imq::preview::FitMode) -> &'static str {
+        match fit {
+            imq::preview::FitMode::Contain => "contain",
+            imq::preview::FitMode::Cover => "cover",
+            imq::preview::FitMode::Stretch => "stretch",
         }
     }
 }

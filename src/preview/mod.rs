@@ -22,6 +22,17 @@ pub enum DecodeMode {
     Cpu,
 }
 
+/// How previews should fit into the requested dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FitMode {
+    /// Preserve aspect ratio and fit entirely inside the requested dimensions.
+    Contain,
+    /// Preserve aspect ratio, fill the requested dimensions, and center-crop overflow.
+    Cover,
+    /// Ignore aspect ratio and stretch to the requested dimensions.
+    Stretch,
+}
+
 /// Small RGB preview image.
 #[derive(Debug, Clone)]
 pub struct PreviewImage {
@@ -55,6 +66,8 @@ pub struct PreviewOptions {
     pub ffmpeg: PathBuf,
     /// Video decode mode.
     pub decode: DecodeMode,
+    /// Fit policy for resizing.
+    pub fit: FitMode,
 }
 
 impl Default for PreviewOptions {
@@ -64,6 +77,7 @@ impl Default for PreviewOptions {
             height: 40,
             ffmpeg: PathBuf::from("ffmpeg"),
             decode: DecodeMode::Auto,
+            fit: FitMode::Contain,
         }
     }
 }
@@ -84,6 +98,7 @@ pub fn preview_image(path: &Path, options: &PreviewOptions) -> Result<PreviewIma
         image,
         options.width,
         options.height,
+        options.fit,
         "image".to_string(),
     ))
 }
@@ -98,6 +113,7 @@ pub fn preview_video(path: &Path, options: &PreviewOptions) -> Result<PreviewIma
         image,
         options.width,
         options.height,
+        options.fit,
         frame.source,
     ))
 }
@@ -135,19 +151,35 @@ fn dynamic_to_preview(
     image: DynamicImage,
     max_width: u32,
     max_height: u32,
+    fit: FitMode,
     source: String,
 ) -> PreviewImage {
     let (width, height) = image.dimensions();
     let max_width = max_width.max(1);
     let max_height = max_height.max(1);
-    let scale = (max_width as f64 / f64::from(width))
-        .min(max_height as f64 / f64::from(height))
-        .min(1.0);
-    let target_width = (f64::from(width) * scale).round().max(1.0) as u32;
-    let target_height = (f64::from(height) * scale).round().max(1.0) as u32;
-    let resized = image
-        .resize_exact(target_width, target_height, FilterType::Triangle)
-        .to_rgb8();
+    let resized = match fit {
+        FitMode::Contain => {
+            let scale =
+                (max_width as f64 / f64::from(width)).min(max_height as f64 / f64::from(height));
+            let target_width = (f64::from(width) * scale).round().max(1.0) as u32;
+            let target_height = (f64::from(height) * scale).round().max(1.0) as u32;
+            image.resize_exact(target_width, target_height, FilterType::Triangle)
+        }
+        FitMode::Cover => {
+            let scale =
+                (max_width as f64 / f64::from(width)).max(max_height as f64 / f64::from(height));
+            let resized_width = (f64::from(width) * scale).round().max(1.0) as u32;
+            let resized_height = (f64::from(height) * scale).round().max(1.0) as u32;
+            let resized = image.resize_exact(resized_width, resized_height, FilterType::Triangle);
+            let crop_x = resized_width.saturating_sub(max_width) / 2;
+            let crop_y = resized_height.saturating_sub(max_height) / 2;
+            resized.crop_imm(crop_x, crop_y, max_width, max_height)
+        }
+        FitMode::Stretch => image.resize_exact(max_width, max_height, FilterType::Triangle),
+    };
+    let resized = resized.to_rgb8();
+    let target_width = resized.width();
+    let target_height = resized.height();
     let pixels = resized.pixels().map(|p| [p[0], p[1], p[2]]).collect();
     PreviewImage {
         width: target_width,

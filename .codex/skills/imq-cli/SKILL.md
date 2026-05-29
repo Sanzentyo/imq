@@ -71,13 +71,16 @@ appears to support it and ANSI color blocks otherwise.
 ```bash
 imq preview image.png
 imq preview --display sixel --cols 2 a.png b.png clip.mp4
+imq preview --size 120x60 --fit cover image.png
 imq preview --decode cpu clip.mp4
 ```
 
 Multiple inputs are arranged as a montage. Use `--rows` or `--cols` to control
-the layout. Video thumbnails are extracted through `ffmpeg`; `--decode auto`
-tries detected hardware decode backends and falls back to CPU unless the build
-uses the `cpu-only` feature.
+the layout. Omit `--size` to derive preview dimensions from the terminal size,
+or pass `--size WIDTHxHEIGHT`; `--fit contain|cover|stretch` controls aspect
+handling. Video thumbnails are extracted through `ffmpeg`; `--decode auto` tries
+detected hardware decode backends and falls back to CPU unless the build uses
+the `cpu-only` feature.
 
 ## TUI
 
@@ -93,7 +96,8 @@ The TUI includes a file browser. Use it to move through folders and set
 reference/distorted images without restarting. When testing non-interactively,
 run it in a PTY and send `q` or Esc to exit. Vim-style navigation is supported:
 `j`/`k` move, `h` goes to the parent directory, `l` opens/selects, and `g`/`G`
-jump to the first/last entry.
+jump to the first/last entry. Use `+`/`-` to adjust preview resolution and `f`
+to cycle fit mode.
 
 ## GPU and NN Features
 
