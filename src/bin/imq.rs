@@ -7,6 +7,7 @@ use imq::metrics::MetricSet;
 use imq::report::{ComparisonReport, VideoReport};
 use imq::{Dimensions, MetricOutput};
 use serde::Serialize;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
@@ -71,6 +72,8 @@ struct ImageCmd {
     #[arg(long, default_value_t = 16)]
     histogram_bins: usize,
     #[command(flatten)]
+    stdin: StdinImageArgs,
+    #[command(flatten)]
     output: OutputArgs,
 }
 
@@ -84,6 +87,8 @@ struct StatsCmd {
     /// Print JSON instead of text.
     #[arg(long)]
     json: bool,
+    #[command(flatten)]
+    stdin: StdinImageArgs,
     #[command(flatten)]
     output: OutputArgs,
 }
@@ -114,6 +119,8 @@ struct CompareCmd {
     /// Number of histogram bins to emit when --stats is used.
     #[arg(long, default_value_t = 16)]
     histogram_bins: usize,
+    #[command(flatten)]
+    stdin: StdinImageArgs,
     /// Compare every Nth decoded video frame.
     #[cfg(feature = "ffmpeg")]
     #[arg(long, default_value_t = 1)]
@@ -208,6 +215,39 @@ enum OutputFormatArg {
     Yaml,
     Toml,
     Csv,
+}
+
+#[derive(Debug, Args, Clone, Copy)]
+struct StdinImageArgs {
+    /// How to decode `-` image input from stdin.
+    #[arg(long, value_enum, default_value_t = StdinImageFormatArg::Encoded)]
+    stdin_format: StdinImageFormatArg,
+    /// Raw stdin image width in pixels.
+    #[arg(long)]
+    raw_width: Option<u32>,
+    /// Raw stdin image height in pixels.
+    #[arg(long)]
+    raw_height: Option<u32>,
+    /// Raw stdin pixel format.
+    #[arg(long, value_enum, default_value_t = RawPixelFormatArg::Rgba8)]
+    raw_pixel_format: RawPixelFormatArg,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum StdinImageFormatArg {
+    /// Decode stdin as an encoded image such as PNG/JPEG/WebP.
+    Encoded,
+    /// Interpret stdin as raw packed pixel bytes.
+    Raw,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RawPixelFormatArg {
+    Rgb8,
+    Rgba8,
+    Bgr8,
+    Bgra8,
+    Luma8,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -343,6 +383,7 @@ fn run_stats(cmd: StatsCmd) -> Result<()> {
     run_image_stats(
         &cmd.input,
         cmd.histogram_bins,
+        cmd.stdin,
         output_format(cmd.json, cmd.output.format),
         &cmd.output,
     )
@@ -354,6 +395,7 @@ fn run_compare(cmd: CompareCmd) -> Result<()> {
             return run_image_stats(
                 &cmd.reference,
                 cmd.histogram_bins,
+                cmd.stdin,
                 output_format(cmd.json, cmd.output.format),
                 &cmd.output,
             );
@@ -365,15 +407,13 @@ fn run_compare(cmd: CompareCmd) -> Result<()> {
     let distorted_is_video = is_video_path(distorted);
     match (reference_is_video, distorted_is_video) {
         (false, false) => {
-            let report = compare_image_paths(&cmd.reference, distorted, &cmd.metrics)?;
-            let stats = if cmd.stats {
-                Some(ImageComparisonStats {
-                    reference: image_stats_for_path(&cmd.reference, cmd.histogram_bins)?,
-                    distorted: image_stats_for_path(distorted, cmd.histogram_bins)?,
-                })
-            } else {
-                None
-            };
+            let (report, stats) = compare_image_paths(
+                &cmd.reference,
+                distorted,
+                &cmd.metrics,
+                cmd.stdin,
+                cmd.stats.then_some(cmd.histogram_bins),
+            )?;
             write_sqlite_report(cmd.output.sqlite.as_deref(), SqlReport::Image(&report))?;
             if let Some(stats) = &stats {
                 write_sqlite_stats(cmd.output.sqlite.as_deref(), &stats.reference)?;
@@ -427,13 +467,15 @@ fn run_compare(cmd: CompareCmd) -> Result<()> {
 }
 
 fn run_image(cmd: ImageCmd) -> Result<()> {
-    let report = compare_image_paths(&cmd.reference, &cmd.distorted, &cmd.metrics)?;
+    let (report, stats) = compare_image_paths(
+        &cmd.reference,
+        &cmd.distorted,
+        &cmd.metrics,
+        cmd.stdin,
+        cmd.stats.then_some(cmd.histogram_bins),
+    )?;
     write_sqlite_report(cmd.output.sqlite.as_deref(), SqlReport::Image(&report))?;
-    if cmd.stats {
-        let stats = ImageComparisonStats {
-            reference: image_stats_for_path(&cmd.reference, cmd.histogram_bins)?,
-            distorted: image_stats_for_path(&cmd.distorted, cmd.histogram_bins)?,
-        };
+    if let Some(stats) = stats {
         write_sqlite_stats(cmd.output.sqlite.as_deref(), &stats.reference)?;
         write_sqlite_stats(cmd.output.sqlite.as_deref(), &stats.distorted)?;
         emit_image_comparison_stats_report(
@@ -458,55 +500,144 @@ fn compare_image_paths(
     reference_path: &Path,
     distorted_path: &Path,
     metrics_csv: &str,
-) -> Result<ComparisonReport> {
-    let reference = image_crate::load_image_path(reference_path).with_context(|| {
+    stdin: StdinImageArgs,
+    histogram_bins: Option<usize>,
+) -> Result<(ComparisonReport, Option<ImageComparisonStats>)> {
+    reject_double_stdin(reference_path, Some(distorted_path))?;
+    let reference = load_image_input(reference_path, stdin).with_context(|| {
         format!(
             "failed to decode reference image `{}`",
-            reference_path.display()
+            image_input_label(reference_path)
         )
     })?;
-    let distorted = image_crate::load_image_path(distorted_path).with_context(|| {
+    let distorted = load_image_input(distorted_path, stdin).with_context(|| {
         format!(
             "failed to decode distorted image `{}`",
-            distorted_path.display()
+            image_input_label(distorted_path)
         )
     })?;
     let metrics = MetricSet::from_csv(metrics_csv)?;
     let outputs = metrics.compare(&reference.as_view(), &distorted.as_view())?;
-    Ok(ComparisonReport::new(
+    let report = ComparisonReport::new(
         reference.dimensions(),
         reference.format(),
         distorted.format(),
         outputs,
     )
     .with_labels(
-        reference_path.display().to_string(),
-        distorted_path.display().to_string(),
-    ))
+        image_input_label(reference_path),
+        image_input_label(distorted_path),
+    );
+    let stats = histogram_bins
+        .map(|histogram_bins| {
+            Ok::<_, anyhow::Error>(ImageComparisonStats {
+                reference: image_stats_for_frame(
+                    image_input_label(reference_path),
+                    &reference,
+                    histogram_bins,
+                )?,
+                distorted: image_stats_for_frame(
+                    image_input_label(distorted_path),
+                    &distorted,
+                    histogram_bins,
+                )?,
+            })
+        })
+        .transpose()?;
+    Ok((report, stats))
 }
 
 fn run_image_stats(
     input: &Path,
     histogram_bins: usize,
+    stdin: StdinImageArgs,
     format: OutputFormatArg,
     output: &OutputArgs,
 ) -> Result<()> {
-    let report = image_stats_for_path(input, histogram_bins)?;
+    let report = image_stats_for_path(input, histogram_bins, stdin)?;
     write_sqlite_stats(output.sqlite.as_deref(), &report)?;
     emit_stats_report(&report, format, output)
 }
 
-fn image_stats_for_path(input: &Path, histogram_bins: usize) -> Result<ImageStatsReport> {
-    let image = image_crate::load_image_path(input)
-        .with_context(|| format!("failed to decode image `{}`", input.display()))?;
+fn image_stats_for_path(
+    input: &Path,
+    histogram_bins: usize,
+    stdin: StdinImageArgs,
+) -> Result<ImageStatsReport> {
+    let image = load_image_input(input, stdin)
+        .with_context(|| format!("failed to decode image `{}`", image_input_label(input)))?;
+    image_stats_for_frame(image_input_label(input), &image, histogram_bins)
+}
+
+fn image_stats_for_frame(
+    input: String,
+    image: &imq::FrameOwned,
+    histogram_bins: usize,
+) -> Result<ImageStatsReport> {
     let stats = imq::image_statistics(
         &image.as_view(),
         imq::ImageStatisticsOptions { histogram_bins },
     )?;
-    Ok(ImageStatsReport {
-        input: input.display().to_string(),
-        stats,
-    })
+    Ok(ImageStatsReport { input, stats })
+}
+
+fn load_image_input(path: &Path, stdin: StdinImageArgs) -> Result<imq::FrameOwned> {
+    if !is_stdin_path(path) {
+        return Ok(image_crate::load_image_path(path)?);
+    }
+
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut bytes)
+        .with_context(|| "failed to read image bytes from stdin")?;
+    match stdin.stdin_format {
+        StdinImageFormatArg::Encoded => Ok(image_crate::decode_image_bytes(&bytes)?),
+        StdinImageFormatArg::Raw => {
+            let width = stdin
+                .raw_width
+                .ok_or_else(|| anyhow::anyhow!("--raw-width is required for raw stdin"))?;
+            let height = stdin
+                .raw_height
+                .ok_or_else(|| anyhow::anyhow!("--raw-height is required for raw stdin"))?;
+            Ok(imq::FrameOwned::packed_tight(
+                bytes,
+                width,
+                height,
+                stdin.raw_pixel_format.into(),
+            )?)
+        }
+    }
+}
+
+fn reject_double_stdin(first: &Path, second: Option<&Path>) -> Result<()> {
+    if is_stdin_path(first) && second.is_some_and(is_stdin_path) {
+        bail!("stdin input `-` can only be used for one image argument")
+    }
+    Ok(())
+}
+
+fn is_stdin_path(path: &Path) -> bool {
+    path == Path::new("-")
+}
+
+fn image_input_label(path: &Path) -> String {
+    if is_stdin_path(path) {
+        "stdin".to_string()
+    } else {
+        path.display().to_string()
+    }
+}
+
+impl From<RawPixelFormatArg> for imq::PixelFormat {
+    fn from(value: RawPixelFormatArg) -> Self {
+        match value {
+            RawPixelFormatArg::Rgb8 => Self::Rgb8,
+            RawPixelFormatArg::Rgba8 => Self::Rgba8,
+            RawPixelFormatArg::Bgr8 => Self::Bgr8,
+            RawPixelFormatArg::Bgra8 => Self::Bgra8,
+            RawPixelFormatArg::Luma8 => Self::Luma8,
+        }
+    }
 }
 
 #[cfg(feature = "ffmpeg")]

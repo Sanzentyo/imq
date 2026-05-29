@@ -41,6 +41,8 @@ cargo run --bin imq -- compare reference.mp4 distorted.mp4 --every 30 --max-fram
 cargo run --bin imq -- c image.png -s --format yaml
 cargo run --bin imq -- compare reference.png distorted.webp -s --format json
 cargo run --bin imq -- stats image.png --format toml
+cat image.png | cargo run --bin imq -- stats - --format json
+cat image.rgba | cargo run --bin imq -- stats - --stdin-format raw --raw-width 1920 --raw-height 1080 --raw-pixel-format rgba8
 ```
 
 Explicit still-image comparison remains available:
@@ -65,6 +67,11 @@ and `formats` with `--format text|json|yaml|toml|csv`; `--json` is kept as an
 alias for `--format json`. Use `--output PATH` to write the selected
 representation to a file. Use `--sqlite PATH` to append reports, metric rows,
 probe rows, image statistics, and format hints to SQLite tables.
+
+Use `-` as an image input to read encoded image bytes from stdin. For raw packed
+stdin bytes, pass `--stdin-format raw` with `--raw-width`, `--raw-height`, and
+`--raw-pixel-format rgb8|rgba8|bgr8|bgra8|luma8`. Stdin can be used for only one
+image argument per command.
 
 Extract one decoded video frame:
 
