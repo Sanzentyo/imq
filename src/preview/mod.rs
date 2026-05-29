@@ -1,6 +1,7 @@
 //! Terminal-friendly still-image and video preview generation.
 
 use crate::{Error, Result};
+use fast_image_resize::{ResizeOptions, Resizer};
 use image::{DynamicImage, GenericImageView, ImageReader, imageops::FilterType};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -23,7 +24,7 @@ pub enum DecodeMode {
 }
 
 /// How previews should fit into the requested dimensions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FitMode {
     /// Preserve aspect ratio and fit entirely inside the requested dimensions.
     Contain,
@@ -171,19 +172,19 @@ fn dynamic_to_preview(
                 (max_width as f64 / f64::from(width)).min(max_height as f64 / f64::from(height));
             let target_width = (f64::from(width) * scale).round().max(1.0) as u32;
             let target_height = (f64::from(height) * scale).round().max(1.0) as u32;
-            image.resize_exact(target_width, target_height, FilterType::Triangle)
+            fast_resize_rgb(&image, target_width, target_height)
         }
         FitMode::Cover => {
             let scale =
                 (max_width as f64 / f64::from(width)).max(max_height as f64 / f64::from(height));
             let resized_width = (f64::from(width) * scale).round().max(1.0) as u32;
             let resized_height = (f64::from(height) * scale).round().max(1.0) as u32;
-            let resized = image.resize_exact(resized_width, resized_height, FilterType::Triangle);
+            let resized = fast_resize_rgb(&image, resized_width, resized_height);
             let crop_x = resized_width.saturating_sub(max_width) / 2;
             let crop_y = resized_height.saturating_sub(max_height) / 2;
             resized.crop_imm(crop_x, crop_y, max_width, max_height)
         }
-        FitMode::Stretch => image.resize_exact(max_width, max_height, FilterType::Triangle),
+        FitMode::Stretch => fast_resize_rgb(&image, max_width, max_height),
     };
     let resized = resized.to_rgb8();
     let target_width = resized.width();
@@ -196,6 +197,17 @@ fn dynamic_to_preview(
         source_height: height,
         pixels,
         source,
+    }
+}
+
+fn fast_resize_rgb(image: &DynamicImage, target_width: u32, target_height: u32) -> DynamicImage {
+    let src = DynamicImage::ImageRgb8(image.to_rgb8());
+    let mut dst = DynamicImage::new_rgb8(target_width, target_height);
+    let mut resizer = Resizer::new();
+    let options = ResizeOptions::new();
+    match resizer.resize(&src, &mut dst, &options) {
+        Ok(()) => dst,
+        Err(_) => image.resize_exact(target_width, target_height, FilterType::Triangle),
     }
 }
 

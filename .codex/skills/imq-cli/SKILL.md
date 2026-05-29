@@ -135,6 +135,7 @@ The `tui` subcommand is enabled by default:
 imq tui reference.png distorted.png
 imq tui
 imq tui ./images
+imq tui --preview-cache 64 ./images
 ```
 
 The TUI includes a file browser. Use it to move through folders and set
@@ -142,7 +143,9 @@ reference/distorted images without restarting. When testing non-interactively,
 run it in a PTY and send `q` or Esc to exit. Vim-style navigation is supported:
 `j`/`k` move, `h` goes to the parent directory, `l` opens/selects, and `g`/`G`
 jump to the first/last entry. Use `+`/`-` to adjust preview resolution and `f`
-to cycle fit mode.
+to cycle fit mode. The TUI uses native Kitty/Sixel/iTerm2 image protocols when
+the terminal reports support, falls back to half-block rendering otherwise, and
+keeps decoded previews in memory according to `--preview-cache`.
 
 ## GPU and NN Features
 

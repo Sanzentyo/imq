@@ -24,9 +24,9 @@ std = []
 serde = ["dep:serde", "dep:serde_json"]
 image-codecs = ["dep:image"]
 cli = ["std", "serde", "image-codecs", "ffmpeg", "dep:anyhow", "dep:clap", "dep:csv", "dep:rusqlite", "dep:serde_yaml_ng", "dep:toml", "dep:tracing", "dep:tracing-subscriber"]
-tui = ["cli", "preview", "dep:ratatui", "dep:crossterm"]
+tui = ["cli", "preview", "dep:ratatui", "dep:crossterm", "dep:ratatui-image"]
 ffmpeg = ["std", "serde"]
-preview = ["std", "image-codecs", "ffmpeg", "dep:base64"]
+preview = ["std", "image-codecs", "ffmpeg", "dep:base64", "dep:fast_image_resize"]
 cpu-only = []
 gpu = ["std", "dep:wgpu", "dep:pollster", "dep:bytemuck"]
 nn-burn = ["std", "dep:burn"]
@@ -47,6 +47,8 @@ serde_yaml_ng = { version = "0.10.0", optional = true }
 toml = { version = "1.1.2", optional = true }
 ratatui = { version = "0.30.0", optional = true }
 crossterm = { version = "0.29.0", optional = true }
+ratatui-image = { version = "11.0.2", default-features = false, features = ["crossterm"], optional = true }
+fast_image_resize = { version = "6.0.0", features = ["image"], optional = true }
 tracing = { version = "0.1.44", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
 wgpu = { version = "29.0.3", features = ["wgsl"], optional = true }

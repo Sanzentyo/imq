@@ -102,6 +102,9 @@ struct TuiCmd {
     /// Comma-separated metrics.
     #[arg(long, default_value = "psnr,ssim,mse,mae,maxae")]
     metrics: String,
+    /// Number of decoded previews to keep in memory.
+    #[arg(long, default_value_t = 32)]
+    preview_cache: usize,
 }
 
 #[derive(Debug, Args)]
@@ -1643,7 +1646,13 @@ fn run_tui(cmd: TuiCmd) -> Result<()> {
             } else {
                 (cmd.reference, cmd.distorted, None)
             };
-        tui_app::run(reference, distorted, initial_dir, cmd.metrics)
+        tui_app::run(
+            reference,
+            distorted,
+            initial_dir,
+            cmd.metrics,
+            cmd.preview_cache,
+        )
     }
     #[cfg(not(feature = "tui"))]
     {
@@ -1688,6 +1697,10 @@ mod tui_app {
     use ratatui::widgets::{
         Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table,
     };
+    use ratatui_image::picker::Picker;
+    use ratatui_image::protocol::StatefulProtocol;
+    use ratatui_image::{Resize, StatefulImage};
+    use std::collections::{HashMap, VecDeque};
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
@@ -1728,6 +1741,64 @@ mod tui_app {
         metrics: Vec<MetricOutput>,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    struct PreviewCacheKey {
+        path: PathBuf,
+        width: u32,
+        height: u32,
+        fit: imq::preview::FitMode,
+    }
+
+    #[derive(Debug)]
+    struct PreviewCache {
+        capacity: usize,
+        order: VecDeque<PreviewCacheKey>,
+        entries: HashMap<PreviewCacheKey, imq::preview::PreviewImage>,
+    }
+
+    impl PreviewCache {
+        fn new(capacity: usize) -> Self {
+            Self {
+                capacity,
+                order: VecDeque::new(),
+                entries: HashMap::new(),
+            }
+        }
+
+        fn get(&mut self, key: &PreviewCacheKey) -> Option<imq::preview::PreviewImage> {
+            let preview = self.entries.get(key)?.clone();
+            self.touch(key);
+            Some(preview)
+        }
+
+        fn insert(&mut self, key: PreviewCacheKey, preview: imq::preview::PreviewImage) {
+            if self.capacity == 0 {
+                return;
+            }
+            if self.entries.contains_key(&key) {
+                self.touch(&key);
+                self.entries.insert(key, preview);
+                return;
+            }
+            while self.entries.len() >= self.capacity {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.entries.remove(&oldest);
+                } else {
+                    break;
+                }
+            }
+            self.order.push_back(key.clone());
+            self.entries.insert(key, preview);
+        }
+
+        fn touch(&mut self, key: &PreviewCacheKey) {
+            if let Some(index) = self.order.iter().position(|existing| existing == key) {
+                self.order.remove(index);
+            }
+            self.order.push_back(key.clone());
+        }
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum PreviewResolution {
         Fixed { width: u32, height: u32 },
@@ -1740,6 +1811,9 @@ mod tui_app {
         metrics_csv: String,
         comparison: Option<Comparison>,
         preview: Option<imq::preview::PreviewImage>,
+        preview_protocol: Option<StatefulProtocol>,
+        preview_picker: Picker,
+        preview_cache: PreviewCache,
         preview_resolution: PreviewResolution,
         preview_fit: imq::preview::FitMode,
         cwd: PathBuf,
@@ -1756,6 +1830,8 @@ mod tui_app {
             distorted: Option<PathBuf>,
             initial_dir: Option<PathBuf>,
             metrics_csv: String,
+            preview_picker: Picker,
+            preview_cache_capacity: usize,
         ) -> Result<Self> {
             let cwd = initial_cwd(
                 initial_dir.as_deref(),
@@ -1768,6 +1844,9 @@ mod tui_app {
                 metrics_csv,
                 comparison: None,
                 preview: None,
+                preview_protocol: None,
+                preview_picker,
+                preview_cache: PreviewCache::new(preview_cache_capacity),
                 preview_resolution: PreviewResolution::Fixed {
                     width: 192,
                     height: 96,
@@ -1934,13 +2013,25 @@ mod tui_app {
         fn update_preview(&mut self) {
             let Some(entry) = self.entries.get(self.selected) else {
                 self.preview = None;
+                self.preview_protocol = None;
                 return;
             };
             if entry.is_dir {
                 self.preview = None;
+                self.preview_protocol = None;
                 return;
             }
             let (width, height) = self.requested_preview_size();
+            let key = PreviewCacheKey {
+                path: entry.path.clone(),
+                width,
+                height,
+                fit: self.preview_fit,
+            };
+            if let Some(preview) = self.preview_cache.get(&key) {
+                self.set_preview(preview);
+                return;
+            }
             let options = imq::preview::PreviewOptions {
                 width,
                 height,
@@ -1948,12 +2039,22 @@ mod tui_app {
                 ..Default::default()
             };
             match imq::preview::preview_path(&entry.path, &options) {
-                Ok(preview) => self.preview = Some(preview),
+                Ok(preview) => {
+                    self.preview_cache.insert(key, preview.clone());
+                    self.set_preview(preview);
+                }
                 Err(err) => {
                     self.preview = None;
+                    self.preview_protocol = None;
                     self.status = format!("Preview failed: {err:#}");
                 }
             }
+        }
+
+        fn set_preview(&mut self, preview: imq::preview::PreviewImage) {
+            self.preview_protocol = preview_to_dynamic(&preview)
+                .map(|image| self.preview_picker.new_resize_protocol(image));
+            self.preview = Some(preview);
         }
 
         fn resize_preview(&mut self, larger: bool) {
@@ -2030,13 +2131,30 @@ mod tui_app {
         distorted: Option<PathBuf>,
         initial_dir: Option<PathBuf>,
         metrics_csv: String,
+        preview_cache_capacity: usize,
     ) -> Result<()> {
-        let mut app = App::new(reference, distorted, initial_dir, metrics_csv)?;
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
+        let preview_picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
+        let mut app = match App::new(
+            reference,
+            distorted,
+            initial_dir,
+            metrics_csv,
+            preview_picker,
+            preview_cache_capacity,
+        ) {
+            Ok(app) => app,
+            Err(err) => {
+                disable_raw_mode()?;
+                execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+                terminal.show_cursor()?;
+                return Err(err);
+            }
+        };
 
         let result = loop {
             terminal.draw(|frame| {
@@ -2060,7 +2178,7 @@ mod tui_app {
                     .direction(LayoutDirection::Vertical)
                     .constraints([Constraint::Length(17), Constraint::Min(5)])
                     .split(body[1]);
-                render_preview_panel(frame, right[0], &app);
+                render_preview_panel(frame, right[0], &mut app);
                 render_metrics(frame, right[1], &app);
 
                 let footer = Paragraph::new(Line::from(vec![
@@ -2249,7 +2367,7 @@ mod tui_app {
         frame.render_widget(table, area);
     }
 
-    fn render_preview_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    fn render_preview_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         let Some(preview) = &app.preview else {
             let empty =
                 Paragraph::new("Select an image or video file").block(panel_block(" preview "));
@@ -2264,6 +2382,14 @@ mod tui_app {
         ));
         let content_area = inner.inner(area);
         frame.render_widget(inner, area);
+        if let Some(protocol) = &mut app.preview_protocol {
+            frame.render_stateful_widget(
+                StatefulImage::default().resize(Resize::Fit(None)),
+                content_area,
+                protocol,
+            );
+            return;
+        }
         let (display_cols, display_pixel_rows) = fitted_preview_cells(preview, content_area);
         if display_cols == 0 || display_pixel_rows == 0 {
             return;
@@ -2300,6 +2426,16 @@ mod tui_app {
                 },
             );
         }
+    }
+
+    fn preview_to_dynamic(preview: &imq::preview::PreviewImage) -> Option<image::DynamicImage> {
+        let mut raw = Vec::with_capacity(preview.pixels.len() * 3);
+        preview
+            .pixels
+            .iter()
+            .for_each(|pixel| raw.extend_from_slice(pixel));
+        image::RgbImage::from_raw(preview.width, preview.height, raw)
+            .map(image::DynamicImage::ImageRgb8)
     }
 
     fn fitted_preview_cells(preview: &imq::preview::PreviewImage, area: Rect) -> (u32, u32) {

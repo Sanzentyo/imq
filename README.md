@@ -85,6 +85,7 @@ Run the TUI:
 cargo run --bin imq -- tui reference.png distorted.png
 cargo run --bin imq -- tui
 cargo run --bin imq -- tui ./images
+cargo run --bin imq -- tui --preview-cache 64 ./images
 ```
 
 The TUI shows a colorized metric table and an image file browser. Use the
@@ -121,6 +122,10 @@ detection. Fit modes are
 source image dimensions. In the TUI, use `+`/`-` to change preview resolution
 and `f` to cycle the fit mode; pressing `+` at the source dimensions switches to
 `max`, which keeps using each selected file's own maximum preview resolution.
+The TUI queries the terminal for native image support and renders through Kitty,
+Sixel, or iTerm2 protocols when available, falling back to half-blocks. Decoded
+previews are resized with `fast_image_resize` and cached in memory; use
+`--preview-cache N` to tune how many previews are kept.
 
 Common subcommand aliases are available: `i` for `image`, `v` for `video`, `p`
 for `preview`, `t` for `tui`, `fmt` for `formats`, and `x`/`extract` for
