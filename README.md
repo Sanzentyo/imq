@@ -33,7 +33,16 @@ Default features are `std`, `serde`, `image-codecs`, `cli`, `tui`, and `preview`
 
 ## CLI examples
 
-Compare still images:
+Compare images or videos with automatic handling based on file extensions:
+
+```bash
+cargo run --bin imq -- compare reference.png distorted.webp --metrics psnr,ssim,mse,mae,maxae
+cargo run --bin imq -- compare reference.mp4 distorted.mp4 --every 30 --max-frames 120
+cargo run --bin imq -- compare image.png --stats --format yaml
+cargo run --bin imq -- compare reference.png distorted.webp --stats --format json
+```
+
+Explicit still-image comparison remains available:
 
 ```bash
 cargo run --bin imq -- image reference.png distorted.webp --metrics psnr,ssim,mse,mae,maxae
@@ -42,7 +51,7 @@ cargo run --bin imq -- image reference.png distorted.webp --format yaml --output
 cargo run --bin imq -- image reference.png distorted.webp --format csv --sqlite reports.sqlite
 ```
 
-Compare videos by decoding RGBA frames with `ffmpeg`:
+Explicit video comparison by decoding RGBA frames with `ffmpeg`:
 
 ```bash
 cargo run --bin imq -- video reference.mp4 distorted.mp4 --every 30 --max-frames 120
@@ -50,12 +59,11 @@ cargo run --bin imq -- video reference.mp4 distorted.mp4 --width 1920 --height 1
 cargo run --bin imq -- video reference.mp4 distorted.mp4 --format toml --output video-report.toml
 ```
 
-Structured output is available on `image`, `video`, `probe`, and `formats` with
-`--format text|json|yaml|toml|csv`; `--json` is kept as an alias for
-`--format json`. Use `--output PATH` to write the selected representation to a
-file. Use `--sqlite PATH` to append reports and metric rows to a SQLite database
-through tables such as `imq_reports`, `imq_metrics`, `imq_probe_reports`, and
-`imq_formats`.
+Structured output is available on `compare`, `image`, `video`, `probe`, and
+`formats` with `--format text|json|yaml|toml|csv`; `--json` is kept as an alias
+for `--format json`. Use `--output PATH` to write the selected representation to
+a file. Use `--sqlite PATH` to append reports, metric rows, probe rows, image
+statistics, and format hints to SQLite tables.
 
 Extract one decoded video frame:
 

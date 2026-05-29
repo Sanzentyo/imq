@@ -20,6 +20,7 @@ pub mod error;
 pub mod frame;
 pub mod metrics;
 pub mod report;
+pub mod stats;
 
 #[cfg(feature = "ffmpeg")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ffmpeg")))]
@@ -46,3 +47,4 @@ pub use metrics::{
     Direction, Metric, MetricOutput, MetricSet, MetricSpec, SampleDomain, compare_with_defaults,
 };
 pub use report::{ComparisonReport, FrameReport, VideoReport};
+pub use stats::{ImageStatistics, ImageStatisticsOptions, image_statistics};

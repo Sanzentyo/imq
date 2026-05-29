@@ -20,6 +20,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Compare or inspect media, automatically selecting image/video handling by extension.
+    #[command(alias = "c", alias = "cmp")]
+    Compare(CompareCmd),
     /// Compare two still images decoded by the image crate.
     #[command(alias = "i")]
     Image(ImageCmd),
@@ -58,6 +61,12 @@ struct ImageCmd {
     /// Print JSON instead of a text table.
     #[arg(long)]
     json: bool,
+    /// Include per-image statistics, color balance, histograms, and tendencies.
+    #[arg(long)]
+    stats: bool,
+    /// Number of histogram bins to emit when --stats is used.
+    #[arg(long, default_value_t = 16)]
+    histogram_bins: usize,
     #[command(flatten)]
     output: OutputArgs,
 }
@@ -71,6 +80,56 @@ struct TuiCmd {
     /// Comma-separated metrics.
     #[arg(long, default_value = "psnr,ssim,mse,mae,maxae")]
     metrics: String,
+}
+
+#[derive(Debug, Args)]
+struct CompareCmd {
+    /// Reference/original image or video. With --stats and no DISTORTED, reports image statistics.
+    reference: PathBuf,
+    /// Distorted/test image or video.
+    distorted: Option<PathBuf>,
+    /// Comma-separated metrics.
+    #[arg(long, default_value = "psnr,ssim,mse,mae,maxae")]
+    metrics: String,
+    /// Include image statistics, color balance, histograms, and tendencies.
+    #[arg(long)]
+    stats: bool,
+    /// Number of histogram bins to emit when --stats is used.
+    #[arg(long, default_value_t = 16)]
+    histogram_bins: usize,
+    /// Compare every Nth decoded video frame.
+    #[cfg(feature = "ffmpeg")]
+    #[arg(long, default_value_t = 1)]
+    every: u64,
+    /// Maximum number of decoded video frame pairs to compare.
+    #[cfg(feature = "ffmpeg")]
+    #[arg(long)]
+    max_frames: Option<u64>,
+    /// Force a video comparison width. Requires --height.
+    #[cfg(feature = "ffmpeg")]
+    #[arg(long)]
+    width: Option<u32>,
+    /// Force a video comparison height. Requires --width.
+    #[cfg(feature = "ffmpeg")]
+    #[arg(long)]
+    height: Option<u32>,
+    /// ffmpeg executable.
+    #[cfg(feature = "ffmpeg")]
+    #[arg(long, default_value = "ffmpeg")]
+    ffmpeg: PathBuf,
+    /// ffprobe executable.
+    #[cfg(feature = "ffmpeg")]
+    #[arg(long, default_value = "ffprobe")]
+    ffprobe: PathBuf,
+    /// Video stream index.
+    #[cfg(feature = "ffmpeg")]
+    #[arg(long, default_value_t = 0)]
+    stream: usize,
+    /// Print JSON instead of text.
+    #[arg(long)]
+    json: bool,
+    #[command(flatten)]
+    output: OutputArgs,
 }
 
 #[derive(Debug, Args)]
@@ -248,6 +307,7 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Command::Compare(cmd) => run_compare(cmd),
         Command::Image(cmd) => run_image(cmd),
         #[cfg(feature = "ffmpeg")]
         Command::Video(cmd) => run_video(cmd),
@@ -261,39 +321,165 @@ fn main() -> Result<()> {
     }
 }
 
+fn run_compare(cmd: CompareCmd) -> Result<()> {
+    let Some(distorted) = cmd.distorted.as_ref() else {
+        if cmd.stats {
+            return run_image_stats(
+                &cmd.reference,
+                cmd.histogram_bins,
+                output_format(cmd.json, cmd.output.format),
+                &cmd.output,
+            );
+        }
+        bail!("DISTORTED is required unless --stats is used for a single image")
+    };
+
+    let reference_is_video = is_video_path(&cmd.reference);
+    let distorted_is_video = is_video_path(distorted);
+    match (reference_is_video, distorted_is_video) {
+        (false, false) => {
+            let report = compare_image_paths(&cmd.reference, distorted, &cmd.metrics)?;
+            let stats = if cmd.stats {
+                Some(ImageComparisonStats {
+                    reference: image_stats_for_path(&cmd.reference, cmd.histogram_bins)?,
+                    distorted: image_stats_for_path(distorted, cmd.histogram_bins)?,
+                })
+            } else {
+                None
+            };
+            write_sqlite_report(cmd.output.sqlite.as_deref(), SqlReport::Image(&report))?;
+            if let Some(stats) = &stats {
+                write_sqlite_stats(cmd.output.sqlite.as_deref(), &stats.reference)?;
+                write_sqlite_stats(cmd.output.sqlite.as_deref(), &stats.distorted)?;
+            }
+            if let Some(stats) = stats {
+                emit_image_comparison_stats_report(
+                    &ImageComparisonStatsReport {
+                        comparison: report,
+                        stats,
+                    },
+                    output_format(cmd.json, cmd.output.format),
+                    &cmd.output,
+                )
+            } else {
+                emit_comparison_report(
+                    &report,
+                    output_format(cmd.json, cmd.output.format),
+                    &cmd.output,
+                )
+            }
+        }
+        (true, true) => {
+            if cmd.stats {
+                bail!("--stats currently applies to still images; omit it for video comparison")
+            }
+            #[cfg(feature = "ffmpeg")]
+            {
+                run_video(VideoCmd {
+                    reference: cmd.reference,
+                    distorted: distorted.clone(),
+                    metrics: cmd.metrics,
+                    every: cmd.every,
+                    max_frames: cmd.max_frames,
+                    width: cmd.width,
+                    height: cmd.height,
+                    ffmpeg: cmd.ffmpeg,
+                    ffprobe: cmd.ffprobe,
+                    stream: cmd.stream,
+                    json: cmd.json,
+                    output: cmd.output,
+                })
+            }
+            #[cfg(not(feature = "ffmpeg"))]
+            {
+                bail!("video support is disabled; rebuild with `--features ffmpeg`")
+            }
+        }
+        _ => bail!("reference and distorted must both be images or both be videos"),
+    }
+}
+
 fn run_image(cmd: ImageCmd) -> Result<()> {
-    let reference = image_crate::load_image_path(&cmd.reference).with_context(|| {
+    let report = compare_image_paths(&cmd.reference, &cmd.distorted, &cmd.metrics)?;
+    write_sqlite_report(cmd.output.sqlite.as_deref(), SqlReport::Image(&report))?;
+    if cmd.stats {
+        let stats = ImageComparisonStats {
+            reference: image_stats_for_path(&cmd.reference, cmd.histogram_bins)?,
+            distorted: image_stats_for_path(&cmd.distorted, cmd.histogram_bins)?,
+        };
+        write_sqlite_stats(cmd.output.sqlite.as_deref(), &stats.reference)?;
+        write_sqlite_stats(cmd.output.sqlite.as_deref(), &stats.distorted)?;
+        emit_image_comparison_stats_report(
+            &ImageComparisonStatsReport {
+                comparison: report,
+                stats,
+            },
+            output_format(cmd.json, cmd.output.format),
+            &cmd.output,
+        )?;
+    } else {
+        emit_comparison_report(
+            &report,
+            output_format(cmd.json, cmd.output.format),
+            &cmd.output,
+        )?;
+    }
+    Ok(())
+}
+
+fn compare_image_paths(
+    reference_path: &Path,
+    distorted_path: &Path,
+    metrics_csv: &str,
+) -> Result<ComparisonReport> {
+    let reference = image_crate::load_image_path(reference_path).with_context(|| {
         format!(
             "failed to decode reference image `{}`",
-            cmd.reference.display()
+            reference_path.display()
         )
     })?;
-    let distorted = image_crate::load_image_path(&cmd.distorted).with_context(|| {
+    let distorted = image_crate::load_image_path(distorted_path).with_context(|| {
         format!(
             "failed to decode distorted image `{}`",
-            cmd.distorted.display()
+            distorted_path.display()
         )
     })?;
-    let metrics = MetricSet::from_csv(&cmd.metrics)?;
+    let metrics = MetricSet::from_csv(metrics_csv)?;
     let outputs = metrics.compare(&reference.as_view(), &distorted.as_view())?;
-    let report = ComparisonReport::new(
+    Ok(ComparisonReport::new(
         reference.dimensions(),
         reference.format(),
         distorted.format(),
         outputs,
     )
     .with_labels(
-        cmd.reference.display().to_string(),
-        cmd.distorted.display().to_string(),
-    );
+        reference_path.display().to_string(),
+        distorted_path.display().to_string(),
+    ))
+}
 
-    write_sqlite_report(cmd.output.sqlite.as_deref(), SqlReport::Image(&report))?;
-    emit_comparison_report(
-        &report,
-        output_format(cmd.json, cmd.output.format),
-        &cmd.output,
+fn run_image_stats(
+    input: &Path,
+    histogram_bins: usize,
+    format: OutputFormatArg,
+    output: &OutputArgs,
+) -> Result<()> {
+    let report = image_stats_for_path(input, histogram_bins)?;
+    write_sqlite_stats(output.sqlite.as_deref(), &report)?;
+    emit_stats_report(&report, format, output)
+}
+
+fn image_stats_for_path(input: &Path, histogram_bins: usize) -> Result<ImageStatsReport> {
+    let image = image_crate::load_image_path(input)
+        .with_context(|| format!("failed to decode image `{}`", input.display()))?;
+    let stats = imq::image_statistics(
+        &image.as_view(),
+        imq::ImageStatisticsOptions { histogram_bins },
     )?;
-    Ok(())
+    Ok(ImageStatsReport {
+        input: input.display().to_string(),
+        stats,
+    })
 }
 
 #[cfg(feature = "ffmpeg")]
@@ -397,6 +583,24 @@ struct ProbeReport {
 }
 
 #[derive(Debug, Serialize)]
+struct ImageStatsReport {
+    input: String,
+    stats: imq::ImageStatistics,
+}
+
+#[derive(Debug, Serialize)]
+struct ImageComparisonStatsReport {
+    comparison: ComparisonReport,
+    stats: ImageComparisonStats,
+}
+
+#[derive(Debug, Serialize)]
+struct ImageComparisonStats {
+    reference: ImageStatsReport,
+    distorted: ImageStatsReport,
+}
+
+#[derive(Debug, Serialize)]
 struct FormatsReport {
     formats: Vec<String>,
 }
@@ -432,6 +636,16 @@ struct ProbeCsvRow {
 #[derive(Debug, Serialize)]
 struct FormatCsvRow {
     format: String,
+}
+
+#[derive(Debug, Serialize)]
+struct StatsCsvRow {
+    input: String,
+    width: u32,
+    height: u32,
+    pixels: u64,
+    metric: String,
+    value: String,
 }
 
 struct MetricCsvContext {
@@ -475,6 +689,50 @@ fn emit_comparison_report(
         OutputFormatArg::Yaml => serde_yaml_ng::to_string(report)?,
         OutputFormatArg::Toml => toml::to_string_pretty(report)?,
         OutputFormatArg::Csv => csv_string(comparison_csv_rows(report))?,
+    };
+    write_output(output.output.as_deref(), &content)
+}
+
+fn emit_image_comparison_stats_report(
+    report: &ImageComparisonStatsReport,
+    format: OutputFormatArg,
+    output: &OutputArgs,
+) -> Result<()> {
+    let content = match format {
+        OutputFormatArg::Text => {
+            let mut text = render_comparison_text(&report.comparison);
+            text.push('\n');
+            text.push_str(&render_stats_text(&report.stats.reference));
+            text.push('\n');
+            text.push_str(&render_stats_text(&report.stats.distorted));
+            text
+        }
+        OutputFormatArg::Json => serde_json::to_string_pretty(report)?,
+        OutputFormatArg::Yaml => serde_yaml_ng::to_string(report)?,
+        OutputFormatArg::Toml => toml::to_string_pretty(report)?,
+        OutputFormatArg::Csv => {
+            let mut csv = csv_string(comparison_csv_rows(&report.comparison))?;
+            csv.push('\n');
+            csv.push_str(&csv_string(stats_csv_rows(&report.stats.reference))?);
+            csv.push('\n');
+            csv.push_str(&csv_string(stats_csv_rows(&report.stats.distorted))?);
+            csv
+        }
+    };
+    write_output(output.output.as_deref(), &content)
+}
+
+fn emit_stats_report(
+    report: &ImageStatsReport,
+    format: OutputFormatArg,
+    output: &OutputArgs,
+) -> Result<()> {
+    let content = match format {
+        OutputFormatArg::Text => render_stats_text(report),
+        OutputFormatArg::Json => serde_json::to_string_pretty(report)?,
+        OutputFormatArg::Yaml => serde_yaml_ng::to_string(report)?,
+        OutputFormatArg::Toml => toml::to_string_pretty(report)?,
+        OutputFormatArg::Csv => csv_string(stats_csv_rows(report))?,
     };
     write_output(output.output.as_deref(), &content)
 }
@@ -581,6 +839,50 @@ fn render_comparison_text(report: &ComparisonReport) -> String {
     output
 }
 
+fn render_stats_text(report: &ImageStatsReport) -> String {
+    let stats = &report.stats;
+    let mut output = String::new();
+    output.push_str(&format!("image     : {}\n", report.input));
+    output.push_str(&format!("size      : {}x{}\n", stats.width, stats.height));
+    output.push_str(&format!("pixels    : {}\n", stats.pixels));
+    output.push_str(&format!(
+        "exposure  : {}  contrast: {}  saturation: {}\n",
+        stats.tendencies.exposure, stats.tendencies.contrast, stats.tendencies.saturation
+    ));
+    output.push_str(&format!(
+        "temp/tint : {} / {}\n",
+        stats.tendencies.temperature, stats.tendencies.tint
+    ));
+    output.push_str(&format!(
+        "rgb mean  : r={:.4} g={:.4} b={:.4} dominant={}\n",
+        stats.color_balance.red_mean,
+        stats.color_balance.green_mean,
+        stats.color_balance.blue_mean,
+        stats.color_balance.dominant_channel
+    ));
+    output.push_str(&format!(
+        "luma      : mean={:.4} std={:.4} p05={:.4} p95={:.4} entropy={:.4}\n",
+        stats.luma.mean,
+        stats.luma.std_dev,
+        stats.luma.p05,
+        stats.luma.p95,
+        stats.luma.entropy_bits
+    ));
+    output.push_str(&format!(
+        "hsv       : hue={:.2} sat={:.4} value={:.4}\n",
+        stats.hsv.mean_hue_degrees, stats.hsv.mean_saturation, stats.hsv.mean_value
+    ));
+    output.push_str(&format!(
+        "flags     : grayscale={} cast={} shadow_clip={} highlight_clip={} transparency={}\n",
+        stats.tendencies.likely_grayscale,
+        stats.tendencies.color_cast,
+        stats.tendencies.shadow_clipping,
+        stats.tendencies.highlight_clipping,
+        stats.tendencies.has_transparency
+    ));
+    output
+}
+
 fn render_video_text(report: &VideoReport) -> String {
     let mut output = String::new();
     output.push_str(&format!("reference       : {}\n", report.reference));
@@ -667,6 +969,45 @@ fn comparison_csv_rows(report: &ComparisonReport) -> Vec<MetricCsvRow> {
         },
         &report.metrics,
     )
+}
+
+fn stats_csv_rows(report: &ImageStatsReport) -> Vec<StatsCsvRow> {
+    let stats = &report.stats;
+    [
+        ("red_mean", stats.color_balance.red_mean.to_string()),
+        ("green_mean", stats.color_balance.green_mean.to_string()),
+        ("blue_mean", stats.color_balance.blue_mean.to_string()),
+        ("luma_mean", stats.luma.mean.to_string()),
+        ("luma_std_dev", stats.luma.std_dev.to_string()),
+        ("luma_p05", stats.luma.p05.to_string()),
+        ("luma_p95", stats.luma.p95.to_string()),
+        ("hue_degrees", stats.hsv.mean_hue_degrees.to_string()),
+        ("saturation_mean", stats.hsv.mean_saturation.to_string()),
+        ("value_mean", stats.hsv.mean_value.to_string()),
+        ("exposure", stats.tendencies.exposure.clone()),
+        ("contrast", stats.tendencies.contrast.clone()),
+        ("temperature", stats.tendencies.temperature.clone()),
+        ("tint", stats.tendencies.tint.clone()),
+        (
+            "dominant_channel",
+            stats.color_balance.dominant_channel.clone(),
+        ),
+        (
+            "likely_grayscale",
+            stats.tendencies.likely_grayscale.to_string(),
+        ),
+        ("color_cast", stats.tendencies.color_cast.to_string()),
+    ]
+    .into_iter()
+    .map(|(metric, value)| StatsCsvRow {
+        input: report.input.clone(),
+        width: stats.width,
+        height: stats.height,
+        pixels: stats.pixels,
+        metric: metric.to_string(),
+        value,
+    })
+    .collect()
 }
 
 fn video_csv_rows(report: &VideoReport) -> Vec<MetricCsvRow> {
@@ -799,6 +1140,33 @@ fn write_sqlite_probe(path: Option<&Path>, report: &ProbeReport) -> Result<()> {
     Ok(())
 }
 
+fn write_sqlite_stats(path: Option<&Path>, report: &ImageStatsReport) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let conn = open_sqlite(path)?;
+    init_sqlite(&conn)?;
+    conn.execute(
+        "INSERT INTO imq_image_stats \
+         (input, width, height, pixels, exposure, contrast, saturation, temperature, tint, dominant_channel, payload_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        rusqlite::params![
+            report.input.as_str(),
+            i64::from(report.stats.width),
+            i64::from(report.stats.height),
+            sql_u64(report.stats.pixels),
+            report.stats.tendencies.exposure.as_str(),
+            report.stats.tendencies.contrast.as_str(),
+            report.stats.tendencies.saturation.as_str(),
+            report.stats.tendencies.temperature.as_str(),
+            report.stats.tendencies.tint.as_str(),
+            report.stats.color_balance.dominant_channel.as_str(),
+            serde_json::to_string(report)?,
+        ],
+    )?;
+    Ok(())
+}
+
 fn write_sqlite_formats(path: Option<&Path>, report: &FormatsReport) -> Result<()> {
     let Some(path) = path else {
         return Ok(());
@@ -867,6 +1235,21 @@ fn init_sqlite(conn: &rusqlite::Connection) -> Result<()> {
         );
         CREATE TABLE IF NOT EXISTS imq_formats (
             format TEXT PRIMARY KEY
+        );
+        CREATE TABLE IF NOT EXISTS imq_image_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            input TEXT NOT NULL,
+            width INTEGER NOT NULL,
+            height INTEGER NOT NULL,
+            pixels INTEGER NOT NULL,
+            exposure TEXT NOT NULL,
+            contrast TEXT NOT NULL,
+            saturation TEXT NOT NULL,
+            temperature TEXT NOT NULL,
+            tint TEXT NOT NULL,
+            dominant_channel TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );",
     )?;
     Ok(())
@@ -1117,6 +1500,18 @@ fn parse_optional_scale(width: Option<u32>, height: Option<u32>) -> Result<Optio
         (None, None) => Ok(None),
         _ => bail!("--width and --height must be specified together"),
     }
+}
+
+fn is_video_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "avi" | "m4v" | "mkv" | "mov" | "mp4" | "mpeg" | "mpg" | "webm" | "wmv"
+            )
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(feature = "tui")]
