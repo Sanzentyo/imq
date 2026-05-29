@@ -20,6 +20,8 @@ The crate is intended as a practical starting point for full-reference evaluatio
 | `serde` | JSON reports and serializable structs. |
 | `image-codecs` | Decode still images through the `image` crate. |
 | `ffmpeg` | Shell out to `ffmpeg`/`ffprobe` and stream RGBA frames from stdout. |
+| `preview` | Terminal image/video previews, using `ffmpeg` for video thumbnails. |
+| `cpu-only` | Disable hardware decode attempts for preview thumbnail extraction. |
 | `gpu` | `wgpu` compute kernels. |
 | `nn-burn` | Burn tensor adapters and NN metric scaffolding. |
 | `nn-burn-wgpu` | Burn with WGPU backend features. |
@@ -27,7 +29,7 @@ The crate is intended as a practical starting point for full-reference evaluatio
 | `cli` | `imq` binary. |
 | `tui` | Ratatui/crossterm interactive frontend. |
 
-Default features are `std`, `serde`, `image-codecs`, `cli`, and `tui`.
+Default features are `std`, `serde`, `image-codecs`, `cli`, `tui`, and `preview`.
 
 ## CLI examples
 
@@ -55,12 +57,25 @@ Run the TUI:
 
 ```bash
 cargo run --bin imq -- tui reference.png distorted.png
+cargo run --bin imq -- tui
 ```
+
+The TUI shows a colorized metric table and an image file browser. Use the
+browser to move through folders and assign images to the reference/distorted
+slots without restarting the program.
 
 List still-image formats exposed by the image adapter:
 
 ```bash
 cargo run --bin imq -- formats
+```
+
+Preview images or video thumbnails in the terminal:
+
+```bash
+cargo run --bin imq -- preview image.png
+cargo run --bin imq -- preview --display sixel --cols 2 a.png b.png clip.mp4
+cargo run --bin imq -- preview --decode cpu clip.mp4
 ```
 
 ## Codex skill

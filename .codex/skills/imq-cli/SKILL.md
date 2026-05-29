@@ -63,15 +63,34 @@ imq probe input.mp4 --json
 imq extract-frame input.mp4 150 frame-150.png
 ```
 
+## Preview Files
+
+Use `preview` for terminal previews. Auto mode uses Sixel when the terminal
+appears to support it and ANSI color blocks otherwise.
+
+```bash
+imq preview image.png
+imq preview --display sixel --cols 2 a.png b.png clip.mp4
+imq preview --decode cpu clip.mp4
+```
+
+Multiple inputs are arranged as a montage. Use `--rows` or `--cols` to control
+the layout. Video thumbnails are extracted through `ffmpeg`; `--decode auto`
+tries detected hardware decode backends and falls back to CPU unless the build
+uses the `cpu-only` feature.
+
 ## TUI
 
 The `tui` subcommand is enabled by default:
 
 ```bash
 imq tui reference.png distorted.png
+imq tui
 ```
 
-When testing non-interactively, run it in a PTY and send `q` or Esc to exit.
+The TUI includes a file browser. Use it to move through folders and set
+reference/distorted images without restarting. When testing non-interactively,
+run it in a PTY and send `q` or Esc to exit.
 
 ## GPU and NN Features
 

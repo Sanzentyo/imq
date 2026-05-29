@@ -9,6 +9,7 @@
 //! - `ffmpeg`: video/raw-frame piping through external `ffmpeg`/`ffprobe`.
 //! - `gpu`: wgpu compute kernels for RGBA8-heavy workloads.
 //! - `nn-burn`: Burn tensor adapters for NN/perceptual metrics.
+//! - `preview`: terminal-friendly still/video thumbnails.
 //! - `cli` / `tui`: command-line and terminal UI frontends.
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -31,6 +32,10 @@ pub mod gpu;
 #[cfg(feature = "nn-burn")]
 #[cfg_attr(docsrs, doc(cfg(feature = "nn-burn")))]
 pub mod nn;
+
+#[cfg(feature = "preview")]
+#[cfg_attr(docsrs, doc(cfg(feature = "preview")))]
+pub mod preview;
 
 pub use error::{Error, Result};
 pub use frame::{
