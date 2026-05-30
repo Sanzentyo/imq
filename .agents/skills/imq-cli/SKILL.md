@@ -105,6 +105,7 @@ imq preview image.png
 imq p image.png
 imq preview --display kitty --cols 2 a.png b.png clip.mp4
 imq preview --size 120x60 --fit cover image.png
+imq preview -a image.png
 imq preview --decode cpu clip.mp4
 ```
 
@@ -118,12 +119,17 @@ then ANSI blocks. Use `--display kitty`, `--display sixel`, `IMQ_KITTY=1`,
 `--fit contain|cover|stretch` controls aspect handling. Video thumbnails are
 extracted through `ffmpeg`. When a small source needs to fill the terminal-based
 display area, preview uses nearest-neighbor enlargement so source pixels become
-larger; shrink paths use `fast_image_resize`. In the TUI, the initial preview
-resolution is derived from the current preview panel area and terminal font
-size. Pressing `+` at the selected file's source dimensions switches to `max`,
-and `max` uses each newly selected file's own maximum preview resolution.
+larger; shrink paths use `fast_image_resize`. Use `-a`/`--actual-size` to render at
+the decoded source dimensions instead of fitting the terminal area. In the TUI,
+the initial preview resolution is derived from the current preview panel area
+and terminal font size. Pressing `a` toggles exact-pixel display. Pressing `+`
+at the selected file's source dimensions switches to `max`, and `max` uses each
+newly selected file's own maximum preview resolution.
 `--decode auto` tries detected hardware decode backends and falls back to CPU
 unless the build uses the `cpu-only` feature.
+Useful short options include `-m` for metrics, `-j` for JSON output, `preview
+-s` for size, `preview -D` for display mode, `preview -a` for exact pixel size,
+and `tui -C` for preview cache size.
 
 Subcommand aliases are available: `i` for `image`, `v` for `video`, `p` for
 `preview`, `t` for `tui`, `fmt` for `formats`, and `x`/`extract` for
@@ -145,9 +151,10 @@ reference/distorted images without restarting. When testing non-interactively,
 run it in a PTY and send `q` or Esc to exit. Vim-style navigation is supported:
 `j`/`k` move, `h` goes to the parent directory, `l` opens/selects, and `g`/`G`
 jump to the first/last entry. Use `+`/`-` to adjust preview resolution and `f`
-to cycle fit mode. The TUI uses native Kitty/Sixel/iTerm2 image protocols when
-the terminal reports support, falls back to half-block rendering otherwise, and
-keeps decoded previews in memory according to `--preview-cache`.
+to cycle fit mode. Use `a` to toggle exact-pixel preview display. The TUI uses
+native Kitty/Sixel/iTerm2 image protocols when the terminal reports support,
+falls back to half-block rendering otherwise, and keeps decoded previews in
+memory according to `--preview-cache`.
 
 ## GPU and NN Features
 

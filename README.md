@@ -107,6 +107,7 @@ cargo run --bin imq -- preview image.png
 cargo run --bin imq -- p image.png
 cargo run --bin imq -- preview --display kitty --cols 2 a.png b.png clip.mp4
 cargo run --bin imq -- preview --size 120x60 --fit cover image.png
+cargo run --bin imq -- preview -a image.png
 cargo run --bin imq -- preview --decode cpu clip.mp4
 ```
 
@@ -120,9 +121,13 @@ then ANSI blocks. Use `--display kitty`, `--display sixel`, `IMQ_KITTY=1`,
 detection. Fit modes are `contain`, `cover`, and `stretch`. When `preview` needs
 to enlarge a small source to fill the terminal-derived display area, it uses
 nearest-neighbor scaling so source pixels become larger instead of blurred.
-Shrink paths use `fast_image_resize`. In the TUI, the initial preview
-resolution is derived from the current preview panel area and terminal font
-size; use `+`/`-` to change preview resolution and `f` to cycle the fit mode.
+Shrink paths use `fast_image_resize`. Use `-a`/`--actual-size` to render the decoded
+source pixels at their exact dimensions instead of fitting the terminal area. In
+the TUI, the initial preview resolution is derived from the current preview
+panel area and terminal font size; use `+`/`-` to change preview resolution, `f`
+to cycle the fit mode, and `a` to toggle exact-pixel display. Common option
+shorts include `-m` for metrics, `preview -s` for size, `preview -D` for display
+mode, `-j` for JSON output, and `tui -C` for preview cache size.
 Pressing `+` at the source dimensions switches to `max`, which keeps using each
 selected file's own maximum preview resolution.
 The TUI queries the terminal for native image support and renders through Kitty,

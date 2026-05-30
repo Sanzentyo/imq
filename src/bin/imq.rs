@@ -60,10 +60,10 @@ struct ImageCmd {
     /// Distorted/test image.
     distorted: PathBuf,
     /// Comma-separated metrics: psnr,ssim,mse,rmse,mae,maxae; optional domains: psnr:color,mse:all.
-    #[arg(long, default_value = "psnr,ssim,mse,mae,maxae")]
+    #[arg(short, long, default_value = "psnr,ssim,mse,mae,maxae")]
     metrics: String,
     /// Print JSON instead of a text table.
-    #[arg(long)]
+    #[arg(short, long)]
     json: bool,
     /// Include per-image statistics, color balance, histograms, and tendencies.
     #[arg(short, long)]
@@ -85,7 +85,7 @@ struct StatsCmd {
     #[arg(long, default_value_t = 16)]
     histogram_bins: usize,
     /// Print JSON instead of text.
-    #[arg(long)]
+    #[arg(short, long)]
     json: bool,
     #[command(flatten)]
     stdin: StdinImageArgs,
@@ -100,11 +100,14 @@ struct TuiCmd {
     /// Distorted/test image.
     distorted: Option<PathBuf>,
     /// Comma-separated metrics.
-    #[arg(long, default_value = "psnr,ssim,mse,mae,maxae")]
+    #[arg(short, long, default_value = "psnr,ssim,mse,mae,maxae")]
     metrics: String,
     /// Number of decoded previews to keep in memory.
-    #[arg(long, default_value_t = 32)]
+    #[arg(short = 'C', long, default_value_t = 32)]
     preview_cache: usize,
+    /// Display previews at their exact decoded pixel dimensions.
+    #[arg(short, long)]
+    actual_size: bool,
 }
 
 #[derive(Debug, Args)]
@@ -114,7 +117,7 @@ struct CompareCmd {
     /// Distorted/test image or video.
     distorted: Option<PathBuf>,
     /// Comma-separated metrics.
-    #[arg(long, default_value = "psnr,ssim,mse,mae,maxae")]
+    #[arg(short, long, default_value = "psnr,ssim,mse,mae,maxae")]
     metrics: String,
     /// Include image statistics, color balance, histograms, and tendencies.
     #[arg(short, long)]
@@ -153,7 +156,7 @@ struct CompareCmd {
     #[arg(long, default_value_t = 0)]
     stream: usize,
     /// Print JSON instead of text.
-    #[arg(long)]
+    #[arg(short, long)]
     json: bool,
     #[command(flatten)]
     output: OutputArgs,
@@ -164,32 +167,35 @@ struct PreviewCmd {
     /// Image or video files to preview.
     inputs: Vec<PathBuf>,
     /// Terminal display mode.
-    #[arg(long, value_enum, default_value_t = PreviewDisplayArg::Auto)]
+    #[arg(short = 'D', long, value_enum, default_value_t = PreviewDisplayArg::Auto)]
     display: PreviewDisplayArg,
     /// Video decode policy.
     #[arg(long, value_enum, default_value_t = PreviewDecodeArg::Auto)]
     decode: PreviewDecodeArg,
     /// Preview size for each input, for example 120x60.
-    #[arg(long, value_parser = parse_preview_size)]
+    #[arg(short, long, value_parser = parse_preview_size, conflicts_with = "actual_size")]
     size: Option<PreviewSize>,
     /// Maximum preview width for each input. Overridden by --size.
-    #[arg(long)]
+    #[arg(short = 'W', long, conflicts_with = "actual_size")]
     width: Option<u32>,
     /// Maximum preview height for each input. Overridden by --size.
-    #[arg(long)]
+    #[arg(short = 'H', long, conflicts_with = "actual_size")]
     height: Option<u32>,
     /// Fit policy for the requested preview size.
-    #[arg(long, value_enum, default_value_t = PreviewFitArg::Contain)]
+    #[arg(short, long, value_enum, default_value_t = PreviewFitArg::Contain, conflicts_with = "actual_size")]
     fit: PreviewFitArg,
     /// Number of montage rows.
-    #[arg(long)]
+    #[arg(short, long)]
     rows: Option<usize>,
     /// Number of montage columns.
-    #[arg(long)]
+    #[arg(short, long)]
     cols: Option<usize>,
     /// ffmpeg executable for video thumbnails.
     #[arg(long, default_value = "ffmpeg")]
     ffmpeg: PathBuf,
+    /// Display at exact decoded pixel dimensions instead of fitting terminal area.
+    #[arg(short, long)]
+    actual_size: bool,
 }
 
 #[derive(Debug, Args)]
@@ -291,7 +297,7 @@ struct VideoCmd {
     /// Distorted/test video.
     distorted: PathBuf,
     /// Comma-separated metrics.
-    #[arg(long, default_value = "psnr,ssim,mse,mae,maxae")]
+    #[arg(short, long, default_value = "psnr,ssim,mse,mae,maxae")]
     metrics: String,
     /// Compare every Nth decoded frame.
     #[arg(long, default_value_t = 1)]
@@ -315,7 +321,7 @@ struct VideoCmd {
     #[arg(long, default_value_t = 0)]
     stream: usize,
     /// Print JSON instead of a text table.
-    #[arg(long)]
+    #[arg(short, long)]
     json: bool,
     #[command(flatten)]
     output: OutputArgs,
@@ -353,7 +359,7 @@ struct ProbeCmd {
     #[arg(long, default_value_t = 0)]
     stream: usize,
     /// Print JSON.
-    #[arg(long)]
+    #[arg(short, long)]
     json: bool,
     #[command(flatten)]
     output: OutputArgs,
@@ -1485,10 +1491,17 @@ fn run_preview(cmd: PreviewCmd) -> Result<()> {
         PreviewDisplayArg::None => DisplayMode::None,
     };
     let default_size = default_preview_size(columns, rows, cmd.display);
-    let size = cmd.size.unwrap_or(PreviewSize {
-        width: cmd.width.unwrap_or(default_size.width),
-        height: cmd.height.unwrap_or(default_size.height),
-    });
+    let size = if cmd.actual_size {
+        PreviewSize {
+            width: u32::MAX,
+            height: u32::MAX,
+        }
+    } else {
+        cmd.size.unwrap_or(PreviewSize {
+            width: cmd.width.unwrap_or(default_size.width),
+            height: cmd.height.unwrap_or(default_size.height),
+        })
+    };
     let options = PreviewOptions {
         width: size.width,
         height: size.height,
@@ -1660,6 +1673,7 @@ fn run_tui(cmd: TuiCmd) -> Result<()> {
             initial_dir,
             cmd.metrics,
             cmd.preview_cache,
+            cmd.actual_size,
         )
     }
     #[cfg(not(feature = "tui"))]
@@ -1811,6 +1825,7 @@ mod tui_app {
     enum PreviewResolution {
         Fixed { width: u32, height: u32 },
         Max,
+        Actual,
     }
 
     struct App {
@@ -1832,31 +1847,38 @@ mod tui_app {
         list_state: ListState,
     }
 
+    struct AppConfig {
+        reference: Option<PathBuf>,
+        distorted: Option<PathBuf>,
+        initial_dir: Option<PathBuf>,
+        metrics_csv: String,
+        preview_picker: Picker,
+        preview_cache_capacity: usize,
+        preview_resolution: PreviewResolution,
+        actual_size: bool,
+    }
+
     impl App {
-        fn new(
-            reference: Option<PathBuf>,
-            distorted: Option<PathBuf>,
-            initial_dir: Option<PathBuf>,
-            metrics_csv: String,
-            preview_picker: Picker,
-            preview_cache_capacity: usize,
-            preview_resolution: PreviewResolution,
-        ) -> Result<Self> {
+        fn new(config: AppConfig) -> Result<Self> {
             let cwd = initial_cwd(
-                initial_dir.as_deref(),
-                reference.as_deref(),
-                distorted.as_deref(),
+                config.initial_dir.as_deref(),
+                config.reference.as_deref(),
+                config.distorted.as_deref(),
             )?;
             let mut app = Self {
-                reference,
-                distorted,
-                metrics_csv,
+                reference: config.reference,
+                distorted: config.distorted,
+                metrics_csv: config.metrics_csv,
                 comparison: None,
                 preview: None,
                 preview_protocol: None,
-                preview_picker,
-                preview_cache: PreviewCache::new(preview_cache_capacity),
-                preview_resolution,
+                preview_picker: config.preview_picker,
+                preview_cache: PreviewCache::new(config.preview_cache_capacity),
+                preview_resolution: if config.actual_size {
+                    PreviewResolution::Actual
+                } else {
+                    config.preview_resolution
+                },
                 preview_fit: imq::preview::FitMode::Contain,
                 cwd,
                 entries: Vec::new(),
@@ -2085,6 +2107,7 @@ mod tui_app {
                     }
                 }
                 (true, PreviewResolution::Max, _) => PreviewResolution::Max,
+                (true, PreviewResolution::Actual, _) => PreviewResolution::Actual,
                 (false, PreviewResolution::Fixed { width, height }, _) => {
                     PreviewResolution::Fixed {
                         width: (width * 4 / 5).max(16),
@@ -2099,6 +2122,25 @@ mod tui_app {
                     width: 192,
                     height: 96,
                 },
+                (false, PreviewResolution::Actual, _) => PreviewResolution::Actual,
+            };
+            self.status = format!("Preview size: {}", self.preview_resolution_label());
+            self.update_preview();
+        }
+
+        fn toggle_actual_size(&mut self) {
+            self.preview_resolution = match self.preview_resolution {
+                PreviewResolution::Actual => match self.preview.as_ref() {
+                    Some(preview) => PreviewResolution::Fixed {
+                        width: preview.source_width,
+                        height: preview.source_height,
+                    },
+                    None => PreviewResolution::Fixed {
+                        width: 192,
+                        height: 96,
+                    },
+                },
+                _ => PreviewResolution::Actual,
             };
             self.status = format!("Preview size: {}", self.preview_resolution_label());
             self.update_preview();
@@ -2118,6 +2160,7 @@ mod tui_app {
             match self.preview_resolution {
                 PreviewResolution::Fixed { width, height } => (width, height),
                 PreviewResolution::Max => (u32::MAX, u32::MAX),
+                PreviewResolution::Actual => (u32::MAX, u32::MAX),
             }
         }
 
@@ -2128,6 +2171,10 @@ mod tui_app {
                     format!("max {}x{}", preview.source_width, preview.source_height)
                 }
                 (PreviewResolution::Max, None) => "max".to_string(),
+                (PreviewResolution::Actual, Some(preview)) => {
+                    format!("actual {}x{}", preview.source_width, preview.source_height)
+                }
+                (PreviewResolution::Actual, None) => "actual".to_string(),
             }
         }
     }
@@ -2138,6 +2185,7 @@ mod tui_app {
         initial_dir: Option<PathBuf>,
         metrics_csv: String,
         preview_cache_capacity: usize,
+        actual_size: bool,
     ) -> Result<()> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -2150,15 +2198,16 @@ mod tui_app {
             Rect::new(0, 0, terminal_size.width, terminal_size.height),
             &preview_picker,
         );
-        let mut app = match App::new(
+        let mut app = match App::new(AppConfig {
             reference,
             distorted,
             initial_dir,
             metrics_csv,
             preview_picker,
-            preview_cache_capacity,
             preview_resolution,
-        ) {
+            actual_size,
+            preview_cache_capacity,
+        }) {
             Ok(app) => app,
             Err(err) => {
                 disable_raw_mode()?;
@@ -2206,6 +2255,8 @@ mod tui_app {
                     Span::raw(" size  "),
                     Span::styled("f", Style::default().fg(Color::Magenta)),
                     Span::raw(" fit  "),
+                    Span::styled("a", Style::default().fg(Color::Magenta)),
+                    Span::raw(" actual  "),
                     Span::styled("Tab", Style::default().fg(Color::Yellow)),
                     Span::raw(" target  "),
                     Span::styled("r/d", Style::default().fg(Color::Yellow)),
@@ -2237,6 +2288,7 @@ mod tui_app {
                     KeyCode::Char('+') | KeyCode::Char('=') => app.resize_preview(true),
                     KeyCode::Char('-') => app.resize_preview(false),
                     KeyCode::Char('f') => app.cycle_preview_fit(),
+                    KeyCode::Char('a') => app.toggle_actual_size(),
                     _ => {}
                 }
             }
@@ -2395,14 +2447,18 @@ mod tui_app {
         let content_area = inner.inner(area);
         frame.render_widget(inner, area);
         if let Some(protocol) = &mut app.preview_protocol {
+            let resize = match app.preview_resolution {
+                PreviewResolution::Actual => Resize::Crop(None),
+                _ => Resize::Scale(None),
+            };
             frame.render_stateful_widget(
-                StatefulImage::default().resize(Resize::Scale(None)),
+                StatefulImage::default().resize(resize),
                 content_area,
                 protocol,
             );
             return;
         }
-        let (display_cols, display_pixel_rows) = fitted_preview_cells(preview, content_area);
+        let (display_cols, display_pixel_rows) = preview_display_cells(preview, content_area, app);
         if display_cols == 0 || display_pixel_rows == 0 {
             return;
         }
@@ -2413,13 +2469,15 @@ mod tui_app {
             / 2;
         for y in (0..display_pixel_rows).step_by(2) {
             let spans = (0..display_cols).map(|x| {
-                let top = sample_preview_pixel(preview, x, y, display_cols, display_pixel_rows);
+                let top =
+                    sample_preview_pixel(preview, x, y, display_cols, display_pixel_rows, app);
                 let bottom = sample_preview_pixel(
                     preview,
                     x,
                     (y + 1).min(display_pixel_rows.saturating_sub(1)),
                     display_cols,
                     display_pixel_rows,
+                    app,
                 );
                 Span::styled(
                     "▀",
@@ -2438,6 +2496,20 @@ mod tui_app {
                 },
             );
         }
+    }
+
+    fn preview_display_cells(
+        preview: &imq::preview::PreviewImage,
+        area: Rect,
+        app: &App,
+    ) -> (u32, u32) {
+        if app.preview_resolution == PreviewResolution::Actual {
+            return (
+                preview.width.min(u32::from(area.width)),
+                preview.height.min(u32::from(area.height).saturating_mul(2)),
+            );
+        }
+        fitted_preview_cells(preview, area)
     }
 
     fn preview_to_dynamic(preview: &imq::preview::PreviewImage) -> Option<image::DynamicImage> {
@@ -2497,7 +2569,11 @@ mod tui_app {
         y: u32,
         display_width: u32,
         display_height: u32,
+        app: &App,
     ) -> [u8; 3] {
+        if app.preview_resolution == PreviewResolution::Actual {
+            return preview.pixel(x, y);
+        }
         let source_x = (u64::from(x) * u64::from(preview.width) / u64::from(display_width)) as u32;
         let source_y =
             (u64::from(y) * u64::from(preview.height) / u64::from(display_height)) as u32;
