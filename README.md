@@ -134,9 +134,9 @@ Common subcommand aliases are available: `i` for `image`, `v` for `video`, `p`
 for `preview`, `t` for `tui`, `fmt` for `formats`, and `x`/`extract` for
 `extract-frame`.
 
-## Codex skill
+## Agent skill
 
-This repository includes a repo-scoped Codex skill at `.codex/skills/imq-cli/`.
+This repository includes a repo-scoped agent skill at `.agents/skills/imq-cli/`.
 It guides agents through installing and using the `imq` CLI for image and video
 quality checks.
 
