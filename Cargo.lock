@@ -3224,6 +3224,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "imqraw-capi"
+version = "0.1.0"
+dependencies = [
+ "imq",
+]
+
+[[package]]
 name = "imqraw-wasm"
 version = "0.1.0"
 dependencies = [

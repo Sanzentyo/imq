@@ -10,7 +10,7 @@ keywords = ["image", "quality", "psnr", "ssim", "ffmpeg"]
 categories = ["multimedia::images", "multimedia::video", "command-line-utilities"]
 
 [workspace]
-members = [".", "crates/imqraw-wasm"]
+members = [".", "crates/imqraw-capi", "crates/imqraw-wasm"]
 
 [lib]
 name = "imq"

@@ -125,8 +125,8 @@ Subcommand aliases are available: `i` for `image`, `v` for `video`, `p` for
 Use `preview` or `tui` only when the user explicitly asks to inspect images in a
 terminal UI. For crate/library, WebAssembly, GPU, benchmark, or NN usage, refer
 to repository documentation instead of expanding those workflows in this skill:
-`docs/rust-crate-usage.md` for Rust and `docs/js-usage.md` for JavaScript/browser
-usage.
+`docs/rust-crate-usage.md` for Rust, `docs/js-usage.md` for JavaScript/browser
+usage, and `docs/c-api-usage.md` for C ABI usage.
 
 ## Reporting Results
 

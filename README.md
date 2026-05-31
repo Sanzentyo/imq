@@ -176,6 +176,8 @@ For library-focused Rust usage, see [docs/rust-crate-usage.md](docs/rust-crate-u
 and the sample project at [samples/imq-crate-usage](samples/imq-crate-usage).
 For JavaScript/browser usage, see [docs/js-usage.md](docs/js-usage.md) and
 [samples/imqraw-js-browser](samples/imqraw-js-browser).
+For C ABI usage, see [docs/c-api-usage.md](docs/c-api-usage.md) and
+[samples/imqraw-c-api](samples/imqraw-c-api).
 
 ```rust
 use imq::{FrameView, MetricSet, PixelFormat};

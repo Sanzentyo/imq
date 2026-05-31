@@ -1,0 +1,15 @@
+[package]
+name = "imqraw-capi"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+description = "C API for imqraw lossless raw image bundles."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Sanzentyo/imq"
+
+[lib]
+name = "imqraw_capi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+imq = { path = "../..", default-features = false }
