@@ -1,4 +1,4 @@
 interface:
   display_name: "imq CLI"
-  short_description: "Use imq for image and video quality checks"
-  default_prompt: "Use $imq-cli to compare images or videos with the imq command-line tool."
+  short_description: "Use imq and imqraw from CLI, Rust, JS, or TS"
+  default_prompt: "Use $imq-cli to compare images or videos, or reference imqraw Rust/JS/TS examples."

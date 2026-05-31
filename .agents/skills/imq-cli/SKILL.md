@@ -1,6 +1,6 @@
 ---
 name: imq-cli
-description: Use the `imq` command-line tool for full-reference image and video quality evaluation. Trigger when Codex needs to compare reference/distorted images or videos, compute PSNR/SSIM/MSE/RMSE/MAE/maxAE, produce JSON metric reports, list supported still-image formats, probe video metadata, or extract video frames.
+description: Use the `imq` command-line tool for full-reference image and video quality evaluation, and reference imqraw Rust/JavaScript/TypeScript examples when needed. Trigger when Codex needs to compare reference/distorted images or videos, compute PSNR/SSIM/MSE/RMSE/MAE/maxAE, produce JSON metric reports, list supported still-image formats, probe video metadata, extract video frames, or use imqraw from Rust, JS, or TS.
 ---
 
 # imq CLI
@@ -123,10 +123,10 @@ Subcommand aliases are available: `i` for `image`, `v` for `video`, `p` for
 `raw-info` for `bundle-info`, and `x`/`extract` for `extract-frame`.
 
 Use `preview` or `tui` only when the user explicitly asks to inspect images in a
-terminal UI. For crate/library, WebAssembly, GPU, benchmark, or NN usage, refer
-to repository documentation instead of expanding those workflows in this skill:
-`docs/rust-crate-usage.md` for Rust, `docs/js-usage.md` for JavaScript/browser
-usage, and `docs/c-api-usage.md` for C ABI usage.
+terminal UI. For Rust, JavaScript, or TypeScript `imqraw` library usage, read
+`references/imqraw-library.md` for concrete examples. For GPU, benchmark, or NN
+usage, refer to repository documentation instead of expanding those workflows in
+this skill.
 
 ## Reporting Results
 
