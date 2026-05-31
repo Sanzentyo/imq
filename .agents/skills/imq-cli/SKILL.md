@@ -161,13 +161,18 @@ comparison table. It uses native Kitty/Sixel/iTerm2 image protocols when the
 terminal reports support, falls back to half-block rendering otherwise, and
 keeps decoded previews in memory according to `--preview-cache`.
 
-## GPU and NN Features
+## GPU, Benchmark, and NN Features
 
-GPU MSE is exposed as an example, not a CLI subcommand:
+GPU RGBA8 error stats are exposed as examples, not CLI subcommands. The GPU
+path computes MSE, RMSE, PSNR, MAE, and maxAE-compatible stats in one dispatch:
 
 ```bash
 cargo run --quiet --features gpu --example gpu_mse -- reference.png distorted.png
+cargo run --release --example benchmark --features gpu -- --width 3840 --height 2160 --iterations 3
 ```
+
+The benchmark prints separate CPU error metrics, optimized combined CPU error
+metrics, CPU default metrics, and GPU RGBA8 error stats when `gpu` is enabled.
 
 Burn/NN support is library scaffolding. Validate availability with:
 

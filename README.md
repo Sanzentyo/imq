@@ -197,15 +197,27 @@ let frame = FrameView::nv12(width, height, PlaneView::new(y, y_stride), PlaneVie
 
 ## GPU path
 
-With `--features gpu`, `GpuContext::mse_rgba8` dispatches a WGSL compute shader. It compacts strided RGBA8 rows, uploads a `u32` per pixel, reduces per-workgroup squared error on the GPU, then performs the final accumulation on CPU readback.
+With `--features gpu`, `GpuContext::error_stats_rgba8` dispatches a WGSL
+compute shader for RGBA8 frames. Tight RGBA8 buffers are uploaded directly;
+strided rows are compacted only when required. The shader reduces squared
+error, absolute error, and max absolute error in one pass, so MSE, RMSE, PSNR,
+MAE, and maxAE can be reported from one dispatch.
 
 ```rust
 use imq::gpu::GpuContext;
 
 let gpu = GpuContext::new()?;
-let result = gpu.mse_rgba8(&reference, &distorted)?;
-println!("GPU MSE: {}", result.mse);
+let stats = gpu.error_stats_rgba8(&reference, &distorted)?;
+for metric in stats.into_normalized_metric_outputs() {
+    println!("{}: {}", metric.name, metric.score);
+}
 # Ok::<(), imq::Error>(())
+```
+
+Run the built-in synthetic benchmark with:
+
+```bash
+cargo run --release --example benchmark --features gpu -- --width 3840 --height 2160 --iterations 3
 ```
 
 ## Burn / NN metrics
@@ -232,6 +244,6 @@ See `docs/architecture.md`, `docs/metrics.md`, `docs/ffmpeg.md`, and `docs/nn-bu
 ## Current limitations
 
 - SSIM is a global luma implementation, not windowed MS-SSIM.
-- GPU acceleration currently covers RGBA8 MSE. PSNR can be derived from MSE, and more kernels can follow the same layout.
+- GPU acceleration currently covers RGBA8 MSE, RMSE, PSNR, MAE, and maxAE error statistics. SSIM still runs on CPU.
 - Neural metrics provide Burn integration and feature-distance scaffolding; model definitions/checkpoints are caller-supplied.
 - The `ffmpeg` module uses external executables by path. The core library remains pure Rust and Sans I/O.

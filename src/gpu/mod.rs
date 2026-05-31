@@ -8,4 +8,4 @@
 mod wgpu_impl;
 
 #[cfg(feature = "gpu")]
-pub use wgpu_impl::{GpuContext, GpuMse};
+pub use wgpu_impl::{GpuContext, GpuMse, GpuRgba8ErrorStats};

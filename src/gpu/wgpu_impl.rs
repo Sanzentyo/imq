@@ -1,13 +1,15 @@
 //! wgpu compute kernels for image-quality primitives.
 //!
-//! The first kernel is intentionally narrow: RGBA8 MSE. That is the most common
-//! interchange format when frames come from `image` or `ffmpeg -pix_fmt rgba`,
-//! and it maps cleanly to a single `u32` per pixel on the GPU.
+//! The first kernel is intentionally narrow: RGBA8 full-reference error stats.
+//! That is the most common interchange format when frames come from `image` or
+//! `ffmpeg -pix_fmt rgba`, and it maps cleanly to a single `u32` per pixel on
+//! the GPU.
 
 use crate::frame::{FrameView, PixelFormat, Validated};
 use crate::metrics::{Direction, MetricOutput};
 use crate::{Error, Result};
 use bytemuck::{Pod, Zeroable};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::mpsc;
 use wgpu::util::DeviceExt;
@@ -15,26 +17,41 @@ use wgpu::util::DeviceExt;
 const WORKGROUP_SIZE: u32 = 256;
 const SHADER: &str = include_str!("shaders/mse_rgba8.wgsl");
 
-/// GPU-computed MSE result for RGBA8 frames.
+/// GPU-computed RGBA8 error statistics.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct GpuMse {
+pub struct GpuRgba8ErrorStats {
     /// Mean squared error over R, G, B, and A channels in code-value units.
     pub mse: f64,
     /// Per-channel MSE in RGBA order.
     pub channel_mse: [f64; 4],
+    /// Root mean squared error over R, G, B, and A channels in code-value units.
+    pub rmse: f64,
+    /// Mean absolute error over R, G, B, and A channels in code-value units.
+    pub mae: f64,
+    /// Per-channel MAE in RGBA order.
+    pub channel_mae: [f64; 4],
+    /// Maximum absolute error in code-value units.
+    pub max_abs: f64,
+    /// Per-channel maximum absolute error in RGBA order.
+    pub channel_max_abs: [f64; 4],
     /// Pixel count used by the kernel.
     pub pixels: u64,
 }
 
-impl GpuMse {
-    /// Converts this result into a metric output.
+/// Backward-compatible alias for the original GPU MSE result type.
+pub type GpuMse = GpuRgba8ErrorStats;
+
+impl GpuRgba8ErrorStats {
+    /// Converts this result into the historical `gpu_mse_rgba8` metric output.
     pub fn into_metric_output(self) -> MetricOutput {
         let mut details = BTreeMap::new();
         details.insert("mse_r".to_string(), self.channel_mse[0]);
         details.insert("mse_g".to_string(), self.channel_mse[1]);
         details.insert("mse_b".to_string(), self.channel_mse[2]);
         details.insert("mse_a".to_string(), self.channel_mse[3]);
+        details.insert("mae".to_string(), self.mae);
+        details.insert("maxae".to_string(), self.max_abs);
         details.insert("pixels".to_string(), self.pixels as f64);
         MetricOutput {
             name: "gpu_mse_rgba8".to_string(),
@@ -43,6 +60,37 @@ impl GpuMse {
             unit: "code_value^2".to_string(),
             details,
         }
+    }
+
+    /// Converts the GPU stats into standard normalized error metric outputs.
+    pub fn into_normalized_metric_outputs(self) -> Vec<MetricOutput> {
+        let mse = self.mse / (255.0 * 255.0);
+        let rmse = self.rmse / 255.0;
+        let mae = self.mae / 255.0;
+        let max_abs = self.max_abs / 255.0;
+        let psnr = if mse == 0.0 {
+            f64::INFINITY
+        } else {
+            10.0 * (1.0 / mse).log10()
+        };
+        vec![
+            MetricOutput::new("mse", mse, "normalized_code^2", Direction::LowerIsBetter)
+                .with_detail("pixels", self.pixels as f64),
+            MetricOutput::new("rmse", rmse, "normalized_code", Direction::LowerIsBetter)
+                .with_detail("pixels", self.pixels as f64),
+            MetricOutput::new("psnr", psnr, "dB", Direction::HigherIsBetter)
+                .with_detail("mse", mse)
+                .with_detail("pixels", self.pixels as f64),
+            MetricOutput::new("mae", mae, "normalized_code", Direction::LowerIsBetter)
+                .with_detail("pixels", self.pixels as f64),
+            MetricOutput::new(
+                "maxae",
+                max_abs,
+                "normalized_code",
+                Direction::LowerIsBetter,
+            )
+            .with_detail("pixels", self.pixels as f64),
+        ]
     }
 }
 
@@ -58,9 +106,17 @@ pub struct GpuContext {
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 struct Params {
     pixel_count: u32,
-    _pad0: u32,
+    groups_x: u32,
     _pad1: u32,
     _pad2: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+struct PartialStats {
+    sum_sq: [f32; 4],
+    sum_abs: [f32; 4],
+    max_abs: [f32; 4],
 }
 
 impl GpuContext {
@@ -150,6 +206,18 @@ impl GpuContext {
         reference: &FrameView<'_, Validated>,
         distorted: &FrameView<'_, Validated>,
     ) -> Result<GpuMse> {
+        self.error_stats_rgba8(reference, distorted)
+    }
+
+    /// Computes RGBA8 MSE/RMSE/MAE/max absolute error statistics on the GPU.
+    ///
+    /// The shader reduces squared error, absolute error, and max absolute error
+    /// in one pass; PSNR can then be derived from the returned MSE.
+    pub fn error_stats_rgba8(
+        &self,
+        reference: &FrameView<'_, Validated>,
+        distorted: &FrameView<'_, Validated>,
+    ) -> Result<GpuRgba8ErrorStats> {
         if reference.dimensions() != distorted.dimensions() {
             return Err(Error::incompatible(format!(
                 "dimension mismatch: {:?} vs {:?}",
@@ -172,22 +240,29 @@ impl GpuContext {
             ));
         }
         let groups = (pixels as u32).div_ceil(WORKGROUP_SIZE).max(1);
-        let reference_words = rgba8_words(reference)?;
-        let distorted_words = rgba8_words(distorted)?;
-        let partial_bytes = u64::from(groups) * std::mem::size_of::<[f32; 4]>() as u64;
+        let groups_x = groups.min(65_535);
+        let groups_y = groups.div_ceil(groups_x);
+        if groups_y > 65_535 {
+            return Err(Error::unsupported(
+                "gpu_mse_rgba8 dispatch would exceed wgpu workgroup limits",
+            ));
+        }
+        let reference_bytes = rgba8_bytes(reference)?;
+        let distorted_bytes = rgba8_bytes(distorted)?;
+        let partial_bytes = u64::from(groups) * std::mem::size_of::<PartialStats>() as u64;
 
         let ref_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("imq-mse-ref"),
-                contents: bytemuck::cast_slice(&reference_words),
+                contents: reference_bytes.as_ref(),
                 usage: wgpu::BufferUsages::STORAGE,
             });
         let dist_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("imq-mse-dist"),
-                contents: bytemuck::cast_slice(&distorted_words),
+                contents: distorted_bytes.as_ref(),
                 usage: wgpu::BufferUsages::STORAGE,
             });
         let partial_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -204,7 +279,7 @@ impl GpuContext {
         });
         let params = Params {
             pixel_count: pixels as u32,
-            _pad0: 0,
+            groups_x,
             _pad1: 0,
             _pad2: 0,
         };
@@ -250,7 +325,7 @@ impl GpuContext {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(groups, 1, 1);
+            pass.dispatch_workgroups(groups_x, groups_y, 1);
         }
         encoder.copy_buffer_to_buffer(&partial_buffer, 0, &readback, 0, partial_bytes);
         self.queue.submit(Some(encoder.finish()));
@@ -268,22 +343,43 @@ impl GpuContext {
             .map_err(|e| Error::Gpu(format!("wgpu readback map failed: {e}")))?;
 
         let mapped = slice.get_mapped_range();
-        let partials: &[[f32; 4]] = bytemuck::cast_slice(&mapped);
-        let mut sums = [0.0f64; 4];
+        let partials: &[PartialStats] = bytemuck::cast_slice(&mapped);
+        let mut sum_sq = [0.0f64; 4];
+        let mut sum_abs = [0.0f64; 4];
+        let mut max_abs = [0.0f64; 4];
         for partial in partials {
             for c in 0..4 {
-                sums[c] += f64::from(partial[c]);
+                sum_sq[c] += f64::from(partial.sum_sq[c]);
+                sum_abs[c] += f64::from(partial.sum_abs[c]);
+                max_abs[c] = max_abs[c].max(f64::from(partial.max_abs[c]));
             }
         }
         drop(mapped);
         readback.unmap();
 
         let px = pixels as f64;
-        let channel_mse = [sums[0] / px, sums[1] / px, sums[2] / px, sums[3] / px];
-        let mse = sums.iter().sum::<f64>() / (px * 4.0);
-        Ok(GpuMse {
+        let channel_mse = [
+            sum_sq[0] / px,
+            sum_sq[1] / px,
+            sum_sq[2] / px,
+            sum_sq[3] / px,
+        ];
+        let channel_mae = [
+            sum_abs[0] / px,
+            sum_abs[1] / px,
+            sum_abs[2] / px,
+            sum_abs[3] / px,
+        ];
+        let mse = sum_sq.iter().sum::<f64>() / (px * 4.0);
+        let mae = sum_abs.iter().sum::<f64>() / (px * 4.0);
+        Ok(GpuRgba8ErrorStats {
             mse,
             channel_mse,
+            rmse: mse.sqrt(),
+            mae,
+            channel_mae,
+            max_abs: max_abs.into_iter().fold(0.0, f64::max),
+            channel_max_abs: max_abs,
             pixels: pixels as u64,
         })
     }
@@ -302,19 +398,27 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-fn rgba8_words(frame: &FrameView<'_, Validated>) -> Result<Vec<u32>> {
+fn rgba8_bytes<'a>(frame: &FrameView<'a, Validated>) -> Result<Cow<'a, [u8]>> {
     let dims = frame.dimensions();
     let (w, h) = dims.as_usize()?;
     let row_bytes = w
         .checked_mul(4)
         .ok_or_else(|| Error::invalid_frame("RGBA row byte size overflow"))?;
     let plane = frame.plane(0)?;
-    let mut out = Vec::with_capacity(dims.pixels()?);
+    let total_bytes = row_bytes
+        .checked_mul(h)
+        .ok_or_else(|| Error::invalid_frame("RGBA buffer byte size overflow"))?;
+    if plane.stride == row_bytes {
+        return plane
+            .data
+            .get(..total_bytes)
+            .map(Cow::Borrowed)
+            .ok_or_else(|| Error::invalid_frame("RGBA plane is shorter than expected"));
+    }
+    let mut out = Vec::with_capacity(total_bytes);
     for y in 0..h {
         let row = plane.row(y, row_bytes)?;
-        for px in row.chunks_exact(4) {
-            out.push(u32::from_le_bytes([px[0], px[1], px[2], px[3]]));
-        }
+        out.extend_from_slice(row);
     }
-    Ok(out)
+    Ok(Cow::Owned(out))
 }

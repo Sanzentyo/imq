@@ -48,6 +48,10 @@ The public API uses small ADTs instead of stringly typed values:
 
 `video::ffmpeg` is an I/O adapter. It runs `ffprobe` for metadata and `ffmpeg` for RGBA rawvideo frames on stdout, then hands those frames to the same `FrameOwned`/`MetricSet` core used for still images.
 
-`gpu` is another edge adapter. It receives validated borrowed frames, compacts rows if required, dispatches WGSL compute, and returns normal `MetricOutput`-compatible results.
+`gpu` is another edge adapter. It receives validated borrowed frames, uploads
+tight RGBA8 rows directly, compacts rows only when required, dispatches WGSL
+compute, and returns normal `MetricOutput`-compatible results. The RGBA8 kernel
+reduces squared error, absolute error, and max absolute error together, so MSE,
+RMSE, PSNR, MAE, and maxAE can share one GPU pass.
 
 `nn` converts validated frames into Burn tensors and provides extension traits for pretrained perceptual models.

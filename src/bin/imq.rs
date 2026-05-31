@@ -1726,6 +1726,7 @@ mod tui_app {
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
+    use std::thread;
     use std::time::SystemTime;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2129,25 +2130,24 @@ mod tui_app {
                 self.status = "Select a reference image with r".to_string();
                 return;
             };
-            self.comparisons = self
-                .targets
-                .iter()
-                .map(
-                    |target| match compare_paths(reference_path, target, &self.metrics_csv) {
-                        Ok(comparison) => TargetComparison {
-                            path: target.clone(),
-                            comparison: Some(comparison),
-                            error: None,
-                        },
-                        Err(err) => TargetComparison {
-                            path: target.clone(),
+            let targets = self.targets.clone();
+            self.comparisons =
+                match compare_target_paths(reference_path, &targets, &self.metrics_csv) {
+                    Ok(comparisons) => comparisons,
+                    Err(err) => targets
+                        .into_iter()
+                        .map(|path| TargetComparison {
+                            path,
                             comparison: None,
                             error: Some(format!("{err:#}")),
-                        },
-                    },
-                )
-                .collect();
-            self.status = format!("Compared {} target(s)", self.targets.len());
+                        })
+                        .collect(),
+                };
+            self.status = format!(
+                "Compared {} target(s) with {} worker(s)",
+                self.targets.len(),
+                comparison_worker_count(self.targets.len())
+            );
         }
 
         fn sync_list_state(&mut self) {
@@ -3104,21 +3104,81 @@ mod tui_app {
         preview.pixel(source_x, source_y)
     }
 
-    fn compare_paths(
+    fn compare_target_paths(
         reference_path: &Path,
-        distorted_path: &Path,
+        targets: &[PathBuf],
         metrics_csv: &str,
-    ) -> Result<Comparison> {
+    ) -> Result<Vec<TargetComparison>> {
         let reference = image_crate::load_image_path(reference_path)
             .with_context(|| format!("failed to decode `{}`", reference_path.display()))?;
-        let distorted = image_crate::load_image_path(distorted_path)
-            .with_context(|| format!("failed to decode `{}`", distorted_path.display()))?;
         let metrics = MetricSet::from_csv(metrics_csv)?;
+        let workers = comparison_worker_count(targets.len());
+        if workers <= 1 {
+            return Ok(targets
+                .iter()
+                .map(|target| compare_one_target(&reference, &metrics, target))
+                .collect());
+        }
+        let mut comparisons = Vec::with_capacity(targets.len());
+        for chunk in targets.chunks(workers) {
+            let mut chunk_results = thread::scope(|scope| {
+                chunk
+                    .iter()
+                    .map(|target| scope.spawn(|| compare_one_target(&reference, &metrics, target)))
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|handle| {
+                        handle.join().unwrap_or_else(|_| TargetComparison {
+                            path: PathBuf::from("<worker panic>"),
+                            comparison: None,
+                            error: Some("comparison worker panicked".to_string()),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
+            comparisons.append(&mut chunk_results);
+        }
+        Ok(comparisons)
+    }
+
+    fn compare_one_target(
+        reference: &imq::FrameOwned,
+        metrics: &MetricSet,
+        target: &Path,
+    ) -> TargetComparison {
+        match compare_loaded_target(reference, metrics, target) {
+            Ok(comparison) => TargetComparison {
+                path: target.to_path_buf(),
+                comparison: Some(comparison),
+                error: None,
+            },
+            Err(err) => TargetComparison {
+                path: target.to_path_buf(),
+                comparison: None,
+                error: Some(format!("{err:#}")),
+            },
+        }
+    }
+
+    fn compare_loaded_target(
+        reference: &imq::FrameOwned,
+        metrics: &MetricSet,
+        target: &Path,
+    ) -> Result<Comparison> {
+        let distorted = image_crate::load_image_path(target)
+            .with_context(|| format!("failed to decode `{}`", target.display()))?;
         let outputs = metrics.compare(&reference.as_view(), &distorted.as_view())?;
         Ok(Comparison {
             dimensions: reference.dimensions(),
             metrics: outputs,
         })
+    }
+
+    fn comparison_worker_count(target_count: usize) -> usize {
+        thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            .min(target_count.max(1))
     }
 
     fn initial_cwd(

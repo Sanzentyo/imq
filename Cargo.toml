@@ -81,3 +81,7 @@ required-features = ["ffmpeg"]
 name = "gpu_mse"
 path = "examples/gpu_mse.rs"
 required-features = ["gpu", "image-codecs"]
+
+[[example]]
+name = "benchmark"
+path = "examples/benchmark.rs"

@@ -11,7 +11,10 @@ fn main() -> Result<()> {
     let reference = image_crate::load_image_path(reference_path)?;
     let distorted = image_crate::load_image_path(distorted_path)?;
     let gpu = GpuContext::new()?;
-    let result = gpu.mse_rgba8(&reference.as_view(), &distorted.as_view())?;
+    let result = gpu.error_stats_rgba8(&reference.as_view(), &distorted.as_view())?;
     println!("gpu_mse_rgba8 = {}", result.mse);
+    println!("gpu_rmse_rgba8 = {}", result.rmse);
+    println!("gpu_mae_rgba8 = {}", result.mae);
+    println!("gpu_maxae_rgba8 = {}", result.max_abs);
     Ok(())
 }

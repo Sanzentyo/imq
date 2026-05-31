@@ -3,6 +3,9 @@
 use crate::frame::{ColorSpace, Dimensions, FrameView, PixelFormat, Validated};
 use crate::{Error, Result};
 use std::collections::BTreeMap;
+use std::thread;
+
+const PARALLEL_ERROR_MIN_PIXELS: usize = 512 * 512;
 
 mod basic;
 mod ssim;
@@ -153,14 +156,19 @@ impl MetricSpec {
 
 /// A set of metrics to run together.
 pub struct MetricSet {
-    metrics: Vec<Box<dyn Metric>>,
+    entries: Vec<MetricEntry>,
+}
+
+enum MetricEntry {
+    BuiltIn(MetricSpec),
+    Custom(Box<dyn Metric>),
 }
 
 impl MetricSet {
     /// Creates an empty metric set.
     pub fn new() -> Self {
         Self {
-            metrics: Vec::new(),
+            entries: Vec::new(),
         }
     }
 
@@ -180,7 +188,8 @@ impl MetricSet {
     pub fn from_specs(specs: &[MetricSpec]) -> Result<Self> {
         let mut set = Self::new();
         for spec in specs {
-            set.push(spec.build()?);
+            spec.build()?;
+            set.entries.push(MetricEntry::BuiltIn(spec.clone()));
         }
         Ok(set)
     }
@@ -198,7 +207,7 @@ impl MetricSet {
 
     /// Adds one metric.
     pub fn push(&mut self, metric: Box<dyn Metric>) {
-        self.metrics.push(metric);
+        self.entries.push(MetricEntry::Custom(metric));
     }
 
     /// Runs all metrics.
@@ -207,15 +216,29 @@ impl MetricSet {
         reference: &FrameView<'_, Validated>,
         distorted: &FrameView<'_, Validated>,
     ) -> Result<Vec<MetricOutput>> {
-        self.metrics
-            .iter()
-            .map(|metric| metric.compare(reference, distorted))
-            .collect()
+        let mut outputs = Vec::with_capacity(self.entries.len());
+        let mut error_stats = Vec::<(SampleDomain, ErrorStats)>::new();
+        for entry in &self.entries {
+            let output = match entry {
+                MetricEntry::BuiltIn(spec) => {
+                    if is_error_metric(spec.name.as_str()) {
+                        let stats =
+                            stats_for_domain(&mut error_stats, spec.domain, reference, distorted)?;
+                        error_metric_output(spec, stats)
+                    } else {
+                        spec.build()?.compare(reference, distorted)?
+                    }
+                }
+                MetricEntry::Custom(metric) => metric.compare(reference, distorted)?,
+            };
+            outputs.push(output);
+        }
+        Ok(outputs)
     }
 
     /// Returns `true` if no metrics are configured.
     pub fn is_empty(&self) -> bool {
-        self.metrics.is_empty()
+        self.entries.is_empty()
     }
 }
 
@@ -328,18 +351,92 @@ pub(crate) fn aggregate_error(
     b: &FrameView<'_, Validated>,
     domain: SampleDomain,
 ) -> Result<ErrorStats> {
+    if let Some(stats) = aggregate_error_parallel(a, b, domain)? {
+        return Ok(stats);
+    }
+    aggregate_error_rows(a, b, domain, 0, None)
+}
+
+fn aggregate_error_rows(
+    a: &FrameView<'_, Validated>,
+    b: &FrameView<'_, Validated>,
+    domain: SampleDomain,
+    start_y: usize,
+    end_y: Option<usize>,
+) -> Result<ErrorStats> {
+    let dims = ensure_same_dimensions(a, b)?;
+    let (_, h) = dims.as_usize()?;
+    let end_y = end_y.unwrap_or(h).min(h);
     let mut sum_sq = 0.0;
     let mut sum_abs = 0.0;
     let mut max_abs = 0.0;
-    let count = for_each_sample_pair(a, b, domain, |x, y| {
-        let d = x - y;
-        let ad = d.abs();
-        sum_sq += d * d;
-        sum_abs += ad;
-        if ad > max_abs {
-            max_abs = ad;
+    let mut count = 0usize;
+
+    match domain {
+        SampleDomain::Luma => {
+            for y in start_y..end_y {
+                for x in 0..usize::try_from(dims.width)
+                    .map_err(|_| Error::invalid_frame("width overflows usize"))?
+                {
+                    let x_value = read_luma(a, x, y)?;
+                    let y_value = read_luma(b, x, y)?;
+                    push_error_sample(&mut sum_sq, &mut sum_abs, &mut max_abs, x_value, y_value);
+                    count += 1;
+                }
+            }
         }
-    })?;
+        SampleDomain::Color => {
+            for y in start_y..end_y {
+                for x in 0..usize::try_from(dims.width)
+                    .map_err(|_| Error::invalid_frame("width overflows usize"))?
+                {
+                    let ca = read_rgb(a, x, y)?;
+                    let cb = read_rgb(b, x, y)?;
+                    for c in 0..3 {
+                        push_error_sample(&mut sum_sq, &mut sum_abs, &mut max_abs, ca[c], cb[c]);
+                        count += 1;
+                    }
+                }
+            }
+        }
+        SampleDomain::All if !a.pixel_format().is_yuv() && !b.pixel_format().is_yuv() => {
+            let channels_a = stored_channel_count(a.pixel_format());
+            let channels_b = stored_channel_count(b.pixel_format());
+            if channels_a != channels_b {
+                return Err(Error::incompatible(format!(
+                    "channel counts differ for all-channel compare: {channels_a} vs {channels_b}"
+                )));
+            }
+            for y in start_y..end_y {
+                for x in 0..usize::try_from(dims.width)
+                    .map_err(|_| Error::invalid_frame("width overflows usize"))?
+                {
+                    let ca = read_stored_channels(a, x, y)?;
+                    let cb = read_stored_channels(b, x, y)?;
+                    for c in 0..channels_a {
+                        push_error_sample(&mut sum_sq, &mut sum_abs, &mut max_abs, ca[c], cb[c]);
+                        count += 1;
+                    }
+                }
+            }
+        }
+        _ => {
+            if start_y != 0 || end_y != h {
+                return Err(Error::unsupported(
+                    "row-range aggregation is unsupported for this sample domain",
+                ));
+            }
+            count = for_each_sample_pair(a, b, domain, |x, y| {
+                push_error_sample(&mut sum_sq, &mut sum_abs, &mut max_abs, x, y);
+            })?;
+        }
+    }
+
+    if count == 0 {
+        return Err(Error::unsupported(
+            "metric received zero comparable samples",
+        ));
+    }
     Ok(ErrorStats {
         count,
         sum_sq,
@@ -348,6 +445,155 @@ pub(crate) fn aggregate_error(
     })
 }
 
+fn aggregate_error_parallel(
+    a: &FrameView<'_, Validated>,
+    b: &FrameView<'_, Validated>,
+    domain: SampleDomain,
+) -> Result<Option<ErrorStats>> {
+    let dims = ensure_same_dimensions(a, b)?;
+    if !can_parallelize_error_domain(a, b, domain) || dims.pixels()? < PARALLEL_ERROR_MIN_PIXELS {
+        return Ok(None);
+    }
+    let (_, h) = dims.as_usize()?;
+    let workers = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(h);
+    if workers <= 1 {
+        return Ok(None);
+    }
+    let rows_per_worker = h.div_ceil(workers);
+    let partials = thread::scope(|scope| {
+        let handles = (0..workers)
+            .filter_map(|worker| {
+                let start_y = worker * rows_per_worker;
+                let end_y = ((worker + 1) * rows_per_worker).min(h);
+                (start_y < end_y).then(|| {
+                    scope.spawn(move || aggregate_error_rows(a, b, domain, start_y, Some(end_y)))
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| Error::unsupported("metric worker panicked"))?
+            })
+            .collect::<Result<Vec<_>>>()
+    })?;
+    Ok(Some(combine_error_stats(partials)))
+}
+
+fn can_parallelize_error_domain(
+    a: &FrameView<'_, Validated>,
+    b: &FrameView<'_, Validated>,
+    domain: SampleDomain,
+) -> bool {
+    matches!(domain, SampleDomain::Luma | SampleDomain::Color)
+        || (matches!(domain, SampleDomain::All)
+            && !a.pixel_format().is_yuv()
+            && !b.pixel_format().is_yuv())
+}
+
+fn push_error_sample(
+    sum_sq: &mut f64,
+    sum_abs: &mut f64,
+    max_abs: &mut f64,
+    reference: f64,
+    distorted: f64,
+) {
+    let d = reference - distorted;
+    let ad = d.abs();
+    *sum_sq += d * d;
+    *sum_abs += ad;
+    if ad > *max_abs {
+        *max_abs = ad;
+    }
+}
+
+fn combine_error_stats(partials: Vec<ErrorStats>) -> ErrorStats {
+    partials
+        .into_iter()
+        .fold(ErrorStats::default(), |mut acc, stats| {
+            acc.count += stats.count;
+            acc.sum_sq += stats.sum_sq;
+            acc.sum_abs += stats.sum_abs;
+            acc.max_abs = acc.max_abs.max(stats.max_abs);
+            acc
+        })
+}
+
+fn stats_for_domain<'a>(
+    cached: &'a mut Vec<(SampleDomain, ErrorStats)>,
+    domain: SampleDomain,
+    reference: &FrameView<'_, Validated>,
+    distorted: &FrameView<'_, Validated>,
+) -> Result<&'a ErrorStats> {
+    if let Some(index) = cached
+        .iter()
+        .position(|(cached_domain, _)| *cached_domain == domain)
+    {
+        return Ok(&cached[index].1);
+    }
+    let stats = aggregate_error(reference, distorted, domain)?;
+    cached.push((domain, stats));
+    Ok(&cached.last().expect("pushed stats").1)
+}
+
+fn is_error_metric(name: &str) -> bool {
+    matches!(
+        name,
+        "mse" | "rmse" | "psnr" | "mae" | "maxae" | "max_ae" | "max-error"
+    )
+}
+
+fn error_metric_output(spec: &MetricSpec, stats: &ErrorStats) -> MetricOutput {
+    match spec.name.as_str() {
+        "mse" => MetricOutput::new(
+            "mse",
+            stats.mse(),
+            "normalized_code^2",
+            Direction::LowerIsBetter,
+        )
+        .with_detail("samples", stats.count as f64),
+        "rmse" => MetricOutput::new(
+            "rmse",
+            stats.rmse(),
+            "normalized_code",
+            Direction::LowerIsBetter,
+        )
+        .with_detail("samples", stats.count as f64),
+        "psnr" => {
+            let mse = stats.mse();
+            let psnr = if mse == 0.0 {
+                f64::INFINITY
+            } else {
+                10.0 * (1.0 / mse).log10()
+            };
+            MetricOutput::new("psnr", psnr, "dB", Direction::HigherIsBetter)
+                .with_detail("mse", mse)
+                .with_detail("samples", stats.count as f64)
+        }
+        "mae" => MetricOutput::new(
+            "mae",
+            stats.mae(),
+            "normalized_code",
+            Direction::LowerIsBetter,
+        )
+        .with_detail("samples", stats.count as f64),
+        "maxae" | "max_ae" | "max-error" => MetricOutput::new(
+            "maxae",
+            stats.max_abs,
+            "normalized_code",
+            Direction::LowerIsBetter,
+        )
+        .with_detail("samples", stats.count as f64),
+        _ => unreachable!("error metric names are filtered before output"),
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ErrorStats {
     pub count: usize,
     pub sum_sq: f64,
