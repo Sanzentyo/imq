@@ -137,7 +137,9 @@ native graphics terminals and Sixel terminals get a higher pixel-resolution
 default than ANSI block rendering, without an artificial fixed maximum. Auto
 mode prefers Kitty graphics protocol for terminals such as Ghostty, then Sixel
 for terminals such as Windows Terminal, then iTerm2 inline images, then ANSI
-blocks. This works over SSH when the terminal identity is visible through
+blocks. Supported render formats are Kitty inline PNG, Sixel with square-pixel
+raster attributes, iTerm2 inline PNG, and ANSI truecolor half-blocks. This works
+over SSH when the terminal identity is visible through
 `TERM`, `TERM_PROGRAM`, `WT_SESSION`, or similar environment hints; if SSH hides
 the local terminal identity, auto mode falls back to ANSI so an image is still
 drawn. Use `--display kitty`, `--display sixel`, `--display iterm2`,

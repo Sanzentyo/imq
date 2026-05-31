@@ -194,7 +194,11 @@ pub fn render_ansi_blocks(image: &PreviewImage) -> String {
 
 /// Renders an image as Sixel using a fixed 6x6x6 RGB color cube.
 pub fn render_sixel(image: &PreviewImage) -> String {
-    let mut out = String::from("\x1bPq");
+    let mut out = format!(
+        "\x1bP9;1;0q\"1;1;{};{}",
+        image.width.max(1),
+        image.height.max(1)
+    );
     for r in 0..6 {
         for g in 0..6 {
             for b in 0..6 {
@@ -288,8 +292,24 @@ mod tests {
     fn sixel_contains_dcs_markers() {
         let image = test_image();
         let out = render_sixel(&image);
-        assert!(out.starts_with("\x1bPq"));
+        assert!(out.starts_with("\x1bP9;1;0q\"1;1;1;1"));
         assert!(out.ends_with("\x1b\\"));
+    }
+
+    #[test]
+    fn sixel_declares_square_pixels_and_raster_size() {
+        let image = PreviewImage {
+            width: 16,
+            height: 9,
+            source_width: 16,
+            source_height: 9,
+            pixels: vec![[255, 0, 0]; 16 * 9],
+            source: "test".to_string(),
+        };
+        let out = render_sixel(&image);
+
+        assert!(out.starts_with("\x1bP9;1;0q"));
+        assert!(out.contains("\"1;1;16;9"));
     }
 
     #[test]
@@ -312,6 +332,14 @@ mod tests {
     fn auto_uses_sixel_for_windows_terminal_hint() {
         assert_eq!(
             auto_display_mode_from_env(env(&[("WT_SESSION", "abc")])),
+            DisplayMode::Sixel
+        );
+    }
+
+    #[test]
+    fn auto_uses_sixel_for_windows_terminal_program_hint() {
+        assert_eq!(
+            auto_display_mode_from_env(env(&[("TERM_PROGRAM", "Windows_Terminal")])),
             DisplayMode::Sixel
         );
     }
