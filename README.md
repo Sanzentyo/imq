@@ -172,6 +172,11 @@ quality checks.
 
 ## Library: Sans I/O comparison
 
+For library-focused Rust usage, see [docs/rust-crate-usage.md](docs/rust-crate-usage.md)
+and the sample project at [samples/imq-crate-usage](samples/imq-crate-usage).
+For JavaScript/browser usage, see [docs/js-usage.md](docs/js-usage.md) and
+[samples/imqraw-js-browser](samples/imqraw-js-browser).
+
 ```rust
 use imq::{FrameView, MetricSet, PixelFormat};
 

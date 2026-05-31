@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>imqraw JavaScript sample</title>
+<main>
+  <h1>imqraw JavaScript sample</h1>
+  <pre id="output">Loading...</pre>
+</main>
+<script type="module">
+  import {
+    init,
+    encodeRgba8,
+    imqraw_image_count,
+    imqraw_version,
+  } from "https://sanzentyo.github.io/imq/imqraw/v0.1.0/imqraw.js";
+
+  await init();
+
+  const rgba = new Uint8Array([
+    0, 0, 0, 255,
+    255, 255, 255, 255,
+  ]);
+  const bytes = encodeRgba8(rgba, 2, 1, {
+    label: "browser-sample",
+    tags: ["sample", "rgba8"],
+  });
+
+  document.querySelector("#output").textContent = JSON.stringify({
+    version: imqraw_version(),
+    bytes: bytes.byteLength,
+    images: imqraw_image_count(bytes),
+  }, null, 2);
+</script>

@@ -1,6 +1,6 @@
 ---
 name: imq-cli
-description: Use the `imq` command-line tool for full-reference image and video quality evaluation. Trigger when Codex needs to compare reference/distorted images or videos, compute PSNR/SSIM/MSE/RMSE/MAE/maxAE, produce JSON metric reports, list supported still-image formats, probe video metadata, extract video frames, or run the TUI.
+description: Use the `imq` command-line tool for full-reference image and video quality evaluation. Trigger when Codex needs to compare reference/distorted images or videos, compute PSNR/SSIM/MSE/RMSE/MAE/maxAE, produce JSON metric reports, list supported still-image formats, probe video metadata, or extract video frames.
 ---
 
 # imq CLI
@@ -116,137 +116,17 @@ imq probe input.mp4 --json
 imq extract-frame input.mp4 150 frame-150.png
 ```
 
-## Preview Files
-
-Use `preview` for terminal previews. Auto mode uses Sixel when the terminal
-appears to support it and ANSI color blocks otherwise.
-
-```bash
-imq preview image.png
-imq p image.png
-imq preview --display kitty --cols 2 a.png b.png clip.mp4
-imq preview --size 120x60 --fit cover image.png
-imq preview -a image.png
-imq preview --decode cpu clip.mp4
-```
-
-Multiple inputs are arranged as a montage. Use `--rows` or `--cols` to control
-the layout. Omit `--size` to derive preview dimensions from terminal size and
-display mode, or pass `--size WIDTHxHEIGHT`; known native graphics terminals and
-Sixel terminals get a higher pixel-resolution default than ANSI blocks. Auto
-mode prefers Kitty graphics protocol for terminals such as Ghostty, then Sixel
-for terminals such as Windows Terminal, then iTerm2 inline images, then ANSI
-blocks. Over SSH, native graphics are selected when terminal identity hints
-such as `TERM`, `TERM_PROGRAM`, or `WT_SESSION` are visible; otherwise ANSI is
-used so an image is still drawn. Use `--display kitty`, `--display sixel`,
-`--display iterm2`, `IMQ_IMAGE_PROTOCOL=kitty|sixel|iterm2|ansi`, `IMQ_KITTY=1`,
-`IMQ_SIXEL=1`, `IMQ_ITERM2=1`, or matching `IMQ_NO_*` variables to override
-detection.
-`--fit contain|cover|stretch` controls aspect handling. Video thumbnails are
-extracted through `ffmpeg`. When a small source needs to fill the terminal-based
-display area, preview uses nearest-neighbor enlargement so source pixels become
-larger; shrink paths use `fast_image_resize`. Use `-a`/`--actual-size` to render at
-the decoded source dimensions instead of fitting the terminal area. In the TUI,
-the initial preview resolution is derived from the current preview panel area
-and terminal font size. Pressing `a` toggles exact-pixel display. Pressing `+`
-at the selected file's source dimensions switches to `max`, and `max` uses each
-newly selected file's own maximum preview resolution.
-`--decode auto` tries detected hardware decode backends and falls back to CPU
-unless the build uses the `cpu-only` feature.
-Useful short options include `-m` for metrics, `-j` for JSON output, `preview
--s` for size, `preview -D` for display mode, `preview -a` for exact pixel size,
-and `tui -C` for preview cache size.
+## Other Commands
 
 Subcommand aliases are available: `i` for `image`, `v` for `video`, `p` for
 `preview`, `t` for `tui`, `fmt` for `formats`, `raw-pack`/`bundle` for `pack`,
-`raw-info` for `bundle-info`, and `x`/`extract` for
-`extract-frame`.
+`raw-info` for `bundle-info`, and `x`/`extract` for `extract-frame`.
 
-## TUI
-
-The `tui` subcommand is enabled by default:
-
-```bash
-imq tui reference.png distorted-a.png distorted-b.png
-imq tui
-imq tui ./images
-imq tui --preview-cache 64 ./images
-```
-
-The TUI includes a file browser. Use it to move through folders and set
-one reference image plus multiple comparison targets without restarting. When
-testing non-interactively, run it in a PTY and send `q` or Esc to exit.
-Vim-style navigation is supported: `j`/`k` move, `h` goes to the parent
-directory, `l` opens/selects, and `g`/`G` jump to the first/last entry. Use `r`
-to set the reference, `Space` or `d` to toggle targets, `v` to cycle
-current/side-by-side/diff previews, `/` to filter by name, `e` to filter to the
-selected extension, `u` to clear filters, `i` to toggle directories, `o` to
-toggle non-media files, and `s` to cycle sort order. Use `+`/`-` to adjust
-preview resolution, `f` to cycle fit mode, and `a` to toggle exact-pixel preview
-display. The TUI shows selected reference/target thumbnails and a multi-target
-comparison table. It uses native Kitty/Sixel/iTerm2 image protocols when the
-terminal reports support, falls back to half-block rendering otherwise, and
-keeps decoded previews in memory according to `--preview-cache`.
-
-## GPU, Benchmark, and NN Features
-
-GPU RGBA8 error stats are exposed as examples, not CLI subcommands. The GPU
-path computes MSE, RMSE, PSNR, MAE, and maxAE-compatible stats in one dispatch:
-
-```bash
-cargo run --quiet --features gpu --example gpu_mse -- reference.png distorted.png
-cargo run --release --example benchmark --features gpu -- --width 3840 --height 2160 --iterations 3
-```
-
-The benchmark prints separate CPU error metrics, optimized combined CPU error
-metrics, CPU default metrics, and GPU RGBA8 error stats when `gpu` is enabled.
-
-Burn/NN support is library scaffolding. Validate availability with:
-
-```bash
-cargo check --features nn-burn-ndarray --lib
-cargo check --features nn-burn-wgpu --lib
-```
-
-Do not imply bundled pretrained weights exist; applications must supply model definitions/checkpoints.
-
-## imqraw Library Feature
-
-The raw bundle API is always available in the library as `imq::imqraw` and
-through `encode_imqraw_bundle` / `decode_imqraw_bundle`. It is Sans I/O and
-stores little-endian metadata plus verbatim frame planes, so it is suitable for
-cross-platform stdin/stdout exchange without codec artifacts.
-
-For crate-level usage, refer to and run the bundled example:
-
-```bash
-cargo run --example imqraw_bundle
-```
-
-The optional `imqraw-image` feature enables conversion helpers from common
-`image` crate types (`DynamicImage`, `RgbaImage`, `RgbImage`) into imqraw
-records. This feature is disabled by default.
-
-## imqraw Browser Distribution
-
-For browser or Three.js capture workflows, prefer the GitHub Pages ESM build:
-
-```js
-import { init, encodeRgba8, encodeThreeRenderer } from "https://sanzentyo.github.io/imq/imqraw/v0.1.0/imqraw.js";
-
-await init();
-const bytes = encodeRgba8(rgbaBytes, width, height, {
-  label: "frame-0001",
-  tags: ["threejs", "reference"],
-});
-```
-
-Use fixed `imqraw/vX.Y.Z/` URLs for reproducible work and `imqraw/latest/` only
-for quick experiments. Versioned directories are immutable; release workflows
-refresh `latest` and attach the same generated files to GitHub Releases. The
-`encodeThreeRenderer(renderer, options)` helper reads RGBA8 pixels from the
-renderer's WebGL context, flips WebGL's bottom-left origin, and encodes an
-`imqraw` bundle.
+Use `preview` or `tui` only when the user explicitly asks to inspect images in a
+terminal UI. For crate/library, WebAssembly, GPU, benchmark, or NN usage, refer
+to repository documentation instead of expanding those workflows in this skill:
+`docs/rust-crate-usage.md` for Rust and `docs/js-usage.md` for JavaScript/browser
+usage.
 
 ## Reporting Results
 
