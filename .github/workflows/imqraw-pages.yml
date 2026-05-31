@@ -1,0 +1,76 @@
+name: imqraw Pages
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version directory to publish, for example v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version="${{ inputs.version }}"
+          fi
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "version must look like vX.Y.Z" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Install wasm target and wasm-pack
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo install wasm-pack --locked
+      - name: Build web distribution
+        run: |
+          chmod +x scripts/build-imqraw-pages.sh
+          scripts/build-imqraw-pages.sh "${{ steps.version.outputs.version }}" target/imqraw-pages
+          cd target/imqraw-pages
+          zip -r "../imqraw-${{ steps.version.outputs.version }}.zip" imqraw/${{ steps.version.outputs.version }} imqraw/latest index.html
+      - name: Checkout Pages branch
+        shell: bash
+        run: |
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch origin gh-pages
+            git worktree add target/gh-pages origin/gh-pages
+          else
+            git worktree add --detach target/gh-pages
+            git -C target/gh-pages rm -rf . >/dev/null 2>&1 || true
+          fi
+      - name: Publish Pages files
+        shell: bash
+        run: |
+          mkdir -p target/gh-pages
+          cp -R target/imqraw-pages/. target/gh-pages/
+          touch target/gh-pages/.nojekyll
+          git -C target/gh-pages config user.name "github-actions[bot]"
+          git -C target/gh-pages config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C target/gh-pages add .
+          git -C target/gh-pages commit -m "Publish imqraw ${{ steps.version.outputs.version }}" || exit 0
+          git -C target/gh-pages push origin HEAD:gh-pages
+      - name: Publish GitHub Release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            gh release upload "${{ steps.version.outputs.version }}" "target/imqraw-${{ steps.version.outputs.version }}.zip" --clobber
+          else
+            gh release create "${{ steps.version.outputs.version }}" "target/imqraw-${{ steps.version.outputs.version }}.zip" --generate-notes
+          fi

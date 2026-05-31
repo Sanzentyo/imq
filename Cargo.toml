@@ -9,6 +9,9 @@ readme = "README.md"
 keywords = ["image", "quality", "psnr", "ssim", "ffmpeg"]
 categories = ["multimedia::images", "multimedia::video", "command-line-utilities"]
 
+[workspace]
+members = [".", "crates/imqraw-wasm"]
+
 [lib]
 name = "imq"
 path = "src/lib.rs"

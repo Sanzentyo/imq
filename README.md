@@ -245,6 +245,27 @@ With `--features imqraw-image`, helper constructors are enabled for common
 `image` crate types such as `DynamicImage`, `RgbaImage`, and `RgbImage`. That
 feature is opt-in so the raw container can stay independent from codec adapters.
 
+### Browser and Three.js capture
+
+The `imqraw-wasm` package exposes a WebAssembly encoder for browser and Node
+pipelines. Published builds are served from GitHub Pages:
+
+```js
+import { init, encodeRgba8, encodeThreeRenderer } from "https://sanzentyo.github.io/imq/imqraw/v0.1.0/imqraw.js";
+
+await init();
+const bytes = encodeRgba8(rgbaBytes, width, height, {
+  label: "frame-0001",
+  tags: ["threejs", "reference"],
+});
+```
+
+Use `imqraw/vX.Y.Z/` for reproducible imports and `imqraw/latest/` for quick
+experiments. Release tags publish immutable version directories, refresh
+`latest`, and attach the same files to GitHub Releases. The helper
+`encodeThreeRenderer(renderer, options)` captures the current WebGL drawing
+buffer as RGBA8 and packs it into an `imqraw` bundle.
+
 ## GPU path
 
 With `--features gpu`, `GpuContext::error_stats_rgba8` dispatches a WGSL

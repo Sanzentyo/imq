@@ -224,6 +224,27 @@ The optional `imqraw-image` feature enables conversion helpers from common
 `image` crate types (`DynamicImage`, `RgbaImage`, `RgbImage`) into imqraw
 records. This feature is disabled by default.
 
+## imqraw Browser Distribution
+
+For browser or Three.js capture workflows, prefer the GitHub Pages ESM build:
+
+```js
+import { init, encodeRgba8, encodeThreeRenderer } from "https://sanzentyo.github.io/imq/imqraw/v0.1.0/imqraw.js";
+
+await init();
+const bytes = encodeRgba8(rgbaBytes, width, height, {
+  label: "frame-0001",
+  tags: ["threejs", "reference"],
+});
+```
+
+Use fixed `imqraw/vX.Y.Z/` URLs for reproducible work and `imqraw/latest/` only
+for quick experiments. Versioned directories are immutable; release workflows
+refresh `latest` and attach the same generated files to GitHub Releases. The
+`encodeThreeRenderer(renderer, options)` helper reads RGBA8 pixels from the
+renderer's WebGL context, flips WebGL's bottom-left origin, and encodes an
+`imqraw` bundle.
+
 ## Reporting Results
 
 Report exact commands that passed or failed. If a command depends on missing external tools, say which executable is missing. For metric outputs, summarize the metric names, compared dimensions, frame count, and whether JSON/text output was requested.
