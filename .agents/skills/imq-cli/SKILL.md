@@ -12,8 +12,6 @@ Use `imq` for image/video quality checks. Prefer the installed `imq` binary when
 1. If `imq --help` works, use `imq`.
 2. If `imq` is missing, run `cargo install --git https://github.com/Sanzentyo/imq.git --locked` and then use `imq`.
 3. For an install with extra crate features, use `cargo install --git https://github.com/Sanzentyo/imq.git --locked --features <feature>`.
-4. Inside a source checkout, use `cargo run --quiet --bin imq --` when intentionally testing local uninstalled changes.
-5. For optional local-checkout features, use `cargo run --quiet --features <feature> --bin imq --`.
 
 Useful environment checks:
 
