@@ -5,18 +5,38 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Install wasm target
-        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
       - name: Format
-        run: cargo fmt --check
+        run: cargo fmt --all -- --check
+
       - name: Test
         run: cargo test --workspace --all-targets
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Check no-default-features
+        run: cargo check --workspace --no-default-features
+
       - name: Check wasm package
         run: cargo check -p imqraw-wasm --target wasm32-unknown-unknown

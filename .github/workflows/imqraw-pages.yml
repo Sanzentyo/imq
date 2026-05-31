@@ -11,15 +11,28 @@ on:
         required: true
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: imqraw-pages
+  cancel-in-progress: false
 
 jobs:
-  publish:
+  build:
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      pages: write
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
+
       - name: Resolve version
         id: version
         shell: bash
@@ -29,48 +42,114 @@ jobs:
           else
             version="${{ inputs.version }}"
           fi
+
           if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "version must look like vX.Y.Z" >&2
             exit 1
           fi
+
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      - name: Install wasm target and wasm-pack
-        run: |
-          rustup target add wasm32-unknown-unknown
-          cargo install wasm-pack --locked
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.15.0
+          fallback: none
+
       - name: Build web distribution
+        shell: bash
         run: |
           chmod +x scripts/build-imqraw-pages.sh
-          scripts/build-imqraw-pages.sh "${{ steps.version.outputs.version }}" target/imqraw-pages
-          cd target/imqraw-pages
-          zip -r "../imqraw-${{ steps.version.outputs.version }}.zip" imqraw/${{ steps.version.outputs.version }} imqraw/latest index.html
-      - name: Checkout Pages branch
+          scripts/build-imqraw-pages.sh "${{ steps.version.outputs.version }}" out/imqraw-pages
+
+          cd out/imqraw-pages
+          zip -r "../imqraw-${{ steps.version.outputs.version }}.zip" \
+            imqraw/${{ steps.version.outputs.version }} \
+            imqraw/latest \
+            index.html
+
+      - name: Prepare accumulated Pages site
         shell: bash
         run: |
           if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
-            git fetch origin gh-pages
-            git worktree add target/gh-pages origin/gh-pages
+            git fetch origin gh-pages:refs/remotes/origin/gh-pages
+            git worktree add out/gh-pages origin/gh-pages
           else
-            git worktree add --detach target/gh-pages
-            git -C target/gh-pages rm -rf . >/dev/null 2>&1 || true
+            git worktree add --detach out/gh-pages
+            git -C out/gh-pages switch --orphan gh-pages
+            git -C out/gh-pages rm -rf . >/dev/null 2>&1 || true
           fi
-      - name: Publish Pages files
+
+          mkdir -p out/gh-pages/imqraw
+
+          rm -rf "out/gh-pages/imqraw/${{ steps.version.outputs.version }}"
+          rm -rf "out/gh-pages/imqraw/latest"
+          rm -f out/gh-pages/index.html
+
+          cp -R out/imqraw-pages/. out/gh-pages/
+          touch out/gh-pages/.nojekyll
+
+      - name: Save accumulated site to gh-pages branch
         shell: bash
         run: |
-          mkdir -p target/gh-pages
-          cp -R target/imqraw-pages/. target/gh-pages/
-          touch target/gh-pages/.nojekyll
-          git -C target/gh-pages config user.name "github-actions[bot]"
-          git -C target/gh-pages config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git -C target/gh-pages add .
-          git -C target/gh-pages commit -m "Publish imqraw ${{ steps.version.outputs.version }}" || exit 0
-          git -C target/gh-pages push origin HEAD:gh-pages
+          git -C out/gh-pages config user.name "github-actions[bot]"
+          git -C out/gh-pages config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C out/gh-pages add -A
+
+          if git -C out/gh-pages diff --cached --quiet; then
+            echo "No Pages archive changes"
+            exit 0
+          fi
+
+          git -C out/gh-pages commit -m "Publish imqraw ${{ steps.version.outputs.version }}"
+          git -C out/gh-pages push origin HEAD:gh-pages
+
+      - name: Prepare Pages artifact
+        shell: bash
+        run: |
+          rm -rf out/pages-artifact
+          mkdir -p out/pages-artifact
+          rsync -a --exclude ".git" out/gh-pages/ out/pages-artifact/
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v6
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: out/pages-artifact
+
       - name: Publish GitHub Release asset
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view "${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
-            gh release upload "${{ steps.version.outputs.version }}" "target/imqraw-${{ steps.version.outputs.version }}.zip" --clobber
+            gh release upload "${{ steps.version.outputs.version }}" "out/imqraw-${{ steps.version.outputs.version }}.zip" --clobber
           else
-            gh release create "${{ steps.version.outputs.version }}" "target/imqraw-${{ steps.version.outputs.version }}.zip" --generate-notes
+            gh release create "${{ steps.version.outputs.version }}" "out/imqraw-${{ steps.version.outputs.version }}.zip" --generate-notes
           fi
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+
+    permissions:
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
