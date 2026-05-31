@@ -6,6 +6,7 @@
 //!
 //! Optional layers add:
 //! - `image-codecs`: decoding through the `image` crate.
+//! - `imqraw-image`: conversion helpers from common Rust image crate types.
 //! - `ffmpeg`: video/raw-frame piping through external `ffmpeg`/`ffprobe`.
 //! - `gpu`: wgpu compute kernels for RGBA8-heavy workloads.
 //! - `nn-burn`: Burn tensor adapters for NN/perceptual metrics.
@@ -18,6 +19,7 @@
 pub mod adapters;
 pub mod error;
 pub mod frame;
+pub mod imqraw;
 pub mod metrics;
 pub mod report;
 pub mod stats;
@@ -42,6 +44,10 @@ pub use error::{Error, Result};
 pub use frame::{
     ChromaSampling, ColorRange, ColorSpace, Dimensions, FormatSpec, FrameOwned, FrameView,
     FullRange, LimitedRange, OwnedPlane, PixelFormat, PlaneView, Transfer, Unchecked, Validated,
+};
+pub use imqraw::{
+    RawImageBundle, RawImageRecord, RawImageSelector, decode_bundle as decode_imqraw_bundle,
+    encode_bundle as encode_imqraw_bundle,
 };
 pub use metrics::{
     Direction, Metric, MetricOutput, MetricSet, MetricSpec, SampleDomain, compare_with_defaults,

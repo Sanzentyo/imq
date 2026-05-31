@@ -38,6 +38,9 @@ imq compare image.png -s --format yaml
 imq stats image.png --format toml
 cat image.png | imq stats - --format json
 cat image.rgba | imq stats - --stdin-format raw --raw-width 1920 --raw-height 1080 --raw-pixel-format rgba8
+imq pack --tag 1:reference --tag 2:candidate -o pair.imqraw reference.png distorted.png
+cat pair.imqraw | imq image - - --stdin-format imqraw --stdin-reference-tag reference --stdin-distorted-tag candidate
+imq bundle-info pair.imqraw --format json
 ```
 
 ## Compare Still Images
@@ -68,8 +71,24 @@ rows, probe rows, image statistics, and format hints to a SQLite database.
 
 Use `-` as an image input to read encoded image bytes from stdin. For raw packed
 stdin bytes, pass `--stdin-format raw` with `--raw-width`, `--raw-height`, and
-`--raw-pixel-format rgb8|rgba8|bgr8|bgra8|luma8`. Stdin can be used for only one
-image argument per command.
+`--raw-pixel-format rgb8|rgba8|bgr8|bgra8|luma8`.
+
+For multi-image stdin/stdout pipelines, use `imq pack` to create an uncompressed
+lossless `imqraw` bundle with labels and tags:
+
+```bash
+imq pack --tag 1:reference --tag 2:candidate -o pair.imqraw reference.png distorted.png
+imq bundle-info pair.imqraw
+cat pair.imqraw | imq stats - --stdin-format imqraw --stdin-tag reference
+cat pair.imqraw | imq image - - --stdin-format imqraw --stdin-reference-tag reference --stdin-distorted-tag candidate
+```
+
+Use `--stdin-index`/`--stdin-tag` when a command consumes one image from an
+`imqraw` bundle. When both image arguments are `-`, use
+`--stdin-reference-index`, `--stdin-reference-tag`, `--stdin-distorted-index`,
+or `--stdin-distorted-tag`; defaults are index 0 for reference and index 1 for
+distorted. Stdin can be used for both image arguments only with
+`--stdin-format imqraw`.
 
 ## Compare Videos
 
@@ -137,7 +156,8 @@ Useful short options include `-m` for metrics, `-j` for JSON output, `preview
 and `tui -C` for preview cache size.
 
 Subcommand aliases are available: `i` for `image`, `v` for `video`, `p` for
-`preview`, `t` for `tui`, `fmt` for `formats`, and `x`/`extract` for
+`preview`, `t` for `tui`, `fmt` for `formats`, `raw-pack`/`bundle` for `pack`,
+`raw-info` for `bundle-info`, and `x`/`extract` for
 `extract-frame`.
 
 ## TUI
@@ -187,6 +207,17 @@ cargo check --features nn-burn-wgpu --lib
 ```
 
 Do not imply bundled pretrained weights exist; applications must supply model definitions/checkpoints.
+
+## imqraw Library Feature
+
+The raw bundle API is always available in the library as `imq::imqraw` and
+through `encode_imqraw_bundle` / `decode_imqraw_bundle`. It is Sans I/O and
+stores little-endian metadata plus verbatim frame planes, so it is suitable for
+cross-platform stdin/stdout exchange without codec artifacts.
+
+The optional `imqraw-image` feature enables conversion helpers from common
+`image` crate types (`DynamicImage`, `RgbaImage`, `RgbImage`) into imqraw
+records. This feature is disabled by default.
 
 ## Reporting Results
 

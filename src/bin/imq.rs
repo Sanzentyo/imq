@@ -7,7 +7,7 @@ use imq::metrics::MetricSet;
 use imq::report::{ComparisonReport, VideoReport};
 use imq::{Dimensions, MetricOutput};
 use serde::Serialize;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
@@ -45,6 +45,12 @@ enum Command {
     /// Show image formats available through the image adapter.
     #[command(alias = "fmt")]
     Formats(FormatsCmd),
+    /// Pack one or more images into an imqraw lossless raw bundle.
+    #[command(alias = "raw-pack", alias = "bundle")]
+    Pack(PackCmd),
+    /// Inspect an imqraw lossless raw bundle.
+    #[command(alias = "raw-info")]
+    BundleInfo(BundleInfoCmd),
     /// Preview images or video thumbnails in the terminal.
     #[command(alias = "p")]
     Preview(PreviewCmd),
@@ -205,6 +211,35 @@ struct FormatsCmd {
 }
 
 #[derive(Debug, Args)]
+struct PackCmd {
+    /// Input image files to pack.
+    #[arg(required = true)]
+    inputs: Vec<PathBuf>,
+    /// Write bundle bytes to a file instead of stdout.
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+    /// Per-input labels in input order. Defaults to each input path.
+    #[arg(long = "label")]
+    labels: Vec<String>,
+    /// Tags to attach. Use TAG for all inputs, all:TAG for all inputs, or 1:TAG for a one-based input index.
+    #[arg(long = "tag")]
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct BundleInfoCmd {
+    /// imqraw bundle path, or `-` for stdin.
+    #[arg(default_value = "-")]
+    input: PathBuf,
+    /// Structured output format.
+    #[arg(long, value_enum, default_value_t = OutputFormatArg::Text)]
+    format: OutputFormatArg,
+    /// Write output to a file instead of stdout.
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
 struct OutputArgs {
     /// Structured output format.
     #[arg(long, value_enum, default_value_t = OutputFormatArg::Text)]
@@ -226,7 +261,7 @@ enum OutputFormatArg {
     Csv,
 }
 
-#[derive(Debug, Args, Clone, Copy)]
+#[derive(Debug, Args, Clone)]
 struct StdinImageArgs {
     /// How to decode `-` image input from stdin.
     #[arg(long, value_enum, default_value_t = StdinImageFormatArg::Encoded)]
@@ -240,6 +275,24 @@ struct StdinImageArgs {
     /// Raw stdin pixel format.
     #[arg(long, value_enum, default_value_t = RawPixelFormatArg::Rgba8)]
     raw_pixel_format: RawPixelFormatArg,
+    /// Zero-based image index used when --stdin-format imqraw feeds one image argument.
+    #[arg(long)]
+    stdin_index: Option<usize>,
+    /// Tag used when --stdin-format imqraw feeds one image argument.
+    #[arg(long)]
+    stdin_tag: Option<String>,
+    /// Zero-based reference image index when an imqraw bundle feeds both image arguments.
+    #[arg(long)]
+    stdin_reference_index: Option<usize>,
+    /// Reference tag when an imqraw bundle feeds both image arguments.
+    #[arg(long)]
+    stdin_reference_tag: Option<String>,
+    /// Zero-based distorted image index when an imqraw bundle feeds both image arguments.
+    #[arg(long)]
+    stdin_distorted_index: Option<usize>,
+    /// Distorted tag when an imqraw bundle feeds both image arguments.
+    #[arg(long)]
+    stdin_distorted_tag: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -248,6 +301,8 @@ enum StdinImageFormatArg {
     Encoded,
     /// Interpret stdin as raw packed pixel bytes.
     Raw,
+    /// Decode stdin as an imqraw lossless raw bundle.
+    Imqraw,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -384,6 +439,8 @@ fn main() -> Result<()> {
         #[cfg(feature = "ffmpeg")]
         Command::Probe(cmd) => run_probe(cmd),
         Command::Formats(cmd) => run_formats(cmd),
+        Command::Pack(cmd) => run_pack(cmd),
+        Command::BundleInfo(cmd) => run_bundle_info(cmd),
         Command::Preview(cmd) => run_preview(cmd),
         Command::Tui(cmd) => run_tui(cmd),
     }
@@ -513,19 +570,32 @@ fn compare_image_paths(
     stdin: StdinImageArgs,
     histogram_bins: Option<usize>,
 ) -> Result<(ComparisonReport, Option<ImageComparisonStats>)> {
-    reject_double_stdin(reference_path, Some(distorted_path))?;
-    let reference = load_image_input(reference_path, stdin).with_context(|| {
-        format!(
-            "failed to decode reference image `{}`",
-            image_input_label(reference_path)
+    let (reference, distorted, reference_label, distorted_label) = if is_stdin_path(reference_path)
+        && is_stdin_path(distorted_path)
+        && stdin.stdin_format == StdinImageFormatArg::Imqraw
+    {
+        load_imqraw_image_pair_from_stdin(&stdin)?
+    } else {
+        reject_double_stdin(reference_path, Some(distorted_path))?;
+        let reference = load_image_input(reference_path, &stdin).with_context(|| {
+            format!(
+                "failed to decode reference image `{}`",
+                image_input_label(reference_path)
+            )
+        })?;
+        let distorted = load_image_input(distorted_path, &stdin).with_context(|| {
+            format!(
+                "failed to decode distorted image `{}`",
+                image_input_label(distorted_path)
+            )
+        })?;
+        (
+            reference,
+            distorted,
+            image_input_label(reference_path),
+            image_input_label(distorted_path),
         )
-    })?;
-    let distorted = load_image_input(distorted_path, stdin).with_context(|| {
-        format!(
-            "failed to decode distorted image `{}`",
-            image_input_label(distorted_path)
-        )
-    })?;
+    };
     let metrics = MetricSet::from_csv(metrics_csv)?;
     let outputs = metrics.compare(&reference.as_view(), &distorted.as_view())?;
     let report = ComparisonReport::new(
@@ -534,20 +604,17 @@ fn compare_image_paths(
         distorted.format(),
         outputs,
     )
-    .with_labels(
-        image_input_label(reference_path),
-        image_input_label(distorted_path),
-    );
+    .with_labels(reference_label.clone(), distorted_label.clone());
     let stats = histogram_bins
         .map(|histogram_bins| {
             Ok::<_, anyhow::Error>(ImageComparisonStats {
                 reference: image_stats_for_frame(
-                    image_input_label(reference_path),
+                    reference_label.clone(),
                     &reference,
                     histogram_bins,
                 )?,
                 distorted: image_stats_for_frame(
-                    image_input_label(distorted_path),
+                    distorted_label.clone(),
                     &distorted,
                     histogram_bins,
                 )?,
@@ -574,7 +641,7 @@ fn image_stats_for_path(
     histogram_bins: usize,
     stdin: StdinImageArgs,
 ) -> Result<ImageStatsReport> {
-    let image = load_image_input(input, stdin)
+    let image = load_image_input(input, &stdin)
         .with_context(|| format!("failed to decode image `{}`", image_input_label(input)))?;
     image_stats_for_frame(image_input_label(input), &image, histogram_bins)
 }
@@ -591,7 +658,7 @@ fn image_stats_for_frame(
     Ok(ImageStatsReport { input, stats })
 }
 
-fn load_image_input(path: &Path, stdin: StdinImageArgs) -> Result<imq::FrameOwned> {
+fn load_image_input(path: &Path, stdin: &StdinImageArgs) -> Result<imq::FrameOwned> {
     if !is_stdin_path(path) {
         return Ok(image_crate::load_image_path(path)?);
     }
@@ -602,6 +669,10 @@ fn load_image_input(path: &Path, stdin: StdinImageArgs) -> Result<imq::FrameOwne
         .with_context(|| "failed to read image bytes from stdin")?;
     match stdin.stdin_format {
         StdinImageFormatArg::Encoded => Ok(image_crate::decode_image_bytes(&bytes)?),
+        StdinImageFormatArg::Imqraw => {
+            let bundle = imq::decode_imqraw_bundle(&bytes)?;
+            Ok(bundle.select(&single_stdin_selector(stdin))?.frame.clone())
+        }
         StdinImageFormatArg::Raw => {
             let width = stdin
                 .raw_width
@@ -617,6 +688,58 @@ fn load_image_input(path: &Path, stdin: StdinImageArgs) -> Result<imq::FrameOwne
             )?)
         }
     }
+}
+
+fn load_imqraw_image_pair_from_stdin(
+    stdin: &StdinImageArgs,
+) -> Result<(imq::FrameOwned, imq::FrameOwned, String, String)> {
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut bytes)
+        .with_context(|| "failed to read imqraw bundle from stdin")?;
+    let bundle = imq::decode_imqraw_bundle(&bytes)?;
+    let (reference_selector, distorted_selector) = pair_stdin_selectors(stdin);
+    let reference = bundle.select(&reference_selector)?;
+    let distorted = bundle.select(&distorted_selector)?;
+    Ok((
+        reference.frame.clone(),
+        distorted.frame.clone(),
+        imqraw_record_label(reference, &reference_selector),
+        imqraw_record_label(distorted, &distorted_selector),
+    ))
+}
+
+fn single_stdin_selector(stdin: &StdinImageArgs) -> imq::RawImageSelector {
+    stdin.stdin_tag.as_ref().map_or_else(
+        || imq::RawImageSelector::Index(stdin.stdin_index.unwrap_or(0)),
+        |tag| imq::RawImageSelector::Tag(tag.clone()),
+    )
+}
+
+fn pair_stdin_selectors(stdin: &StdinImageArgs) -> (imq::RawImageSelector, imq::RawImageSelector) {
+    let reference = stdin.stdin_reference_tag.as_ref().map_or_else(
+        || {
+            imq::RawImageSelector::Index(
+                stdin
+                    .stdin_reference_index
+                    .or(stdin.stdin_index)
+                    .unwrap_or(0),
+            )
+        },
+        |tag| imq::RawImageSelector::Tag(tag.clone()),
+    );
+    let distorted = stdin.stdin_distorted_tag.as_ref().map_or_else(
+        || imq::RawImageSelector::Index(stdin.stdin_distorted_index.unwrap_or(1)),
+        |tag| imq::RawImageSelector::Tag(tag.clone()),
+    );
+    (reference, distorted)
+}
+
+fn imqraw_record_label(record: &imq::RawImageRecord, selector: &imq::RawImageSelector) -> String {
+    record.label.clone().unwrap_or_else(|| match selector {
+        imq::RawImageSelector::Index(index) => format!("imqraw[{index}]"),
+        imq::RawImageSelector::Tag(tag) => format!("imqraw:{tag}"),
+    })
 }
 
 fn reject_double_stdin(first: &Path, second: Option<&Path>) -> Result<()> {
@@ -744,6 +867,80 @@ fn run_formats(cmd: FormatsCmd) -> Result<()> {
     Ok(())
 }
 
+fn run_pack(cmd: PackCmd) -> Result<()> {
+    let labels = pack_labels(&cmd.inputs, &cmd.labels)?;
+    let tags = parse_pack_tags(cmd.inputs.len(), &cmd.tags)?;
+    let records = cmd
+        .inputs
+        .iter()
+        .zip(labels)
+        .zip(tags)
+        .map(|((input, label), tags)| {
+            let frame = image_crate::load_image_path(input)
+                .with_context(|| format!("failed to decode `{}`", input.display()))?;
+            Ok(imq::RawImageRecord::new(Some(label), tags, frame))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let bundle = imq::RawImageBundle::new(records);
+    let bytes = imq::encode_imqraw_bundle(&bundle)?;
+    write_binary_output(cmd.output.as_deref(), &bytes)
+}
+
+fn run_bundle_info(cmd: BundleInfoCmd) -> Result<()> {
+    let bytes = read_binary_input(&cmd.input)?;
+    let bundle = imq::decode_imqraw_bundle(&bytes)
+        .with_context(|| format!("failed to decode `{}`", image_input_label(&cmd.input)))?;
+    let report = BundleInfoReport::from_bundle(image_input_label(&cmd.input), &bundle);
+    emit_bundle_info_report(&report, cmd.format, cmd.output.as_deref())
+}
+
+fn pack_labels(inputs: &[PathBuf], labels: &[String]) -> Result<Vec<String>> {
+    if !labels.is_empty() && labels.len() != inputs.len() {
+        bail!(
+            "--label must be passed once per input when used; got {} label(s) for {} input(s)",
+            labels.len(),
+            inputs.len()
+        );
+    }
+    Ok(if labels.is_empty() {
+        inputs
+            .iter()
+            .map(|input| input.display().to_string())
+            .collect()
+    } else {
+        labels.to_vec()
+    })
+}
+
+fn parse_pack_tags(input_count: usize, specs: &[String]) -> Result<Vec<Vec<String>>> {
+    let mut tags = vec![Vec::new(); input_count];
+    for spec in specs {
+        match spec.split_once(':') {
+            Some((target, tag)) if target.eq_ignore_ascii_case("all") => {
+                tags.iter_mut()
+                    .for_each(|entry| entry.push(tag.to_string()));
+            }
+            Some((target, tag)) => {
+                let index = target
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid tag target `{target}` in `{spec}`"))?;
+                if !(1..=input_count).contains(&index) {
+                    bail!(
+                        "tag target `{target}` is out of range; use 1..={}",
+                        input_count
+                    );
+                }
+                tags[index - 1].push(tag.to_string());
+            }
+            None => {
+                tags.iter_mut()
+                    .for_each(|entry| entry.push(spec.to_string()));
+            }
+        }
+    }
+    Ok(tags)
+}
+
 #[derive(Debug, Serialize)]
 struct ProbeReport {
     input: String,
@@ -771,6 +968,60 @@ struct ImageComparisonStats {
 #[derive(Debug, Serialize)]
 struct FormatsReport {
     formats: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BundleInfoReport {
+    input: String,
+    images: Vec<BundleImageInfo>,
+}
+
+impl BundleInfoReport {
+    fn from_bundle(input: String, bundle: &imq::RawImageBundle) -> Self {
+        let images = bundle
+            .records
+            .iter()
+            .enumerate()
+            .map(|(index, record)| {
+                let dimensions = record.frame.dimensions();
+                let format = record.frame.format();
+                BundleImageInfo {
+                    index,
+                    label: record.label.clone(),
+                    tags: record.tags.clone(),
+                    width: dimensions.width,
+                    height: dimensions.height,
+                    pixel_format: format!("{:?}", format.pixel_format),
+                    color_space: format!("{:?}", format.color_space),
+                    transfer: format!("{:?}", format.transfer),
+                    range: format!("{:?}", format.range),
+                    planes: record.frame.owned_planes().len(),
+                    bytes: record
+                        .frame
+                        .owned_planes()
+                        .iter()
+                        .map(|plane| u64::try_from(plane.data.len()).unwrap_or(u64::MAX))
+                        .sum(),
+                }
+            })
+            .collect();
+        Self { input, images }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct BundleImageInfo {
+    index: usize,
+    label: Option<String>,
+    tags: Vec<String>,
+    width: u32,
+    height: u32,
+    pixel_format: String,
+    color_space: String,
+    transfer: String,
+    range: String,
+    planes: usize,
+    bytes: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -814,6 +1065,22 @@ struct StatsCsvRow {
     pixels: u64,
     metric: String,
     value: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BundleInfoCsvRow {
+    input: String,
+    index: usize,
+    label: String,
+    tags: String,
+    width: u32,
+    height: u32,
+    pixel_format: String,
+    color_space: String,
+    transfer: String,
+    range: String,
+    planes: usize,
+    bytes: u64,
 }
 
 struct MetricCsvContext {
@@ -960,6 +1227,21 @@ fn emit_formats_report(
     write_output(output.output.as_deref(), &content)
 }
 
+fn emit_bundle_info_report(
+    report: &BundleInfoReport,
+    format: OutputFormatArg,
+    output: Option<&Path>,
+) -> Result<()> {
+    let content = match format {
+        OutputFormatArg::Text => render_bundle_info_text(report),
+        OutputFormatArg::Json => serde_json::to_string_pretty(report)?,
+        OutputFormatArg::Yaml => serde_yaml_ng::to_string(report)?,
+        OutputFormatArg::Toml => toml::to_string_pretty(report)?,
+        OutputFormatArg::Csv => csv_string(bundle_info_csv_rows(report))?,
+    };
+    write_output(output, &content)
+}
+
 fn write_output(path: Option<&Path>, content: &str) -> Result<()> {
     if let Some(path) = path {
         if let Some(parent) = path
@@ -975,6 +1257,38 @@ fn write_output(path: Option<&Path>, content: &str) -> Result<()> {
         print!("{content}");
     }
     Ok(())
+}
+
+fn write_binary_output(path: Option<&Path>, content: &[u8]) -> Result<()> {
+    if let Some(path) = path {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create `{}`", parent.display()))?;
+        }
+        std::fs::write(path, content)
+            .with_context(|| format!("failed to write `{}`", path.display()))?;
+    } else {
+        std::io::stdout()
+            .write_all(content)
+            .with_context(|| "failed to write imqraw bundle to stdout")?;
+    }
+    Ok(())
+}
+
+fn read_binary_input(path: &Path) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    if is_stdin_path(path) {
+        std::io::stdin()
+            .read_to_end(&mut bytes)
+            .with_context(|| "failed to read bytes from stdin")?;
+    } else {
+        bytes =
+            std::fs::read(path).with_context(|| format!("failed to read `{}`", path.display()))?;
+    }
+    Ok(bytes)
 }
 
 fn csv_string<T, I>(rows: I) -> Result<String>
@@ -1104,6 +1418,28 @@ fn render_formats_text(report: &FormatsReport) -> String {
     output
 }
 
+fn render_bundle_info_text(report: &BundleInfoReport) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("bundle : {}\n", report.input));
+    output.push_str(&format!("images : {}\n", report.images.len()));
+    report.images.iter().for_each(|image| {
+        output.push_str(&format!(
+            "[{}] {} {}x{} {} planes={} bytes={}\n",
+            image.index,
+            image.label.as_deref().unwrap_or("<unlabeled>"),
+            image.width,
+            image.height,
+            image.pixel_format,
+            image.planes,
+            image.bytes
+        ));
+        if !image.tags.is_empty() {
+            output.push_str(&format!("    tags: {}\n", image.tags.join(",")));
+        }
+    });
+    output
+}
+
 fn render_metrics(metrics: &[MetricOutput]) -> String {
     let mut output = String::new();
     output.push_str(&format!(
@@ -1121,6 +1457,27 @@ fn render_metrics(metrics: &[MetricOutput]) -> String {
         ));
     });
     output
+}
+
+fn bundle_info_csv_rows(report: &BundleInfoReport) -> Vec<BundleInfoCsvRow> {
+    report
+        .images
+        .iter()
+        .map(|image| BundleInfoCsvRow {
+            input: report.input.clone(),
+            index: image.index,
+            label: image.label.clone().unwrap_or_default(),
+            tags: image.tags.join("|"),
+            width: image.width,
+            height: image.height,
+            pixel_format: image.pixel_format.clone(),
+            color_space: image.color_space.clone(),
+            transfer: image.transfer.clone(),
+            range: image.range.clone(),
+            planes: image.planes,
+            bytes: image.bytes,
+        })
+        .collect()
 }
 
 fn comparison_csv_rows(report: &ComparisonReport) -> Vec<MetricCsvRow> {

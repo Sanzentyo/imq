@@ -19,6 +19,7 @@ The crate is intended as a practical starting point for full-reference evaluatio
 | `std` | Standard-library support. |
 | `serde` | JSON reports and serializable structs. |
 | `image-codecs` | Decode still images through the `image` crate. |
+| `imqraw-image` | Conversion helpers from `image` crate image types into imqraw records. Disabled by default. |
 | `ffmpeg` | Shell out to `ffmpeg`/`ffprobe` and stream RGBA frames from stdout. |
 | `preview` | Terminal image/video previews, using `ffmpeg` for video thumbnails. |
 | `cpu-only` | Disable hardware decode attempts for preview thumbnail extraction. |
@@ -30,6 +31,8 @@ The crate is intended as a practical starting point for full-reference evaluatio
 | `tui` | Ratatui/crossterm interactive frontend. |
 
 Default features are `std`, `serde`, `image-codecs`, `cli`, `tui`, and `preview`.
+`imqraw-image` is intentionally not a default feature; the raw bundle format
+itself is available without codec adapter conversions.
 
 ## CLI examples
 
@@ -43,6 +46,9 @@ cargo run --bin imq -- compare reference.png distorted.webp -s --format json
 cargo run --bin imq -- stats image.png --format toml
 cat image.png | cargo run --bin imq -- stats - --format json
 cat image.rgba | cargo run --bin imq -- stats - --stdin-format raw --raw-width 1920 --raw-height 1080 --raw-pixel-format rgba8
+cargo run --bin imq -- pack --tag 1:reference --tag 2:candidate -o pair.imqraw reference.png distorted.png
+cat pair.imqraw | cargo run --bin imq -- image - - --stdin-format imqraw --stdin-reference-tag reference --stdin-distorted-tag candidate
+cargo run --bin imq -- bundle-info pair.imqraw --format json
 ```
 
 Explicit still-image comparison remains available:
@@ -70,8 +76,14 @@ probe rows, image statistics, and format hints to SQLite tables.
 
 Use `-` as an image input to read encoded image bytes from stdin. For raw packed
 stdin bytes, pass `--stdin-format raw` with `--raw-width`, `--raw-height`, and
-`--raw-pixel-format rgb8|rgba8|bgr8|bgra8|luma8`. Stdin can be used for only one
-image argument per command.
+`--raw-pixel-format rgb8|rgba8|bgr8|bgra8|luma8`. For multi-image stdin/stdout
+pipelines, `imq pack` writes an `imqraw` bundle: a little-endian, uncompressed,
+lossless raw container containing one or more validated frames, labels, and
+tags. `--stdin-format imqraw` reads that bundle; `--stdin-index`/`--stdin-tag`
+select one image for `stats`, while `--stdin-reference-index`,
+`--stdin-reference-tag`, `--stdin-distorted-index`, and
+`--stdin-distorted-tag` select the two images when both image arguments are `-`.
+Stdin can be used for both image arguments only with `--stdin-format imqraw`.
 
 Extract one decoded video frame:
 
@@ -146,8 +158,8 @@ previews are resized with `fast_image_resize` and cached in memory; use
 `--preview-cache N` to tune how many previews are kept.
 
 Common subcommand aliases are available: `i` for `image`, `v` for `video`, `p`
-for `preview`, `t` for `tui`, `fmt` for `formats`, and `x`/`extract` for
-`extract-frame`.
+for `preview`, `t` for `tui`, `fmt` for `formats`, `raw-pack`/`bundle` for
+`pack`, `raw-info` for `bundle-info`, and `x`/`extract` for `extract-frame`.
 
 ## Agent skill
 
@@ -199,6 +211,33 @@ use imq::{FrameView, PlaneView};
 let frame = FrameView::nv12(width, height, PlaneView::new(y, y_stride), PlaneView::new(uv, uv_stride))?.validate()?;
 # Ok::<(), imq::Error>(())
 ```
+
+## imqraw bundle format
+
+The `imqraw` module provides Sans I/O encode/decode helpers for a compact raw
+bundle designed for pipes and cross-platform tool interchange. It stores frames
+without compression, so codec artifacts and encoder settings cannot affect
+metrics. Each bundle begins with `IMQRAW1\n`, then little-endian metadata and
+verbatim plane bytes. Multiple images, labels, and tags are supported.
+
+```rust
+use imq::{FrameOwned, PixelFormat, RawImageBundle, RawImageRecord};
+
+let frame = FrameOwned::packed_tight(vec![0, 0, 0, 255], 1, 1, PixelFormat::Rgba8)?;
+let bundle = RawImageBundle::new(vec![RawImageRecord::new(
+    Some("reference".to_string()),
+    vec!["ref".to_string()],
+    frame,
+)]);
+let bytes = imq::encode_imqraw_bundle(&bundle)?;
+let decoded = imq::decode_imqraw_bundle(&bytes)?;
+assert_eq!(decoded.select_tag("ref")?.label.as_deref(), Some("reference"));
+# Ok::<(), imq::Error>(())
+```
+
+With `--features imqraw-image`, helper constructors are enabled for common
+`image` crate types such as `DynamicImage`, `RgbaImage`, and `RgbImage`. That
+feature is opt-in so the raw container can stay independent from codec adapters.
 
 ## GPU path
 
