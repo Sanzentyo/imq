@@ -113,9 +113,14 @@ Multiple inputs are arranged as a montage. Use `--rows` or `--cols` to control
 the layout. Omit `--size` to derive preview dimensions from terminal size and
 display mode, or pass `--size WIDTHxHEIGHT`; known native graphics terminals and
 Sixel terminals get a higher pixel-resolution default than ANSI blocks. Auto
-mode prefers Kitty graphics protocol for terminals such as Ghostty, then Sixel,
-then ANSI blocks. Use `--display kitty`, `--display sixel`, `IMQ_KITTY=1`,
-`IMQ_NO_KITTY=1`, `IMQ_SIXEL=1`, or `IMQ_NO_SIXEL=1` to override detection.
+mode prefers Kitty graphics protocol for terminals such as Ghostty, then Sixel
+for terminals such as Windows Terminal, then iTerm2 inline images, then ANSI
+blocks. Over SSH, native graphics are selected when terminal identity hints
+such as `TERM`, `TERM_PROGRAM`, or `WT_SESSION` are visible; otherwise ANSI is
+used so an image is still drawn. Use `--display kitty`, `--display sixel`,
+`--display iterm2`, `IMQ_IMAGE_PROTOCOL=kitty|sixel|iterm2|ansi`, `IMQ_KITTY=1`,
+`IMQ_SIXEL=1`, `IMQ_ITERM2=1`, or matching `IMQ_NO_*` variables to override
+detection.
 `--fit contain|cover|stretch` controls aspect handling. Video thumbnails are
 extracted through `ffmpeg`. When a small source needs to fill the terminal-based
 display area, preview uses nearest-neighbor enlargement so source pixels become

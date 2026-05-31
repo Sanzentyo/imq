@@ -264,6 +264,7 @@ enum PreviewDisplayArg {
     Auto,
     Kitty,
     Sixel,
+    Iterm2,
     Ansi,
     None,
 }
@@ -1487,6 +1488,7 @@ fn run_preview(cmd: PreviewCmd) -> Result<()> {
         PreviewDisplayArg::Auto => DisplayMode::Auto,
         PreviewDisplayArg::Kitty => DisplayMode::Kitty,
         PreviewDisplayArg::Sixel => DisplayMode::Sixel,
+        PreviewDisplayArg::Iterm2 => DisplayMode::Iterm2,
         PreviewDisplayArg::Ansi => DisplayMode::Ansi,
         PreviewDisplayArg::None => DisplayMode::None,
     };
@@ -1570,10 +1572,12 @@ fn default_preview_size(columns: usize, rows: usize, display: PreviewDisplayArg)
         #[cfg(feature = "preview")]
         {
             match display {
-                PreviewDisplayArg::Kitty | PreviewDisplayArg::Sixel => true,
+                PreviewDisplayArg::Kitty | PreviewDisplayArg::Sixel | PreviewDisplayArg::Iterm2 => {
+                    true
+                }
                 PreviewDisplayArg::Auto => {
                     let capabilities = imq::preview::terminal_capabilities();
-                    capabilities.kitty || capabilities.sixel
+                    capabilities.kitty || capabilities.sixel || capabilities.iterm2
                 }
                 PreviewDisplayArg::Ansi | PreviewDisplayArg::None => false,
             }
@@ -1719,7 +1723,7 @@ mod tui_app {
     use ratatui::widgets::{
         Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table,
     };
-    use ratatui_image::picker::Picker;
+    use ratatui_image::picker::{Picker, ProtocolType};
     use ratatui_image::protocol::StatefulProtocol;
     use ratatui_image::{Resize, StatefulImage};
     use std::collections::{HashMap, VecDeque};
@@ -2388,7 +2392,7 @@ mod tui_app {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
-        let preview_picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+        let preview_picker = Picker::from_query_stdio().unwrap_or_else(|_| picker_from_env());
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
         let terminal_size = terminal.size()?;
@@ -2531,6 +2535,19 @@ mod tui_app {
         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
         terminal.show_cursor()?;
         result
+    }
+
+    fn picker_from_env() -> Picker {
+        let mut picker = Picker::halfblocks();
+        match imq::preview::auto_display_mode() {
+            imq::preview::DisplayMode::Kitty => picker.set_protocol_type(ProtocolType::Kitty),
+            imq::preview::DisplayMode::Sixel => picker.set_protocol_type(ProtocolType::Sixel),
+            imq::preview::DisplayMode::Iterm2 => picker.set_protocol_type(ProtocolType::Iterm2),
+            imq::preview::DisplayMode::Auto
+            | imq::preview::DisplayMode::Ansi
+            | imq::preview::DisplayMode::None => {}
+        }
+        picker
     }
 
     fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {

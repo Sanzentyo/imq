@@ -120,10 +120,15 @@ When `--size` is omitted, `preview` derives a per-item preview size from the
 terminal dimensions, display mode, and requested montage rows/columns. Known
 native graphics terminals and Sixel terminals get a higher pixel-resolution
 default than ANSI block rendering, without an artificial fixed maximum. Auto
-mode prefers Kitty graphics protocol for terminals such as Ghostty, then Sixel,
-then ANSI blocks. Use `--display kitty`, `--display sixel`, `IMQ_KITTY=1`,
-`IMQ_NO_KITTY=1`, `IMQ_SIXEL=1`, or `IMQ_NO_SIXEL=1` to override auto
-detection. Fit modes are `contain`, `cover`, and `stretch`. When `preview` needs
+mode prefers Kitty graphics protocol for terminals such as Ghostty, then Sixel
+for terminals such as Windows Terminal, then iTerm2 inline images, then ANSI
+blocks. This works over SSH when the terminal identity is visible through
+`TERM`, `TERM_PROGRAM`, `WT_SESSION`, or similar environment hints; if SSH hides
+the local terminal identity, auto mode falls back to ANSI so an image is still
+drawn. Use `--display kitty`, `--display sixel`, `--display iterm2`,
+`IMQ_IMAGE_PROTOCOL=kitty|sixel|iterm2|ansi`, `IMQ_KITTY=1`, `IMQ_SIXEL=1`,
+`IMQ_ITERM2=1`, or the matching `IMQ_NO_*` variables to override auto detection.
+Fit modes are `contain`, `cover`, and `stretch`. When `preview` needs
 to enlarge a small source to fill the terminal-derived display area, it uses
 nearest-neighbor scaling so source pixels become larger instead of blurred.
 Shrink paths use `fast_image_resize`. Use `-a`/`--actual-size` to render the decoded

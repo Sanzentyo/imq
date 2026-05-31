@@ -10,7 +10,7 @@ mod ffmpeg;
 mod terminal;
 
 pub use ffmpeg::{HwAccel, HwAccelReport, detect_hw_accels};
-pub use terminal::{DisplayMode, TerminalCapabilities, terminal_capabilities};
+pub use terminal::{DisplayMode, TerminalCapabilities, auto_display_mode, terminal_capabilities};
 
 /// Hardware decode policy for ffmpeg-backed video previews.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,18 +128,10 @@ pub fn render_preview(image: &PreviewImage, mode: DisplayMode) -> String {
     match mode {
         DisplayMode::Kitty => terminal::render_kitty(image),
         DisplayMode::Sixel => terminal::render_sixel(image),
+        DisplayMode::Iterm2 => terminal::render_iterm2(image),
         DisplayMode::Ansi => terminal::render_ansi_blocks(image),
         DisplayMode::None => String::new(),
-        DisplayMode::Auto => {
-            let capabilities = terminal_capabilities();
-            if capabilities.kitty {
-                terminal::render_kitty(image)
-            } else if capabilities.sixel {
-                terminal::render_sixel(image)
-            } else {
-                terminal::render_ansi_blocks(image)
-            }
-        }
+        DisplayMode::Auto => render_preview(image, terminal::auto_display_mode()),
     }
 }
 
