@@ -235,6 +235,12 @@ assert_eq!(decoded.select_tag("ref")?.label.as_deref(), Some("reference"));
 # Ok::<(), imq::Error>(())
 ```
 
+Run the bundled crate-level example with:
+
+```bash
+cargo run --example imqraw_bundle
+```
+
 With `--features imqraw-image`, helper constructors are enabled for common
 `image` crate types such as `DynamicImage`, `RgbaImage`, and `RgbImage`. That
 feature is opt-in so the raw container can stay independent from codec adapters.

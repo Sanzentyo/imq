@@ -69,6 +69,10 @@ name = "sans_io"
 path = "examples/sans_io.rs"
 
 [[example]]
+name = "imqraw_bundle"
+path = "examples/imqraw_bundle.rs"
+
+[[example]]
 name = "compare_image"
 path = "examples/compare_image.rs"
 required-features = ["image-codecs"]

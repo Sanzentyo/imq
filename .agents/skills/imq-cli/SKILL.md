@@ -5,14 +5,15 @@ description: Use the `imq` command-line tool for full-reference image and video 
 
 # imq CLI
 
-Use `imq` for image/video quality checks. Prefer the installed `imq` binary when available; inside the source repo, install it with Cargo if the binary is missing.
+Use `imq` for image/video quality checks. Prefer the installed `imq` binary when available; if the binary is missing, install from the GitHub repository with Cargo.
 
 ## Locate the Command
 
 1. If `imq --help` works, use `imq`.
-2. If `imq` is missing and the current directory contains this crate's `Cargo.toml`, run `cargo install --path . --locked` and then use `imq`.
-3. If installation is not appropriate, use `cargo run --quiet --bin imq --`.
-4. For optional features, use `cargo run --quiet --features <feature> --bin imq --`.
+2. If `imq` is missing, run `cargo install --git https://github.com/Sanzentyo/imq.git --locked` and then use `imq`.
+3. For an install with extra crate features, use `cargo install --git https://github.com/Sanzentyo/imq.git --locked --features <feature>`.
+4. Inside a source checkout, use `cargo run --quiet --bin imq --` when intentionally testing local uninstalled changes.
+5. For optional local-checkout features, use `cargo run --quiet --features <feature> --bin imq --`.
 
 Useful environment checks:
 
@@ -214,6 +215,12 @@ The raw bundle API is always available in the library as `imq::imqraw` and
 through `encode_imqraw_bundle` / `decode_imqraw_bundle`. It is Sans I/O and
 stores little-endian metadata plus verbatim frame planes, so it is suitable for
 cross-platform stdin/stdout exchange without codec artifacts.
+
+For crate-level usage, refer to and run the bundled example:
+
+```bash
+cargo run --example imqraw_bundle
+```
 
 The optional `imqraw-image` feature enables conversion helpers from common
 `image` crate types (`DynamicImage`, `RgbaImage`, `RgbImage`) into imqraw
