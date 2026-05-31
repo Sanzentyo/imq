@@ -102,6 +102,8 @@ struct ProbeStream {
 
 /// Probes a video using ffprobe.
 pub fn probe_video(path: impl AsRef<Path>, options: &FfmpegOptions) -> Result<VideoInfo> {
+    let path = path.as_ref();
+    ensure_input_exists(path)?;
     let output = Command::new(&options.ffprobe)
         .args([
             "-v",
@@ -113,8 +115,9 @@ pub fn probe_video(path: impl AsRef<Path>, options: &FfmpegOptions) -> Result<Vi
             "-of",
             "json",
         ])
-        .arg(path.as_ref())
-        .output()?;
+        .arg(path)
+        .output()
+        .map_err(|error| process_start_failed(&options.ffprobe, "--ffprobe", error))?;
 
     if !output.status.success() {
         return Err(Error::ProcessFailed {
@@ -168,7 +171,8 @@ pub struct FfmpegFrameIter {
 impl FfmpegFrameIter {
     /// Spawns ffmpeg and starts reading raw RGBA frames.
     pub fn spawn(path: impl AsRef<Path>, options: &FfmpegOptions) -> Result<Self> {
-        let probed = probe_video(&path, options)?;
+        let path = path.as_ref();
+        let probed = probe_video(path, options)?;
         let dims = options.scale.unwrap_or(probed.dimensions()?);
         let frame_bytes = dims
             .pixels()?
@@ -178,7 +182,7 @@ impl FfmpegFrameIter {
         let mut command = Command::new(&options.ffmpeg);
         command.args(["-hide_banner", "-loglevel", "error"]);
         command.args(&options.input_args);
-        command.arg("-i").arg(path.as_ref());
+        command.arg("-i").arg(path);
         command.args(["-map", &format!("0:v:{}", options.stream_index)]);
         if let Some(scale) = options.scale {
             command.args(["-vf", &format!("scale={}:{}", scale.width, scale.height)]);
@@ -189,7 +193,9 @@ impl FfmpegFrameIter {
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
 
-        let mut child = command.spawn()?;
+        let mut child = command
+            .spawn()
+            .map_err(|error| process_start_failed(&options.ffmpeg, "--ffmpeg", error))?;
         let stdout = child
             .stdout
             .take()
@@ -264,7 +270,8 @@ pub fn decode_single_frame(
     frame_index: u64,
     options: &FfmpegOptions,
 ) -> Result<FrameOwned> {
-    let probed = probe_video(&path, options)?;
+    let path = path.as_ref();
+    let probed = probe_video(path, options)?;
     let dims = options.scale.unwrap_or(probed.dimensions()?);
     let frame_bytes = dims
         .pixels()?
@@ -273,7 +280,7 @@ pub fn decode_single_frame(
     let mut command = Command::new(&options.ffmpeg);
     command.args(["-hide_banner", "-loglevel", "error"]);
     command.args(&options.input_args);
-    command.arg("-i").arg(path.as_ref());
+    command.arg("-i").arg(path);
     command.args(["-map", &format!("0:v:{}", options.stream_index)]);
 
     let mut filters = format!("select=eq(n\\,{frame_index})");
@@ -293,7 +300,9 @@ pub fn decode_single_frame(
         "rawvideo",
         "pipe:1",
     ]);
-    let output = command.output()?;
+    let output = command
+        .output()
+        .map_err(|error| process_start_failed(&options.ffmpeg, "--ffmpeg", error))?;
     if !output.status.success() {
         return Err(Error::ProcessFailed {
             program: options.ffmpeg.display().to_string(),
@@ -308,6 +317,18 @@ pub fn decode_single_frame(
         )));
     }
     FrameOwned::packed_tight(output.stdout, dims.width, dims.height, PixelFormat::Rgba8)
+}
+
+fn ensure_input_exists(path: &Path) -> Result<()> {
+    if path.exists() {
+        Ok(())
+    } else {
+        Err(Error::input_not_found(path.display().to_string()))
+    }
+}
+
+fn process_start_failed(program: &Path, option: &str, source: io::Error) -> Error {
+    Error::external_tool_start_failed(program.display().to_string(), option, source)
 }
 
 /// Compares two videos by decoding raw RGBA8 frames and feeding them to the core metrics.
@@ -402,4 +423,40 @@ fn mean_metric_outputs(frames: &[FrameReport]) -> Vec<MetricOutput> {
             metric
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("imq-video-test-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn probe_reports_missing_input_before_ffprobe() {
+        let path = temp_path("missing.mp4");
+        let err = probe_video(&path, &FfmpegOptions::default()).unwrap_err();
+
+        assert!(matches!(err, Error::InputNotFound { .. }));
+        assert!(err.to_string().contains("input file not found"));
+    }
+
+    #[test]
+    fn probe_reports_missing_ffprobe_separately() {
+        let path = temp_path("empty.mp4");
+        fs::write(&path, []).unwrap();
+        let options = FfmpegOptions {
+            ffprobe: temp_path("missing-ffprobe"),
+            ..Default::default()
+        };
+
+        let err = probe_video(&path, &options).unwrap_err();
+        let _ = fs::remove_file(path);
+
+        assert!(matches!(err, Error::ExternalToolNotFound { .. }));
+        assert!(err.to_string().contains("external tool"));
+        assert!(err.to_string().contains("--ffprobe"));
+    }
 }

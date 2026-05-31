@@ -89,6 +89,9 @@ impl Default for PreviewOptions {
 
 /// Generates a preview for an image or video path.
 pub fn preview_path(path: &Path, options: &PreviewOptions) -> Result<PreviewImage> {
+    if !path.exists() {
+        return Err(Error::input_not_found(path.display().to_string()));
+    }
     if is_video_path(path) {
         preview_video(path, options)
     } else {
@@ -239,10 +242,20 @@ fn process_failed(program: &Path, status: String, stderr: Vec<u8>) -> Error {
     }
 }
 
+fn process_start_failed(program: &Path, option: &str, source: std::io::Error) -> Error {
+    Error::external_tool_start_failed(program.display().to_string(), option, source)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Error;
     use image::{Rgb, RgbImage};
+    use std::fs;
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("imq-preview-test-{}-{name}", std::process::id()))
+    }
 
     #[test]
     fn preview_tracks_source_dimensions() {
@@ -260,5 +273,31 @@ mod tests {
         assert_eq!((preview.width, preview.height), (16, 12));
         assert_eq!((preview.source_width, preview.source_height), (8, 6));
         assert!(preview.pixels.iter().all(|pixel| *pixel == [255, 0, 0]));
+    }
+
+    #[test]
+    fn preview_reports_missing_input_before_ffmpeg() {
+        let path = temp_path("missing.mp4");
+        let err = preview_path(&path, &PreviewOptions::default()).unwrap_err();
+
+        assert!(matches!(err, Error::InputNotFound { .. }));
+        assert!(err.to_string().contains("input file not found"));
+    }
+
+    #[test]
+    fn video_preview_reports_missing_ffmpeg_separately() {
+        let path = temp_path("empty.mp4");
+        fs::write(&path, []).unwrap();
+        let options = PreviewOptions {
+            ffmpeg: temp_path("missing-ffmpeg"),
+            ..Default::default()
+        };
+
+        let err = preview_path(&path, &options).unwrap_err();
+        let _ = fs::remove_file(path);
+
+        assert!(matches!(err, Error::ExternalToolNotFound { .. }));
+        assert!(err.to_string().contains("external tool"));
+        assert!(err.to_string().contains("--ffmpeg"));
     }
 }

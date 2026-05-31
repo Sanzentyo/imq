@@ -1,6 +1,6 @@
 //! ffmpeg thumbnail extraction with runtime hardware-decode probing.
 
-use super::{DecodeMode, PreviewOptions, process_failed};
+use super::{DecodeMode, PreviewOptions, process_failed, process_start_failed};
 use crate::Result;
 use std::path::Path;
 use std::process::Command;
@@ -175,7 +175,9 @@ fn run_thumbnail(options: &PreviewOptions, path: &Path, accel: Option<HwAccel>) 
         command.args(["-vf", filter.as_str()]);
     }
     command.args(["-f", "image2pipe", "-vcodec", "png", "pipe:1"]);
-    let output = command.output()?;
+    let output = command
+        .output()
+        .map_err(|error| process_start_failed(&options.ffmpeg, "--ffmpeg", error))?;
     if output.status.success() && !output.stdout.is_empty() {
         Ok(output.stdout)
     } else {

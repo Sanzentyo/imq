@@ -2381,6 +2381,7 @@ mod tui_app {
         metrics_csv: String,
         comparisons: Vec<TargetComparison>,
         preview: Option<imq::preview::PreviewImage>,
+        preview_error: Option<String>,
         preview_protocol: Option<StatefulProtocol>,
         preview_picker: Picker,
         preview_cache: PreviewCache,
@@ -2425,6 +2426,7 @@ mod tui_app {
                 metrics_csv: config.metrics_csv,
                 comparisons: Vec::new(),
                 preview: None,
+                preview_error: None,
                 preview_protocol: None,
                 preview_picker: config.preview_picker,
                 preview_cache: PreviewCache::new(config.preview_cache_capacity),
@@ -2650,11 +2652,13 @@ mod tui_app {
         fn update_preview(&mut self) {
             let Some(entry) = self.entries.get(self.selected) else {
                 self.preview = None;
+                self.preview_error = None;
                 self.preview_protocol = None;
                 return;
             };
             if entry.is_dir || entry.is_other {
                 self.preview = None;
+                self.preview_error = None;
                 self.preview_protocol = None;
                 return;
             }
@@ -2678,10 +2682,12 @@ mod tui_app {
             match imq::preview::preview_path(&entry.path, &options) {
                 Ok(preview) => {
                     self.preview_cache.insert(key, preview.clone());
+                    self.preview_error = None;
                     self.set_preview(preview);
                 }
                 Err(err) => {
                     self.preview = None;
+                    self.preview_error = Some(format!("{err:#}"));
                     self.preview_protocol = None;
                     self.status = format!("Preview failed: {err:#}");
                 }
@@ -3209,8 +3215,11 @@ mod tui_app {
             return;
         }
         let Some(preview) = &app.preview else {
-            let empty =
-                Paragraph::new("Select an image or video file").block(panel_block(" preview "));
+            let message = app.preview_error.as_deref().map_or_else(
+                || "Select an image or video file".to_string(),
+                |error| format!("Preview failed:\n{error}"),
+            );
+            let empty = Paragraph::new(message).block(panel_block(" preview "));
             frame.render_widget(empty, area);
             return;
         };

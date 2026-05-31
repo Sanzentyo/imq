@@ -94,6 +94,11 @@ Extract one decoded video frame:
 cargo run --bin imq -- extract-frame input.mov 150 frame-150.png
 ```
 
+Missing input files, missing `ffmpeg`/`ffprobe` executables, and non-zero
+`ffmpeg`/`ffprobe` exits are reported as distinct errors. The TUI keeps running
+when preview generation fails and shows the preview failure reason in the preview
+panel/status line.
+
 Run the TUI:
 
 ```bash
