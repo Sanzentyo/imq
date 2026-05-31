@@ -140,21 +140,26 @@ Subcommand aliases are available: `i` for `image`, `v` for `video`, `p` for
 The `tui` subcommand is enabled by default:
 
 ```bash
-imq tui reference.png distorted.png
+imq tui reference.png distorted-a.png distorted-b.png
 imq tui
 imq tui ./images
 imq tui --preview-cache 64 ./images
 ```
 
 The TUI includes a file browser. Use it to move through folders and set
-reference/distorted images without restarting. When testing non-interactively,
-run it in a PTY and send `q` or Esc to exit. Vim-style navigation is supported:
-`j`/`k` move, `h` goes to the parent directory, `l` opens/selects, and `g`/`G`
-jump to the first/last entry. Use `+`/`-` to adjust preview resolution and `f`
-to cycle fit mode. Use `a` to toggle exact-pixel preview display. The TUI uses
-native Kitty/Sixel/iTerm2 image protocols when the terminal reports support,
-falls back to half-block rendering otherwise, and keeps decoded previews in
-memory according to `--preview-cache`.
+one reference image plus multiple comparison targets without restarting. When
+testing non-interactively, run it in a PTY and send `q` or Esc to exit.
+Vim-style navigation is supported: `j`/`k` move, `h` goes to the parent
+directory, `l` opens/selects, and `g`/`G` jump to the first/last entry. Use `r`
+to set the reference, `Space` or `d` to toggle targets, `v` to cycle
+current/side-by-side/diff previews, `/` to filter by name, `e` to filter to the
+selected extension, `u` to clear filters, `i` to toggle directories, `o` to
+toggle non-media files, and `s` to cycle sort order. Use `+`/`-` to adjust
+preview resolution, `f` to cycle fit mode, and `a` to toggle exact-pixel preview
+display. The TUI shows selected reference/target thumbnails and a multi-target
+comparison table. It uses native Kitty/Sixel/iTerm2 image protocols when the
+terminal reports support, falls back to half-block rendering otherwise, and
+keeps decoded previews in memory according to `--preview-cache`.
 
 ## GPU and NN Features
 

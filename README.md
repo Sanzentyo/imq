@@ -82,17 +82,22 @@ cargo run --bin imq -- extract-frame input.mov 150 frame-150.png
 Run the TUI:
 
 ```bash
-cargo run --bin imq -- tui reference.png distorted.png
+cargo run --bin imq -- tui reference.png distorted-a.png distorted-b.png
 cargo run --bin imq -- tui
 cargo run --bin imq -- tui ./images
 cargo run --bin imq -- tui --preview-cache 64 ./images
 ```
 
 The TUI shows a colorized metric table and an image file browser. Use the
-browser to move through folders and assign images to the reference/distorted
-slots without restarting the program. It supports Vim-style navigation:
+browser to move through folders, set one reference image, and toggle multiple
+comparison targets without restarting the program. It supports Vim-style navigation:
 `j`/`k` move, `h` goes to the parent directory, `l` opens/selects, and `g`/`G`
-jump to the first/last entry.
+jump to the first/last entry. Use `r` to set the reference, `Space` or `d` to
+toggle targets, `v` to cycle current/side-by-side/diff previews, `/` to filter
+by name, `e` to filter to the selected extension, `u` to clear filters, `i` to
+toggle directories, `o` to toggle non-media files, and `s` to cycle sort order.
+Selected reference/target images are also shown as low-resolution, aspect-ratio
+preserving thumbnails next to the comparison table.
 
 List still-image formats exposed by the image adapter:
 

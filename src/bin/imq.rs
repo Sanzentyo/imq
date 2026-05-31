@@ -95,10 +95,10 @@ struct StatsCmd {
 
 #[derive(Debug, Args)]
 struct TuiCmd {
-    /// Reference/original image, or an initial directory when DISTORTED is omitted.
+    /// Reference/original image, or an initial directory when TARGETS is omitted.
     reference: Option<PathBuf>,
-    /// Distorted/test image.
-    distorted: Option<PathBuf>,
+    /// Distorted/test images to compare against the reference.
+    targets: Vec<PathBuf>,
     /// Comma-separated metrics.
     #[arg(short, long, default_value = "psnr,ssim,mse,mae,maxae")]
     metrics: String,
@@ -1661,15 +1661,15 @@ fn montage_previews(
 fn run_tui(cmd: TuiCmd) -> Result<()> {
     #[cfg(feature = "tui")]
     {
-        let (reference, distorted, initial_dir) =
-            if cmd.distorted.is_none() && cmd.reference.as_ref().is_some_and(|p| p.is_dir()) {
-                (None, None, cmd.reference)
+        let (reference, targets, initial_dir) =
+            if cmd.targets.is_empty() && cmd.reference.as_ref().is_some_and(|p| p.is_dir()) {
+                (None, Vec::new(), cmd.reference)
             } else {
-                (cmd.reference, cmd.distorted, None)
+                (cmd.reference, cmd.targets, None)
             };
         tui_app::run(
             reference,
-            distorted,
+            targets,
             initial_dir,
             cmd.metrics,
             cmd.preview_cache,
@@ -1726,6 +1726,7 @@ mod tui_app {
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
+    use std::time::SystemTime;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Slot {
@@ -1754,13 +1755,83 @@ mod tui_app {
         path: PathBuf,
         name: String,
         is_dir: bool,
+        is_image: bool,
         is_video: bool,
+        is_other: bool,
+        extension: Option<String>,
+        modified: Option<SystemTime>,
     }
 
     #[derive(Debug, Clone)]
     struct Comparison {
         dimensions: Dimensions,
         metrics: Vec<MetricOutput>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct TargetComparison {
+        path: PathBuf,
+        comparison: Option<Comparison>,
+        error: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SortMode {
+        Name,
+        Kind,
+        Extension,
+        Modified,
+    }
+
+    impl SortMode {
+        fn next(self) -> Self {
+            match self {
+                Self::Name => Self::Kind,
+                Self::Kind => Self::Extension,
+                Self::Extension => Self::Modified,
+                Self::Modified => Self::Name,
+            }
+        }
+
+        fn label(self) -> &'static str {
+            match self {
+                Self::Name => "name",
+                Self::Kind => "kind",
+                Self::Extension => "ext",
+                Self::Modified => "modified",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PreviewMode {
+        Current,
+        SideBySide,
+        Diff,
+    }
+
+    impl PreviewMode {
+        fn next(self) -> Self {
+            match self {
+                Self::Current => Self::SideBySide,
+                Self::SideBySide => Self::Diff,
+                Self::Diff => Self::Current,
+            }
+        }
+
+        fn label(self) -> &'static str {
+            match self {
+                Self::Current => "current",
+                Self::SideBySide => "side",
+                Self::Diff => "diff",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum InputMode {
+        Normal,
+        Filter,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1830,26 +1901,33 @@ mod tui_app {
 
     struct App {
         reference: Option<PathBuf>,
-        distorted: Option<PathBuf>,
+        targets: Vec<PathBuf>,
         metrics_csv: String,
-        comparison: Option<Comparison>,
+        comparisons: Vec<TargetComparison>,
         preview: Option<imq::preview::PreviewImage>,
         preview_protocol: Option<StatefulProtocol>,
         preview_picker: Picker,
         preview_cache: PreviewCache,
         preview_resolution: PreviewResolution,
         preview_fit: imq::preview::FitMode,
+        preview_mode: PreviewMode,
         cwd: PathBuf,
         entries: Vec<FileEntry>,
         selected: usize,
         active_slot: Slot,
+        show_dirs: bool,
+        show_other: bool,
+        sort_mode: SortMode,
+        extension_filter: Option<String>,
+        name_filter: String,
+        input_mode: InputMode,
         status: String,
         list_state: ListState,
     }
 
     struct AppConfig {
         reference: Option<PathBuf>,
-        distorted: Option<PathBuf>,
+        targets: Vec<PathBuf>,
         initial_dir: Option<PathBuf>,
         metrics_csv: String,
         preview_picker: Picker,
@@ -1863,13 +1941,13 @@ mod tui_app {
             let cwd = initial_cwd(
                 config.initial_dir.as_deref(),
                 config.reference.as_deref(),
-                config.distorted.as_deref(),
+                config.targets.first().map(PathBuf::as_path),
             )?;
             let mut app = Self {
                 reference: config.reference,
-                distorted: config.distorted,
+                targets: config.targets,
                 metrics_csv: config.metrics_csv,
-                comparison: None,
+                comparisons: Vec::new(),
                 preview: None,
                 preview_protocol: None,
                 preview_picker: config.preview_picker,
@@ -1880,28 +1958,50 @@ mod tui_app {
                     config.preview_resolution
                 },
                 preview_fit: imq::preview::FitMode::Contain,
+                preview_mode: PreviewMode::Current,
                 cwd,
                 entries: Vec::new(),
                 selected: 0,
                 active_slot: Slot::Reference,
+                show_dirs: true,
+                show_other: false,
+                sort_mode: SortMode::Name,
+                extension_filter: None,
+                name_filter: String::new(),
+                input_mode: InputMode::Normal,
                 status: String::new(),
                 list_state: ListState::default(),
             };
             app.refresh_entries();
-            if let Some(path) = app.reference.clone().or_else(|| app.distorted.clone()) {
+            if let Some(path) = app
+                .reference
+                .clone()
+                .or_else(|| app.targets.first().cloned())
+            {
                 app.select_path(&path);
             }
             app.update_preview();
-            app.compare_selected();
+            app.compare_targets();
             Ok(app)
         }
 
         fn refresh_entries(&mut self) {
-            match read_entries(&self.cwd) {
+            match read_entries(
+                &self.cwd,
+                self.show_dirs,
+                self.show_other,
+                self.extension_filter.as_deref(),
+                &self.name_filter,
+                self.sort_mode,
+            ) {
                 Ok(entries) => {
                     self.entries = entries;
                     self.selected = self.selected.min(self.entries.len().saturating_sub(1));
-                    self.status = format!("Browsing {}", self.cwd.display());
+                    self.status = format!(
+                        "Browsing {} ({})",
+                        self.cwd.display(),
+                        self.browser_status()
+                    );
                 }
                 Err(err) => {
                     self.entries.clear();
@@ -1911,6 +2011,21 @@ mod tui_app {
             }
             self.sync_list_state();
             self.update_preview();
+        }
+
+        fn browser_status(&self) -> String {
+            format!(
+                "dirs:{} other:{} sort:{} ext:{} filter:{}",
+                on_off(self.show_dirs),
+                on_off(self.show_other),
+                self.sort_mode.label(),
+                self.extension_filter.as_deref().unwrap_or("*"),
+                if self.name_filter.is_empty() {
+                    "*"
+                } else {
+                    self.name_filter.as_str()
+                }
+            )
         }
 
         fn move_selection(&mut self, delta: isize) {
@@ -1960,60 +2075,79 @@ mod tui_app {
                 self.refresh_entries();
                 return;
             }
-            if entry.is_video {
-                self.status =
-                    "Videos can be previewed, but image comparison needs still images".to_string();
+            if !entry.is_image {
+                self.status = "Select a still image file for comparison".to_string();
                 return;
             }
-            match self.active_slot {
-                Slot::Reference => self.reference = Some(entry.path),
-                Slot::Distorted => self.distorted = Some(entry.path),
+            if self.reference.is_none() {
+                self.set_reference(entry.path);
+            } else {
+                self.toggle_target(entry.path);
             }
-            self.status = format!("Set {}", self.active_slot.label());
-            self.active_slot = self.active_slot.toggle();
-            self.compare_selected();
         }
 
         fn set_slot(&mut self, slot: Slot) {
             let Some(entry) = self.entries.get(self.selected).cloned() else {
                 return;
             };
-            if entry.is_dir || entry.is_video {
+            if entry.is_dir || !entry.is_image {
                 self.status = "Select a still image file for comparison".to_string();
                 return;
             }
             match slot {
-                Slot::Reference => self.reference = Some(entry.path),
-                Slot::Distorted => self.distorted = Some(entry.path),
+                Slot::Reference => self.set_reference(entry.path),
+                Slot::Distorted => self.toggle_target(entry.path),
             }
             self.active_slot = slot.toggle();
-            self.status = format!("Set {}", slot.label());
-            self.compare_selected();
         }
 
-        fn compare_selected(&mut self) {
-            let (Some(reference_path), Some(distorted_path)) = (&self.reference, &self.distorted)
-            else {
-                self.comparison = None;
-                if self.reference.is_none() || self.distorted.is_none() {
-                    self.status = "Select reference and distorted images".to_string();
-                }
+        fn set_reference(&mut self, path: PathBuf) {
+            self.reference = Some(path.clone());
+            self.targets.retain(|target| target != &path);
+            self.status = format!("Set reference {}", short_path(&path));
+            self.compare_targets();
+        }
+
+        fn toggle_target(&mut self, path: PathBuf) {
+            if self.reference.as_ref() == Some(&path) {
+                self.status = "Reference is already selected".to_string();
+                return;
+            }
+            if let Some(index) = self.targets.iter().position(|target| target == &path) {
+                self.targets.remove(index);
+                self.status = format!("Removed target {}", short_path(&path));
+            } else {
+                self.targets.push(path.clone());
+                self.status = format!("Added target {}", short_path(&path));
+            }
+            self.compare_targets();
+        }
+
+        fn compare_targets(&mut self) {
+            let Some(reference_path) = &self.reference else {
+                self.comparisons.clear();
+                self.status = "Select a reference image with r".to_string();
                 return;
             };
-
-            match compare_paths(reference_path, distorted_path, &self.metrics_csv) {
-                Ok(comparison) => {
-                    self.status = format!(
-                        "Compared {}x{}",
-                        comparison.dimensions.width, comparison.dimensions.height
-                    );
-                    self.comparison = Some(comparison);
-                }
-                Err(err) => {
-                    self.comparison = None;
-                    self.status = format!("Comparison failed: {err:#}");
-                }
-            }
+            self.comparisons = self
+                .targets
+                .iter()
+                .map(
+                    |target| match compare_paths(reference_path, target, &self.metrics_csv) {
+                        Ok(comparison) => TargetComparison {
+                            path: target.clone(),
+                            comparison: Some(comparison),
+                            error: None,
+                        },
+                        Err(err) => TargetComparison {
+                            path: target.clone(),
+                            comparison: None,
+                            error: Some(format!("{err:#}")),
+                        },
+                    },
+                )
+                .collect();
+            self.status = format!("Compared {} target(s)", self.targets.len());
         }
 
         fn sync_list_state(&mut self) {
@@ -2044,7 +2178,7 @@ mod tui_app {
                 self.preview_protocol = None;
                 return;
             };
-            if entry.is_dir {
+            if entry.is_dir || entry.is_other {
                 self.preview = None;
                 self.preview_protocol = None;
                 return;
@@ -2156,6 +2290,70 @@ mod tui_app {
             self.update_preview();
         }
 
+        fn cycle_preview_mode(&mut self) {
+            self.preview_mode = self.preview_mode.next();
+            self.status = format!("Preview view: {}", self.preview_mode.label());
+        }
+
+        fn toggle_dirs(&mut self) {
+            self.show_dirs = !self.show_dirs;
+            self.refresh_entries();
+        }
+
+        fn toggle_other_files(&mut self) {
+            self.show_other = !self.show_other;
+            self.refresh_entries();
+        }
+
+        fn cycle_sort(&mut self) {
+            self.sort_mode = self.sort_mode.next();
+            self.refresh_entries();
+        }
+
+        fn filter_to_selected_extension(&mut self) {
+            let Some(entry) = self.entries.get(self.selected) else {
+                return;
+            };
+            if let Some(extension) = &entry.extension {
+                self.extension_filter = Some(extension.clone());
+                self.refresh_entries();
+            }
+        }
+
+        fn clear_filters(&mut self) {
+            self.extension_filter = None;
+            self.name_filter.clear();
+            self.input_mode = InputMode::Normal;
+            self.refresh_entries();
+        }
+
+        fn begin_filter_input(&mut self) {
+            self.input_mode = InputMode::Filter;
+            self.status = format!("Filter: {}", self.name_filter);
+        }
+
+        fn push_filter_char(&mut self, value: char) {
+            self.name_filter.push(value);
+            self.refresh_entries();
+            self.input_mode = InputMode::Filter;
+        }
+
+        fn pop_filter_char(&mut self) {
+            self.name_filter.pop();
+            self.refresh_entries();
+            self.input_mode = InputMode::Filter;
+        }
+
+        fn selected_target_path(&self) -> Option<&Path> {
+            let entry_path = self
+                .entries
+                .get(self.selected)
+                .map(|entry| entry.path.as_path());
+            entry_path
+                .filter(|path| self.targets.iter().any(|target| target == *path))
+                .or_else(|| self.targets.first().map(PathBuf::as_path))
+        }
+
         fn requested_preview_size(&self) -> (u32, u32) {
             match self.preview_resolution {
                 PreviewResolution::Fixed { width, height } => (width, height),
@@ -2181,7 +2379,7 @@ mod tui_app {
 
     pub fn run(
         reference: Option<PathBuf>,
-        distorted: Option<PathBuf>,
+        targets: Vec<PathBuf>,
         initial_dir: Option<PathBuf>,
         metrics_csv: String,
         preview_cache_capacity: usize,
@@ -2200,7 +2398,7 @@ mod tui_app {
         );
         let mut app = match App::new(AppConfig {
             reference,
-            distorted,
+            targets,
             initial_dir,
             metrics_csv,
             preview_picker,
@@ -2237,12 +2435,19 @@ mod tui_app {
                 render_browser(frame, body[0], &mut app);
                 let right = Layout::default()
                     .direction(LayoutDirection::Vertical)
-                    .constraints([Constraint::Length(17), Constraint::Min(5)])
+                    .constraints([
+                        Constraint::Length(17),
+                        Constraint::Length(8),
+                        Constraint::Min(5),
+                    ])
                     .split(body[1]);
                 render_preview_panel(frame, right[0], &mut app);
-                render_metrics(frame, right[1], &app);
+                render_selection_strip(frame, right[1], &mut app);
+                render_metrics(frame, right[2], &app);
 
                 let footer = Paragraph::new(Line::from(vec![
+                    Span::styled("/", Style::default().fg(Color::Cyan)),
+                    Span::raw(" filter  "),
                     Span::styled("j/k", Style::default().fg(Color::Cyan)),
                     Span::raw(" move  "),
                     Span::styled("h/l", Style::default().fg(Color::Green)),
@@ -2257,10 +2462,12 @@ mod tui_app {
                     Span::raw(" fit  "),
                     Span::styled("a", Style::default().fg(Color::Magenta)),
                     Span::raw(" actual  "),
-                    Span::styled("Tab", Style::default().fg(Color::Yellow)),
-                    Span::raw(" target  "),
+                    Span::styled("v", Style::default().fg(Color::Magenta)),
+                    Span::raw(" view  "),
                     Span::styled("r/d", Style::default().fg(Color::Yellow)),
                     Span::raw(" set  "),
+                    Span::styled("Space", Style::default().fg(Color::Yellow)),
+                    Span::raw(" target  "),
                     Span::styled("q/Esc", Style::default().fg(Color::Red)),
                     Span::raw(" quit"),
                 ]));
@@ -2268,6 +2475,18 @@ mod tui_app {
             })?;
 
             if let Event::Key(key) = event::read()? {
+                if app.input_mode == InputMode::Filter {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Enter => {
+                            app.input_mode = InputMode::Normal;
+                            app.status = format!("Filter: {}", app.name_filter);
+                        }
+                        KeyCode::Backspace => app.pop_filter_char(),
+                        KeyCode::Char(value) => app.push_filter_char(value),
+                        _ => {}
+                    }
+                    continue;
+                }
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break Ok::<(), anyhow::Error>(()),
                     KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
@@ -2282,13 +2501,27 @@ mod tui_app {
                         app.active_slot = app.active_slot.toggle();
                         app.status = format!("Target: {}", app.active_slot.label());
                     }
+                    KeyCode::Char(' ') => {
+                        if let Some(entry) = app.entries.get(app.selected).cloned() {
+                            if entry.is_image {
+                                app.toggle_target(entry.path);
+                            }
+                        }
+                    }
                     KeyCode::Char('r') => app.set_slot(Slot::Reference),
                     KeyCode::Char('d') => app.set_slot(Slot::Distorted),
-                    KeyCode::Char('c') => app.compare_selected(),
+                    KeyCode::Char('c') => app.compare_targets(),
                     KeyCode::Char('+') | KeyCode::Char('=') => app.resize_preview(true),
                     KeyCode::Char('-') => app.resize_preview(false),
                     KeyCode::Char('f') => app.cycle_preview_fit(),
                     KeyCode::Char('a') => app.toggle_actual_size(),
+                    KeyCode::Char('v') => app.cycle_preview_mode(),
+                    KeyCode::Char('i') => app.toggle_dirs(),
+                    KeyCode::Char('o') => app.toggle_other_files(),
+                    KeyCode::Char('s') => app.cycle_sort(),
+                    KeyCode::Char('e') => app.filter_to_selected_extension(),
+                    KeyCode::Char('u') => app.clear_filters(),
+                    KeyCode::Char('/') => app.begin_filter_input(),
                     _ => {}
                 }
             }
@@ -2302,9 +2535,15 @@ mod tui_app {
 
     fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         let dims = app
-            .comparison
-            .as_ref()
-            .map(|c| format!("{}x{}", c.dimensions.width, c.dimensions.height))
+            .comparisons
+            .iter()
+            .find_map(|target| target.comparison.as_ref())
+            .map(|comparison| {
+                format!(
+                    "{}x{}",
+                    comparison.dimensions.width, comparison.dimensions.height
+                )
+            })
             .unwrap_or_else(|| "--".to_string());
         let active = Style::default()
             .fg(Color::Yellow)
@@ -2315,8 +2554,12 @@ mod tui_app {
                 Span::raw(display_path(app.reference.as_deref())),
             ]),
             Line::from(vec![
-                Span::styled("distorted ", label_style(Slot::Distorted, app.active_slot)),
-                Span::raw(display_path(app.distorted.as_deref())),
+                Span::styled("targets ", label_style(Slot::Distorted, app.active_slot)),
+                Span::raw(format!(
+                    "{} selected ({})",
+                    app.targets.len(),
+                    app.preview_mode.label()
+                )),
             ]),
             Line::from(vec![
                 Span::styled("target ", active),
@@ -2324,6 +2567,9 @@ mod tui_app {
                 Span::raw("    "),
                 Span::styled("size ", Style::default().fg(Color::Cyan)),
                 Span::raw(dims),
+                Span::raw("    "),
+                Span::styled("browser ", Style::default().fg(Color::Cyan)),
+                Span::raw(app.browser_status()),
                 Span::raw("    "),
                 Span::styled("metrics ", Style::default().fg(Color::Cyan)),
                 Span::raw(app.metrics_csv.as_str()),
@@ -2349,20 +2595,36 @@ mod tui_app {
 
     fn render_browser(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
         let items = app.entries.iter().map(|entry| {
-            let style = if entry.is_dir {
+            let selected_role = entry_role(entry, app);
+            let style = if selected_role.is_some() {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD)
+            } else if entry.is_dir {
                 Style::default().fg(Color::LightBlue)
+            } else if entry.is_video {
+                Style::default().fg(Color::LightMagenta)
+            } else if entry.is_other {
+                Style::default().fg(Color::DarkGray)
             } else {
                 Style::default().fg(Color::White)
             };
             ListItem::new(Line::from(vec![
                 Span::styled(entry_prefix(entry), style),
+                Span::styled(selected_role.unwrap_or(" "), style),
+                Span::raw(" "),
                 Span::styled(entry.name.as_str(), style),
             ]))
         });
         let list = List::new(items)
             .block(
                 Block::default()
-                    .title(format!(" browser: {} ", app.cwd.display()))
+                    .title(format!(
+                        " browser: {} | {} ",
+                        app.cwd.display(),
+                        app.browser_status()
+                    ))
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Blue)),
             )
@@ -2377,7 +2639,7 @@ mod tui_app {
     }
 
     fn render_metrics(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-        let Some(comparison) = &app.comparison else {
+        if app.comparisons.is_empty() {
             let empty = Paragraph::new(vec![
                 Line::from(Span::styled(
                     "No comparison yet",
@@ -2385,38 +2647,61 @@ mod tui_app {
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 )),
-                Line::from("Select a reference and distorted image from the browser."),
+                Line::from("Press r on a reference image, then Space on one or more targets."),
             ])
             .block(
                 Block::default()
-                    .title(" metrics ")
+                    .title(" comparisons ")
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Blue)),
             );
             frame.render_widget(empty, area);
             return;
-        };
+        }
 
-        let rows = comparison.metrics.iter().map(|metric| {
-            Row::new(vec![
-                Cell::from(metric.name.clone()),
-                Cell::from(format!("{:.8}", metric.score)),
-                Cell::from(compact_unit(&metric.unit)),
-                Cell::from(direction_label(metric.direction)),
-            ])
-            .style(direction_style(metric.direction))
-        });
+        let primary_metric = app
+            .comparisons
+            .iter()
+            .filter_map(|target| target.comparison.as_ref())
+            .find_map(|comparison| comparison.metrics.first())
+            .map(|metric| metric.name.as_str())
+            .unwrap_or("score");
+        let rows = app
+            .comparisons
+            .iter()
+            .map(|target| match &target.comparison {
+                Some(comparison) => {
+                    let primary = comparison.metrics.first();
+                    Row::new(vec![
+                        Cell::from(short_path(&target.path)),
+                        Cell::from(metric_value(comparison, "psnr")),
+                        Cell::from(metric_value(comparison, "ssim")),
+                        Cell::from(metric_value(comparison, "mse")),
+                        Cell::from(primary.map(metric_bar).unwrap_or_default()),
+                    ])
+                    .style(primary.map(metric_row_style).unwrap_or_default())
+                }
+                None => Row::new(vec![
+                    Cell::from(short_path(&target.path)),
+                    Cell::from("err"),
+                    Cell::from("err"),
+                    Cell::from("err"),
+                    Cell::from(target.error.clone().unwrap_or_default()),
+                ])
+                .style(Style::default().fg(Color::Red)),
+            });
         let table = Table::new(
             rows,
             [
+                Constraint::Percentage(36),
+                Constraint::Length(12),
                 Constraint::Length(10),
-                Constraint::Length(14),
-                Constraint::Length(10),
-                Constraint::Min(8),
+                Constraint::Length(12),
+                Constraint::Min(14),
             ],
         )
         .header(
-            Row::new(vec!["metric", "score", "unit", "dir"]).style(
+            Row::new(vec!["target", "psnr", "ssim", "mse", primary_metric]).style(
                 Style::default()
                     .fg(Color::LightCyan)
                     .add_modifier(Modifier::BOLD),
@@ -2424,7 +2709,7 @@ mod tui_app {
         )
         .block(
             Block::default()
-                .title(" metrics ")
+                .title(" comparisons ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Blue)),
         );
@@ -2432,6 +2717,9 @@ mod tui_app {
     }
 
     fn render_preview_panel(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
+        if app.preview_mode != PreviewMode::Current && render_comparison_preview(frame, area, app) {
+            return;
+        }
         let Some(preview) = &app.preview else {
             let empty =
                 Paragraph::new("Select an image or video file").block(panel_block(" preview "));
@@ -2498,6 +2786,100 @@ mod tui_app {
         }
     }
 
+    fn render_comparison_preview(
+        frame: &mut ratatui::Frame<'_>,
+        area: Rect,
+        app: &mut App,
+    ) -> bool {
+        let (Some(reference), Some(target)) = (
+            app.reference.clone(),
+            app.selected_target_path().map(Path::to_path_buf),
+        ) else {
+            return false;
+        };
+        let block = panel_block(format!(" preview: {} ", app.preview_mode.label()));
+        let content_area = block.inner(area);
+        frame.render_widget(block, area);
+        match app.preview_mode {
+            PreviewMode::Current => false,
+            PreviewMode::SideBySide => {
+                let split = Layout::default()
+                    .direction(LayoutDirection::Horizontal)
+                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(content_area);
+                render_path_preview(frame, split[0], app, &reference, "reference");
+                render_path_preview(frame, split[1], app, &target, "target");
+                true
+            }
+            PreviewMode::Diff => {
+                if let Some(diff) = diff_preview_for_area(app, &reference, &target, content_area) {
+                    draw_preview_blocks(frame, content_area, &diff, false);
+                } else {
+                    frame.render_widget(Paragraph::new("Diff preview unavailable"), content_area);
+                }
+                true
+            }
+        }
+    }
+
+    fn render_path_preview(
+        frame: &mut ratatui::Frame<'_>,
+        area: Rect,
+        app: &mut App,
+        path: &Path,
+        title: &str,
+    ) {
+        let block = panel_block(format!(" {title}: {} ", short_path(path)));
+        let content_area = block.inner(area);
+        frame.render_widget(block, area);
+        let Some(preview) = preview_for_area(app, path, content_area) else {
+            frame.render_widget(Paragraph::new("preview unavailable"), content_area);
+            return;
+        };
+        draw_preview_blocks(frame, content_area, &preview, false);
+    }
+
+    fn render_selection_strip(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut App) {
+        let block = panel_block(" selected ");
+        let content_area = block.inner(area);
+        frame.render_widget(block, area);
+        let mut paths = Vec::new();
+        if let Some(reference) = &app.reference {
+            paths.push(("ref", reference.clone()));
+        }
+        paths.extend(app.targets.iter().take(4).map(|path| ("tgt", path.clone())));
+        if paths.is_empty() || content_area.width == 0 {
+            frame.render_widget(
+                Paragraph::new("r: set reference, Space: target"),
+                content_area,
+            );
+            return;
+        }
+        let width_each = (content_area.width / paths.len() as u16).max(1);
+        for (index, (kind, path)) in paths.into_iter().enumerate() {
+            let rect = Rect {
+                x: content_area.x + index as u16 * width_each,
+                y: content_area.y,
+                width: if index == 0 {
+                    width_each
+                } else {
+                    width_each.min(
+                        content_area
+                            .right()
+                            .saturating_sub(content_area.x + index as u16 * width_each),
+                    )
+                },
+                height: content_area.height,
+            };
+            let block = panel_block(format!(" {kind}: {} ", short_path(&path)));
+            let inner = block.inner(rect);
+            frame.render_widget(block, rect);
+            if let Some(preview) = preview_for_area(app, &path, inner) {
+                draw_preview_blocks(frame, inner, &preview, false);
+            }
+        }
+    }
+
     fn preview_display_cells(
         preview: &imq::preview::PreviewImage,
         area: Rect,
@@ -2510,6 +2892,130 @@ mod tui_app {
             );
         }
         fitted_preview_cells(preview, area)
+    }
+
+    fn preview_for_area(
+        app: &mut App,
+        path: &Path,
+        area: Rect,
+    ) -> Option<imq::preview::PreviewImage> {
+        let width = u32::from(area.width.max(1));
+        let height = u32::from(area.height.max(1)).saturating_mul(2);
+        let key = PreviewCacheKey {
+            path: path.to_path_buf(),
+            width,
+            height,
+            fit: imq::preview::FitMode::Contain,
+        };
+        if let Some(preview) = app.preview_cache.get(&key) {
+            return Some(preview);
+        }
+        let options = imq::preview::PreviewOptions {
+            width,
+            height,
+            fit: imq::preview::FitMode::Contain,
+            ..Default::default()
+        };
+        let preview = imq::preview::preview_path(path, &options).ok()?;
+        app.preview_cache.insert(key, preview.clone());
+        Some(preview)
+    }
+
+    fn diff_preview_for_area(
+        app: &mut App,
+        reference: &Path,
+        target: &Path,
+        area: Rect,
+    ) -> Option<imq::preview::PreviewImage> {
+        let reference = preview_for_area(app, reference, area)?;
+        let target = preview_for_area(app, target, area)?;
+        let width = reference.width.min(target.width);
+        let height = reference.height.min(target.height);
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let pixels = (0..height)
+            .flat_map(|y| {
+                let reference = &reference;
+                let target = &target;
+                (0..width).map(move |x| {
+                    let a = reference.pixel(x, y);
+                    let b = target.pixel(x, y);
+                    [
+                        a[0].abs_diff(b[0]).saturating_mul(3),
+                        a[1].abs_diff(b[1]).saturating_mul(3),
+                        a[2].abs_diff(b[2]).saturating_mul(3),
+                    ]
+                })
+            })
+            .collect();
+        Some(imq::preview::PreviewImage {
+            width,
+            height,
+            source_width: width,
+            source_height: height,
+            pixels,
+            source: "diff".to_string(),
+        })
+    }
+
+    fn draw_preview_blocks(
+        frame: &mut ratatui::Frame<'_>,
+        area: Rect,
+        preview: &imq::preview::PreviewImage,
+        exact: bool,
+    ) {
+        let (display_cols, display_pixel_rows) = if exact {
+            (
+                preview.width.min(u32::from(area.width)),
+                preview.height.min(u32::from(area.height).saturating_mul(2)),
+            )
+        } else {
+            fitted_preview_cells(preview, area)
+        };
+        if display_cols == 0 || display_pixel_rows == 0 {
+            return;
+        }
+        let x_offset = (area.width.saturating_sub(display_cols as u16)) / 2;
+        let y_offset = (area
+            .height
+            .saturating_sub(display_pixel_rows.div_ceil(2) as u16))
+            / 2;
+        for y in (0..display_pixel_rows).step_by(2) {
+            let spans = (0..display_cols).map(|x| {
+                let top = sample_preview_pixel_scaled(
+                    preview,
+                    x,
+                    y,
+                    display_cols,
+                    display_pixel_rows,
+                    exact,
+                );
+                let bottom = sample_preview_pixel_scaled(
+                    preview,
+                    x,
+                    (y + 1).min(display_pixel_rows.saturating_sub(1)),
+                    display_cols,
+                    display_pixel_rows,
+                    exact,
+                );
+                Span::styled(
+                    "▀",
+                    Style::default()
+                        .fg(Color::Rgb(top[0], top[1], top[2]))
+                        .bg(Color::Rgb(bottom[0], bottom[1], bottom[2])),
+                )
+            });
+            frame.render_widget(
+                Paragraph::new(Line::from(spans.collect::<Vec<_>>())),
+                Rect {
+                    x: area.x + x_offset,
+                    y: area.y + y_offset + (y / 2) as u16,
+                    width: display_cols as u16,
+                    height: 1,
+                },
+            );
+        }
     }
 
     fn preview_to_dynamic(preview: &imq::preview::PreviewImage) -> Option<image::DynamicImage> {
@@ -2540,7 +3046,11 @@ mod tui_app {
             .split(body[1]);
         let right = Layout::default()
             .direction(LayoutDirection::Vertical)
-            .constraints([Constraint::Length(17), Constraint::Min(5)])
+            .constraints([
+                Constraint::Length(17),
+                Constraint::Length(8),
+                Constraint::Min(5),
+            ])
             .split(columns[1]);
         let content_area = panel_block(" preview ").inner(right[0]);
         let font_size = preview_picker.font_size();
@@ -2572,6 +3082,20 @@ mod tui_app {
         app: &App,
     ) -> [u8; 3] {
         if app.preview_resolution == PreviewResolution::Actual {
+            return preview.pixel(x, y);
+        }
+        sample_preview_pixel_scaled(preview, x, y, display_width, display_height, false)
+    }
+
+    fn sample_preview_pixel_scaled(
+        preview: &imq::preview::PreviewImage,
+        x: u32,
+        y: u32,
+        display_width: u32,
+        display_height: u32,
+        exact: bool,
+    ) -> [u8; 3] {
+        if exact {
             return preview.pixel(x, y);
         }
         let source_x = (u64::from(x) * u64::from(preview.width) / u64::from(display_width)) as u32;
@@ -2614,15 +3138,30 @@ mod tui_app {
         std::env::current_dir().context("failed to get current directory")
     }
 
-    fn read_entries(cwd: &Path) -> Result<Vec<FileEntry>> {
+    fn read_entries(
+        cwd: &Path,
+        show_dirs: bool,
+        show_other: bool,
+        extension_filter: Option<&str>,
+        name_filter: &str,
+        sort_mode: SortMode,
+    ) -> Result<Vec<FileEntry>> {
         let mut entries = Vec::new();
-        if let Some(parent) = cwd.parent() {
-            entries.push(FileEntry {
-                path: parent.to_path_buf(),
-                name: "..".to_string(),
-                is_dir: true,
-                is_video: false,
-            });
+        let mut parent_added = false;
+        if show_dirs {
+            if let Some(parent) = cwd.parent() {
+                entries.push(FileEntry {
+                    path: parent.to_path_buf(),
+                    name: "..".to_string(),
+                    is_dir: true,
+                    is_image: false,
+                    is_video: false,
+                    is_other: false,
+                    extension: None,
+                    modified: None,
+                });
+                parent_added = true;
+            }
         }
         for item in
             fs::read_dir(cwd).with_context(|| format!("failed to read {}", cwd.display()))?
@@ -2630,34 +3169,101 @@ mod tui_app {
             let item = item?;
             let file_type = item.file_type()?;
             let is_dir = file_type.is_dir();
-            let is_video = imq::preview::is_video_path(&item.path());
-            if !is_dir && !is_supported_image(&item.path()) && !is_video {
+            let path = item.path();
+            let extension = path_extension(&path);
+            let is_image = is_supported_image(&path);
+            let is_video = imq::preview::is_video_path(&path);
+            let is_other = !is_dir && !is_image && !is_video;
+            if is_dir && !show_dirs {
+                continue;
+            }
+            if is_other && !show_other {
+                continue;
+            }
+            if !matches_extension(extension_filter, extension.as_deref(), is_dir) {
                 continue;
             }
             let name = item.file_name().to_string_lossy().into_owned();
+            if !matches_name_filter(&name, name_filter) {
+                continue;
+            }
             entries.push(FileEntry {
-                path: item.path(),
+                path,
                 name,
                 is_dir,
+                is_image,
                 is_video,
+                is_other,
+                extension,
+                modified: item
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .ok(),
             });
         }
-        let sortable_start = usize::from(cwd.parent().is_some());
-        entries[sortable_start..].sort_by(|a, b| {
-            b.is_dir
-                .cmp(&a.is_dir)
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        });
+        let sortable_start = usize::from(parent_added);
+        sort_entries(&mut entries[sortable_start..], sort_mode);
         Ok(entries)
+    }
+
+    fn sort_entries(entries: &mut [FileEntry], sort_mode: SortMode) {
+        entries.sort_by(|a, b| {
+            b.is_dir.cmp(&a.is_dir).then_with(|| match sort_mode {
+                SortMode::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                SortMode::Kind => entry_kind(a)
+                    .cmp(&entry_kind(b))
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                SortMode::Extension => a
+                    .extension
+                    .cmp(&b.extension)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                SortMode::Modified => b
+                    .modified
+                    .cmp(&a.modified)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+            })
+        });
+    }
+
+    fn matches_extension(filter: Option<&str>, extension: Option<&str>, is_dir: bool) -> bool {
+        is_dir
+            || match filter {
+                Some(filter) => extension == Some(filter),
+                None => true,
+            }
+    }
+
+    fn matches_name_filter(name: &str, filter: &str) -> bool {
+        filter.is_empty()
+            || name
+                .to_ascii_lowercase()
+                .contains(&filter.to_ascii_lowercase())
+    }
+
+    fn path_extension(path: &Path) -> Option<String> {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+    }
+
+    fn entry_kind(entry: &FileEntry) -> u8 {
+        match (entry.is_dir, entry.is_image, entry.is_video, entry.is_other) {
+            (true, _, _, _) => 0,
+            (_, true, _, _) => 1,
+            (_, _, true, _) => 2,
+            _ => 3,
+        }
     }
 
     fn entry_prefix(entry: &FileEntry) -> &'static str {
         if entry.is_dir {
             "dir  "
+        } else if entry.is_image {
+            "img  "
         } else if entry.is_video {
             "vid  "
         } else {
-            "img  "
+            "file "
         }
     }
 
@@ -2701,6 +3307,27 @@ mod tui_app {
             .unwrap_or_else(|| "<not selected>".to_string())
     }
 
+    fn short_path(path: &Path) -> String {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| path.display().to_string())
+    }
+
+    fn on_off(value: bool) -> &'static str {
+        if value { "on" } else { "off" }
+    }
+
+    fn entry_role(entry: &FileEntry, app: &App) -> Option<&'static str> {
+        if app.reference.as_ref() == Some(&entry.path) {
+            Some("R")
+        } else if app.targets.iter().any(|target| target == &entry.path) {
+            Some("*")
+        } else {
+            None
+        }
+    }
+
     fn label_style(slot: Slot, active_slot: Slot) -> Style {
         let color = match slot {
             Slot::Reference => Color::LightGreen,
@@ -2721,20 +3348,51 @@ mod tui_app {
         }
     }
 
-    fn direction_label(direction: imq::metrics::Direction) -> &'static str {
-        match direction {
-            imq::metrics::Direction::HigherIsBetter => "higher",
-            imq::metrics::Direction::LowerIsBetter => "lower",
-            imq::metrics::Direction::Neutral => "neutral",
+    fn metric_value(comparison: &Comparison, name: &str) -> String {
+        comparison
+            .metrics
+            .iter()
+            .find(|metric| metric.name == name)
+            .map(format_metric_score)
+            .unwrap_or_else(|| "--".to_string())
+    }
+
+    fn format_metric_score(metric: &MetricOutput) -> String {
+        if metric.score.is_infinite() {
+            "inf".to_string()
+        } else if metric.score.is_nan() {
+            "nan".to_string()
+        } else {
+            format!("{:.5}", metric.score)
         }
     }
 
-    fn compact_unit(unit: &str) -> String {
-        match unit {
-            "normalized_code^2" => "norm^2".to_string(),
-            "normalized_code" => "norm".to_string(),
-            other => other.to_string(),
-        }
+    fn metric_row_style(metric: &MetricOutput) -> Style {
+        direction_style(metric.direction)
+    }
+
+    fn metric_bar(metric: &MetricOutput) -> String {
+        let normalized = match metric.direction {
+            imq::metrics::Direction::HigherIsBetter => {
+                if metric.score.is_infinite() {
+                    1.0
+                } else if metric.score.is_finite() {
+                    (metric.score.abs() / (metric.score.abs() + 1.0)).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            }
+            imq::metrics::Direction::LowerIsBetter => {
+                if metric.score.is_finite() {
+                    (1.0 / (1.0 + metric.score.abs())).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            }
+            imq::metrics::Direction::Neutral => 0.5,
+        };
+        let filled = (normalized * 10.0).round() as usize;
+        format!("[{}{}]", "#".repeat(filled), ".".repeat(10 - filled))
     }
 
     fn fit_label(fit: imq::preview::FitMode) -> &'static str {
