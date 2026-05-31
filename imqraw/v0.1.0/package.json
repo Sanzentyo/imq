@@ -1,0 +1,17 @@
+{
+  "name": "@sanzentyo/imqraw-web",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./imqraw.js",
+    "./wasm": "./imqraw_wasm.js"
+  },
+  "files": [
+    "imqraw.js",
+    "imqraw.d.ts",
+    "imqraw_wasm.js",
+    "imqraw_wasm.d.ts",
+    "imqraw_wasm_bg.wasm",
+    "VERSION"
+  ]
+}

@@ -1,0 +1,12 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>imqraw v0.1.0</title>
+<script type="module">
+  import { init, encodeRgba8, imqraw_image_count } from "./imqraw.js";
+  await init();
+  const bytes = encodeRgba8(new Uint8Array([0, 0, 0, 255]), 1, 1, {
+    label: "smoke",
+    tags: ["web"],
+  });
+  document.body.textContent = "imqraw v0.1.0 smoke image count: " + imqraw_image_count(bytes);
+</script>

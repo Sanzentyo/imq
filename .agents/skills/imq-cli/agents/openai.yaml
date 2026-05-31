@@ -1,4 +1,0 @@
-interface:
-  display_name: "imq CLI"
-  short_description: "Use imq for image and video quality checks"
-  default_prompt: "Use $imq-cli to compare images or videos with the imq command-line tool."
