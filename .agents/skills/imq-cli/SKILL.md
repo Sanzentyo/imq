@@ -70,7 +70,10 @@ rows, probe rows, image statistics, and format hints to a SQLite database.
 
 Use `-` as an image input to read encoded image bytes from stdin. For raw packed
 stdin bytes, pass `--stdin-format raw` with `--raw-width`, `--raw-height`, and
-`--raw-pixel-format rgb8|rgba8|bgr8|bgra8|luma8`.
+`--raw-pixel-format rgb8|rgba8|bgr8|bgra8|luma8`. Bit-packed grayscale and mask
+stdin is accepted as `gray1-lsb`, `gray1-msb`, `gray2-lsb`, `gray2-msb`,
+`gray4-lsb`, or `gray4-msb`; these inputs are decoded into `Luma8`. Use
+`--raw-stride BYTES` when raw rows include padding.
 
 For multi-image stdin/stdout pipelines, use `imq pack` to create an uncompressed
 lossless `imqraw` bundle with labels and tags:

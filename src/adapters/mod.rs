@@ -6,6 +6,8 @@
 use crate::Result;
 use crate::frame::{FrameView, PixelFormat, PlaneView, Unchecked, Validated};
 
+pub mod bit_packed_gray;
+
 #[cfg(feature = "image-codecs")]
 #[cfg_attr(docsrs, doc(cfg(feature = "image-codecs")))]
 pub mod image_crate;

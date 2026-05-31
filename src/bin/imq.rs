@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use imq::adapters::bit_packed_gray::{BitOrder, BitPackedGrayFormat};
 use imq::adapters::image_crate;
 use imq::metrics::MetricSet;
 use imq::report::{ComparisonReport, VideoReport};
@@ -275,6 +276,9 @@ struct StdinImageArgs {
     /// Raw stdin pixel format.
     #[arg(long, value_enum, default_value_t = RawPixelFormatArg::Rgba8)]
     raw_pixel_format: RawPixelFormatArg,
+    /// Raw stdin row stride in bytes. Defaults to the tight row size for the selected raw pixel format.
+    #[arg(long)]
+    raw_stride: Option<usize>,
     /// Zero-based image index used when --stdin-format imqraw feeds one image argument.
     #[arg(long)]
     stdin_index: Option<usize>,
@@ -312,6 +316,12 @@ enum RawPixelFormatArg {
     Bgr8,
     Bgra8,
     Luma8,
+    Gray1Lsb,
+    Gray1Msb,
+    Gray2Lsb,
+    Gray2Msb,
+    Gray4Lsb,
+    Gray4Msb,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -680,13 +690,47 @@ fn load_image_input(path: &Path, stdin: &StdinImageArgs) -> Result<imq::FrameOwn
             let height = stdin
                 .raw_height
                 .ok_or_else(|| anyhow::anyhow!("--raw-height is required for raw stdin"))?;
-            Ok(imq::FrameOwned::packed_tight(
+            decode_raw_stdin_frame(
                 bytes,
                 width,
                 height,
-                stdin.raw_pixel_format.into(),
-            )?)
+                stdin.raw_pixel_format,
+                stdin.raw_stride,
+            )
         }
+    }
+}
+
+fn decode_raw_stdin_frame(
+    bytes: Vec<u8>,
+    width: u32,
+    height: u32,
+    pixel_format: RawPixelFormatArg,
+    stride: Option<usize>,
+) -> Result<imq::FrameOwned> {
+    if let Some(format) = pixel_format.bit_packed_gray_format()? {
+        return Ok(imq::adapters::bit_packed_gray::decode_bit_packed_gray(
+            &bytes, width, height, format, stride,
+        )?);
+    }
+    let pixel_format = pixel_format
+        .pixel_format()
+        .ok_or_else(|| anyhow::anyhow!("raw pixel format is not a packed imq pixel format"))?;
+    if let Some(stride) = stride {
+        Ok(imq::FrameOwned::packed(
+            bytes,
+            width,
+            height,
+            pixel_format,
+            stride,
+        )?)
+    } else {
+        Ok(imq::FrameOwned::packed_tight(
+            bytes,
+            width,
+            height,
+            pixel_format,
+        )?)
     }
 }
 
@@ -761,15 +805,85 @@ fn image_input_label(path: &Path) -> String {
     }
 }
 
-impl From<RawPixelFormatArg> for imq::PixelFormat {
-    fn from(value: RawPixelFormatArg) -> Self {
-        match value {
-            RawPixelFormatArg::Rgb8 => Self::Rgb8,
-            RawPixelFormatArg::Rgba8 => Self::Rgba8,
-            RawPixelFormatArg::Bgr8 => Self::Bgr8,
-            RawPixelFormatArg::Bgra8 => Self::Bgra8,
-            RawPixelFormatArg::Luma8 => Self::Luma8,
+impl RawPixelFormatArg {
+    fn pixel_format(self) -> Option<imq::PixelFormat> {
+        match self {
+            Self::Rgb8 => Some(imq::PixelFormat::Rgb8),
+            Self::Rgba8 => Some(imq::PixelFormat::Rgba8),
+            Self::Bgr8 => Some(imq::PixelFormat::Bgr8),
+            Self::Bgra8 => Some(imq::PixelFormat::Bgra8),
+            Self::Luma8 => Some(imq::PixelFormat::Luma8),
+            Self::Gray1Lsb
+            | Self::Gray1Msb
+            | Self::Gray2Lsb
+            | Self::Gray2Msb
+            | Self::Gray4Lsb
+            | Self::Gray4Msb => None,
         }
+    }
+
+    fn bit_packed_gray_format(self) -> Result<Option<BitPackedGrayFormat>> {
+        let format = match self {
+            Self::Gray1Lsb => Some(BitPackedGrayFormat::new(1, BitOrder::LsbFirst)?),
+            Self::Gray1Msb => Some(BitPackedGrayFormat::new(1, BitOrder::MsbFirst)?),
+            Self::Gray2Lsb => Some(BitPackedGrayFormat::new(2, BitOrder::LsbFirst)?),
+            Self::Gray2Msb => Some(BitPackedGrayFormat::new(2, BitOrder::MsbFirst)?),
+            Self::Gray4Lsb => Some(BitPackedGrayFormat::new(4, BitOrder::LsbFirst)?),
+            Self::Gray4Msb => Some(BitPackedGrayFormat::new(4, BitOrder::MsbFirst)?),
+            Self::Rgb8 | Self::Rgba8 | Self::Bgr8 | Self::Bgra8 | Self::Luma8 => None,
+        };
+        Ok(format)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plane_bytes(frame: &imq::FrameOwned) -> &[u8] {
+        &frame.owned_planes()[0].data
+    }
+
+    #[test]
+    fn raw_stdin_gray1_lsb_decodes_to_luma8() {
+        let frame =
+            decode_raw_stdin_frame(vec![0b0000_1011], 4, 1, RawPixelFormatArg::Gray1Lsb, None)
+                .unwrap();
+
+        assert_eq!(frame.format().pixel_format, imq::PixelFormat::Luma8);
+        assert_eq!(plane_bytes(&frame), [255, 255, 0, 255]);
+    }
+
+    #[test]
+    fn raw_stdin_gray4_msb_honors_stride() {
+        let frame = decode_raw_stdin_frame(
+            vec![0x12, 0xff, 0x34, 0xee],
+            2,
+            2,
+            RawPixelFormatArg::Gray4Msb,
+            Some(2),
+        )
+        .unwrap();
+
+        assert_eq!(plane_bytes(&frame), [17, 34, 51, 68]);
+    }
+
+    #[test]
+    fn bit_packed_raw_roundtrips_through_imqraw_as_luma8() {
+        let frame =
+            decode_raw_stdin_frame(vec![0b0000_1011], 4, 1, RawPixelFormatArg::Gray1Lsb, None)
+                .unwrap();
+        let bundle = imq::RawImageBundle::new(vec![imq::RawImageRecord::new(
+            Some("mask".to_string()),
+            vec!["mask".to_string()],
+            frame,
+        )]);
+        let decoded =
+            imq::decode_imqraw_bundle(&imq::encode_imqraw_bundle(&bundle).unwrap()).unwrap();
+        let record = decoded.select_tag("mask").unwrap();
+
+        assert_eq!(record.frame.format().pixel_format, imq::PixelFormat::Luma8);
+        assert_eq!(plane_bytes(&record.frame), [255, 255, 0, 255]);
     }
 }
 
