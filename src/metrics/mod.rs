@@ -11,7 +11,7 @@ mod basic;
 mod ssim;
 
 pub use basic::{Mae, MaxAbsoluteError, Mse, Psnr, Rmse};
-pub use ssim::Ssim;
+pub use ssim::{Ssim, WindowedSsim};
 
 /// Whether a higher value means better quality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,7 +97,7 @@ pub trait Metric: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MetricSpec {
-    /// Metric name: `mse`, `rmse`, `psnr`, `mae`, `maxae`, `ssim`.
+    /// Metric name: `mse`, `rmse`, `psnr`, `mae`, `maxae`, `ssim`, `wssim`.
     pub name: String,
     /// Sample domain.
     pub domain: SampleDomain,
@@ -149,6 +149,9 @@ impl MetricSpec {
             "mae" => Ok(Box::new(Mae::new(self.domain))),
             "maxae" | "max_ae" | "max-error" => Ok(Box::new(MaxAbsoluteError::new(self.domain))),
             "ssim" => Ok(Box::new(Ssim::new())),
+            "wssim" | "windowed-ssim" | "windowed_ssim" | "ssim-windowed" | "ssim_windowed" => {
+                Ok(Box::new(WindowedSsim::new()))
+            }
             other => Err(Error::UnknownMetric(other.to_string())),
         }
     }
@@ -885,5 +888,19 @@ mod tests {
         let f = FrameOwned::packed_tight(vec![10, 20, 30, 255], 1, 1, PixelFormat::Rgba8).unwrap();
         let s = aggregate_error(&f.as_view(), &f.as_view(), SampleDomain::Color).unwrap();
         assert_eq!(s.mse(), 0.0);
+    }
+
+    #[test]
+    fn parses_windowed_ssim_aliases() {
+        for name in [
+            "wssim",
+            "windowed-ssim",
+            "windowed_ssim",
+            "ssim-windowed",
+            "ssim_windowed",
+        ] {
+            let metric = MetricSpec::parse(name).unwrap().build().unwrap();
+            assert_eq!(metric.name(), "wssim");
+        }
     }
 }

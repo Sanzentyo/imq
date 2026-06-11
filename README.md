@@ -4,7 +4,7 @@
 
 The crate is intended as a practical starting point for full-reference evaluation pipelines:
 
-- still-image metrics: MSE, RMSE, PSNR, MAE, max absolute error, global SSIM;
+- still-image metrics: MSE, RMSE, PSNR, MAE, max absolute error, global SSIM, and windowed luma SSIM (`wssim`);
 - frame and video comparison through `ffmpeg`/`ffprobe` rawvideo pipes;
 - `image` crate adapters for broad still-image decoding;
 - zero-copy borrowed inputs for `&[u8]`, camera buffers, planar YUV, NV12, packed RGB/RGBA/BGR/BGRA, and owned `Vec<u8>`;
@@ -39,7 +39,7 @@ itself is available without codec adapter conversions.
 Compare images or videos with automatic handling based on file extensions:
 
 ```bash
-cargo run --bin imq -- compare reference.png distorted.webp --metrics psnr,ssim,mse,mae,maxae
+cargo run --bin imq -- compare reference.png distorted.webp --metrics psnr,ssim,wssim,mse,mae,maxae
 cargo run --bin imq -- compare reference.mp4 distorted.mp4 --every 30 --max-frames 120
 cargo run --bin imq -- c image.png -s --format yaml
 cargo run --bin imq -- compare reference.png distorted.webp -s --format json
@@ -54,7 +54,7 @@ cargo run --bin imq -- bundle-info pair.imqraw --format json
 Explicit still-image comparison remains available:
 
 ```bash
-cargo run --bin imq -- image reference.png distorted.webp --metrics psnr,ssim,mse,mae,maxae
+cargo run --bin imq -- image reference.png distorted.webp --metrics psnr,ssim,wssim,mse,mae,maxae
 cargo run --bin imq -- image reference.png distorted.webp --metrics psnr:color,mse:all --json
 cargo run --bin imq -- image reference.png distorted.webp --format yaml --output report.yaml
 cargo run --bin imq -- image reference.png distorted.webp --format csv --sqlite reports.sqlite
@@ -195,7 +195,7 @@ let distorted_rgba: &[u8] = &[0, 0, 0, 255, 250, 250, 250, 255];
 let reference = FrameView::packed(reference_rgba, 2, 1, PixelFormat::Rgba8, 2 * 4)?.validate()?;
 let distorted = FrameView::packed(distorted_rgba, 2, 1, PixelFormat::Rgba8, 2 * 4)?.validate()?;
 
-let metrics = MetricSet::from_csv("psnr:color,ssim,mse")?;
+let metrics = MetricSet::from_csv("psnr:color,ssim,wssim,mse")?;
 let report = metrics.compare(&reference, &distorted)?;
 # Ok::<(), imq::Error>(())
 ```
@@ -331,7 +331,7 @@ See `docs/architecture.md`, `docs/metrics.md`, `docs/ffmpeg.md`, and `docs/nn-bu
 
 ## Current limitations
 
-- SSIM is a global luma implementation, not windowed MS-SSIM.
+- `ssim` is a global luma implementation. `wssim` provides CPU non-overlapping windowed luma SSIM, but multi-scale SSIM is not implemented yet.
 - GPU acceleration currently covers RGBA8 MSE, RMSE, PSNR, MAE, and maxAE error statistics. SSIM still runs on CPU.
 - Neural metrics provide Burn integration and feature-distance scaffolding; model definitions/checkpoints are caller-supplied.
 - The `ffmpeg` module uses external executables by path. The core library remains pure Rust and Sans I/O.

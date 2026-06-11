@@ -66,7 +66,7 @@ struct ImageCmd {
     reference: PathBuf,
     /// Distorted/test image.
     distorted: PathBuf,
-    /// Comma-separated metrics: psnr,ssim,mse,rmse,mae,maxae; optional domains: psnr:color,mse:all.
+    /// Comma-separated metrics: psnr,ssim,wssim,mse,rmse,mae,maxae; optional domains: psnr:color,mse:all.
     #[arg(short, long, default_value = "psnr,ssim,mse,mae,maxae")]
     metrics: String,
     /// Print JSON instead of a text table.

@@ -1,6 +1,6 @@
 ---
 name: imq-cli
-description: Use the `imq` command-line tool for full-reference image and video quality evaluation, and reference imqraw Rust/JavaScript/TypeScript examples when needed. Trigger when Codex needs to compare reference/distorted images or videos, compute PSNR/SSIM/MSE/RMSE/MAE/maxAE, produce JSON metric reports, list supported still-image formats, probe video metadata, extract video frames, or use imqraw from Rust, JS, or TS.
+description: Use the `imq` command-line tool for full-reference image and video quality evaluation, and reference imqraw Rust/JavaScript/TypeScript examples when needed. Trigger when Codex needs to compare reference/distorted images or videos, compute PSNR/SSIM/windowed SSIM/MSE/RMSE/MAE/maxAE, produce JSON metric reports, list supported still-image formats, probe video metadata, extract video frames, or use imqraw from Rust, JS, or TS.
 ---
 
 # imq CLI
@@ -30,7 +30,7 @@ histograms, and visual tendency labels. With a single image plus `--stats`,
 (`stat`/`s`) when only image statistics are needed.
 
 ```bash
-imq compare reference.png distorted.png --metrics psnr,ssim,mse,mae,maxae
+imq compare reference.png distorted.png --metrics psnr,ssim,wssim,mse,mae,maxae
 imq c reference.png distorted.png -s --format json
 imq compare reference.mp4 distorted.mp4 --every 30 --max-frames 120
 imq compare image.png -s --format yaml
@@ -47,11 +47,17 @@ imq bundle-info pair.imqraw --format json
 Use `image` when the caller explicitly wants the still-image path:
 
 ```bash
-imq image reference.png distorted.png --metrics psnr,ssim,mse,mae,maxae
+imq image reference.png distorted.png --metrics psnr,ssim,wssim,mse,mae,maxae
 imq image reference.png distorted.png --metrics psnr:color,mse:all --json
 imq image reference.png distorted.png --format yaml --output report.yaml
 imq image reference.png distorted.png --format csv --sqlite reports.sqlite
 ```
+
+Metric selection:
+
+- `ssim`: global luma SSIM over the whole frame.
+- `wssim`: non-overlapping 8x8 windowed luma SSIM. Use this when local structure changes should count more than a whole-frame aggregate. Aliases are `windowed-ssim`, `windowed_ssim`, `ssim-windowed`, and `ssim_windowed`.
+- `mse`, `rmse`, `psnr`, `mae`, and `maxae`: error metrics over the selected sample domain.
 
 Metric domains:
 
@@ -59,6 +65,8 @@ Metric domains:
 - `color` or `rgb`: RGB/color channels, alpha ignored
 - `all`: every stored component
 - `planeN`: raw plane by index, such as `mse:plane0`
+
+`ssim` and `wssim` currently operate on luma even when a domain suffix is present.
 
 Use `imq formats` to list the image adapter's supported format hints.
 
@@ -97,7 +105,7 @@ distorted. Stdin can be used for both image arguments only with
 Video commands require working `ffmpeg` and `ffprobe` executables. Use `video` for frame-by-frame RGBA decoding through ffmpeg:
 
 ```bash
-imq video reference.mp4 distorted.mp4 --metrics psnr,ssim,mse --every 30 --max-frames 120
+imq video reference.mp4 distorted.mp4 --metrics psnr,ssim,wssim,mse --every 30 --max-frames 120
 imq video reference.mp4 distorted.mp4 --width 1920 --height 1080 --json
 imq video reference.mp4 distorted.mp4 --format toml --output video-report.toml
 ```
@@ -130,7 +138,7 @@ this skill.
 
 ## Reporting Results
 
-Report exact commands that passed or failed. If a command depends on missing external tools, say which executable is missing. For metric outputs, summarize the metric names, compared dimensions, frame count, and whether JSON/text output was requested.
+Report exact commands that passed or failed. If a command depends on missing external tools, say which executable is missing. For metric outputs, summarize the metric names, compared dimensions, frame count, and whether JSON/text output was requested. For `wssim`, also mention that it is non-overlapping windowed luma SSIM and include the reported window count when JSON/details are available.
 
 ## License
 

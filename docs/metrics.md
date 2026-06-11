@@ -7,7 +7,8 @@
 - `psnr` — `20 * log10(max_sample / sqrt(MSE))`; returns infinity for identical samples.
 - `mae` — mean absolute error.
 - `maxae` — maximum absolute error.
-- `ssim` — global luma SSIM.
+- `ssim` — global luma SSIM over the whole frame.
+- `wssim` — sample-weighted mean of non-overlapping windowed luma SSIM values. Aliases: `windowed-ssim`, `windowed_ssim`, `ssim-windowed`, and `ssim_windowed`.
 
 Metric names can include domains:
 
@@ -17,7 +18,12 @@ psnr:luma
 psnr:color    # RGB/luma-expanded color channels, alpha ignored
 mse:all       # all stored channels; for YUV requires matching YUV layout
 mse:plane0    # raw plane comparison
+wssim         # non-overlapping 8x8 luma windows by default
 ```
+
+`ssim` and `wssim` currently operate on perceptual luma. Domain suffixes are
+accepted by the metric parser for consistency, but these SSIM variants do not
+switch to color/all/plane domains.
 
 ## Sample domains
 
