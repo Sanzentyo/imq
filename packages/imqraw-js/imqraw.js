@@ -1,4 +1,5 @@
 import initWasm, {
+  encode_imqraw_image,
   encode_imqraw_rgba8,
   encode_imqraw_rgba8_bundle,
   imqraw_image_count,
@@ -6,6 +7,27 @@ import initWasm, {
 } from "./imqraw_wasm.js";
 
 export { initWasm, imqraw_image_count, imqraw_version };
+
+export const PixelFormatCode = Object.freeze({
+  Luma8: 1,
+  Rgb8: 2,
+  Rgba8: 3,
+  Bgr8: 4,
+  Bgra8: 5,
+  Luma16Le: 6,
+  Rgb16Le: 7,
+  Rgba16Le: 8,
+  RgbF32: 9,
+  RgbaF32: 10,
+  Yuv444p8: 11,
+  Yuv422p8: 12,
+  Yuv420p8: 13,
+  Nv12: 14,
+  Hsv8: 15,
+  Hsva8: 16,
+  Binary1Lsb: 17,
+  Binary1Msb: 18,
+});
 
 export async function init(input) {
   return input === undefined ? initWasm() : initWasm({ module_or_path: input });
@@ -30,6 +52,18 @@ export function encodeBundle(images) {
       label: image.label ?? "",
       tags: image.tags ?? [],
     })),
+  );
+}
+
+export function encodeImage(data, width, height, pixelFormat, options = {}) {
+  return encode_imqraw_image(
+    data,
+    width,
+    height,
+    pixelFormat,
+    options.stride ?? 0,
+    options.label ?? "",
+    options.tags ?? [],
   );
 }
 

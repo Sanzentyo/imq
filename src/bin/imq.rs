@@ -5,11 +5,18 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use imq::adapters::bit_packed_gray::{BitOrder, BitPackedGrayFormat};
 use imq::adapters::image_crate;
 use imq::metrics::MetricSet;
-use imq::report::{ComparisonReport, VideoReport};
-use imq::{Dimensions, MetricOutput};
+use imq::report::{
+    ComparisonGateReport, ComparisonInput, ComparisonReport, ComparisonThresholds,
+    VideoFramePairComparisonReport, VideoReport,
+};
+use imq::{
+    Dimensions, InputSpec, MetricOutput, RemoteFrameFormat, RemoteOptions, RemoteTransferMode,
+    SshInput, VideoFramePair,
+};
 use serde::Serialize;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
 
 #[derive(Debug, Parser)]
 #[command(name = "imq")]
@@ -24,10 +31,10 @@ struct Cli {
 enum Command {
     /// Compare or inspect media, automatically selecting image/video handling by extension.
     #[command(alias = "c", alias = "cmp")]
-    Compare(CompareCmd),
+    Compare(Box<CompareCmd>),
     /// Compare two still images decoded by the image crate.
     #[command(alias = "i")]
-    Image(ImageCmd),
+    Image(Box<ImageCmd>),
     /// Report still-image statistics, color balance, histograms, and tendencies.
     #[command(alias = "s", alias = "stat")]
     Stats(StatsCmd),
@@ -54,7 +61,7 @@ enum Command {
     BundleInfo(BundleInfoCmd),
     /// Preview images or video thumbnails in the terminal.
     #[command(alias = "p")]
-    Preview(PreviewCmd),
+    Preview(Box<PreviewCmd>),
     /// Interactive terminal comparison view.
     #[command(alias = "t")]
     Tui(TuiCmd),
@@ -80,6 +87,8 @@ struct ImageCmd {
     histogram_bins: usize,
     #[command(flatten)]
     stdin: StdinImageArgs,
+    #[command(flatten)]
+    gate: GateArgs,
     #[command(flatten)]
     output: OutputArgs,
 }
@@ -134,6 +143,18 @@ struct CompareCmd {
     histogram_bins: usize,
     #[command(flatten)]
     stdin: StdinImageArgs,
+    #[command(flatten)]
+    gate: GateArgs,
+    #[command(flatten)]
+    remote: RemoteArgs,
+    /// Extract and compare a single video frame. Shorthand for --video-frames N.
+    #[cfg(feature = "ffmpeg")]
+    #[arg(long, conflicts_with = "video_frames")]
+    video_frame: Option<u64>,
+    /// Ordered video frame pairs, e.g. 0:1,30:31 or '(0,1),(30,31)'.
+    #[cfg(feature = "ffmpeg")]
+    #[arg(long, conflicts_with_all = ["video_frame", "every", "max_frames"])]
+    video_frames: Option<String>,
     /// Compare every Nth decoded video frame.
     #[cfg(feature = "ffmpeg")]
     #[arg(long, default_value_t = 1)]
@@ -169,6 +190,113 @@ struct CompareCmd {
     output: OutputArgs,
 }
 
+#[derive(Debug, Args, Clone)]
+struct RemoteArgs {
+    /// Shorthand host for non-URI remote paths.
+    #[arg(long)]
+    ssh: Option<String>,
+    /// Remote transfer mode. The default never falls back to copying.
+    #[arg(long, value_enum, default_value_t = RemoteTransferModeArg::Stream)]
+    remote_transfer: RemoteTransferModeArg,
+    /// Remote video frame stream format.
+    #[arg(long, value_enum, default_value_t = RemoteFrameFormatArg::Png)]
+    remote_frame_format: RemoteFrameFormatArg,
+    /// SSH executable.
+    #[arg(long, default_value = "ssh")]
+    ssh_bin: PathBuf,
+    /// SCP executable.
+    #[arg(long, default_value = "scp")]
+    scp_bin: PathBuf,
+    /// SSH connect timeout in seconds.
+    #[arg(long)]
+    ssh_connect_timeout: Option<u64>,
+    /// Pass BatchMode=yes to SSH.
+    #[arg(long)]
+    ssh_batch_mode: bool,
+    /// Local directory for explicit remote copy modes.
+    #[arg(long)]
+    remote_copy_dir: Option<PathBuf>,
+    /// Keep temporary copy-mode files.
+    #[arg(long)]
+    keep_temp: bool,
+    /// Maximum remote stdout bytes to read.
+    #[arg(long, default_value_t = 512 * 1024 * 1024)]
+    remote_max_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RemoteTransferModeArg {
+    Stream,
+    CopyInput,
+    CopyFrame,
+    CopySource,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RemoteFrameFormatArg {
+    Png,
+    Rgba,
+}
+
+impl RemoteArgs {
+    fn options(&self) -> RemoteOptions {
+        RemoteOptions {
+            transfer: match self.remote_transfer {
+                RemoteTransferModeArg::Stream => RemoteTransferMode::Stream,
+                RemoteTransferModeArg::CopyInput => RemoteTransferMode::CopyInput,
+                RemoteTransferModeArg::CopyFrame => RemoteTransferMode::CopyFrame,
+                RemoteTransferModeArg::CopySource => RemoteTransferMode::CopySource,
+            },
+            frame_format: match self.remote_frame_format {
+                RemoteFrameFormatArg::Png => RemoteFrameFormat::Png,
+                RemoteFrameFormatArg::Rgba => RemoteFrameFormat::Rgba,
+            },
+            ssh: self.ssh_bin.clone(),
+            scp: self.scp_bin.clone(),
+            connect_timeout_seconds: self.ssh_connect_timeout,
+            batch_mode: self.ssh_batch_mode,
+            copy_dir: self.remote_copy_dir.clone(),
+            keep_temp: self.keep_temp,
+            max_bytes: self.remote_max_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Args, Clone, Default)]
+struct GateArgs {
+    /// Metric key or domain used for pass/fail gates, e.g. psnr:rgb-visible or rgb-visible.
+    #[arg(long)]
+    selected_metric: Option<String>,
+    /// Fail when the selected metric score is below this value.
+    #[arg(long)]
+    fail_under: Option<f64>,
+    /// Fail when the selected metric max channel delta exceeds this 8-bit code value.
+    #[arg(long)]
+    max_selected_channel_delta: Option<f64>,
+    /// Fail when the maximum alpha delta exceeds this 8-bit code value.
+    #[arg(long)]
+    max_alpha_delta: Option<u8>,
+    /// Fail when alpha mismatch count exceeds this value.
+    #[arg(long)]
+    max_alpha_mismatches: Option<u64>,
+    /// Fail when alpha mismatches above one LSB exceed this value.
+    #[arg(long)]
+    max_alpha_mismatches_beyond_one_lsb: Option<u64>,
+}
+
+impl GateArgs {
+    fn thresholds(&self) -> ComparisonThresholds {
+        ComparisonThresholds {
+            selected_metric: self.selected_metric.clone(),
+            fail_under: self.fail_under,
+            max_selected_channel_delta: self.max_selected_channel_delta,
+            max_alpha_delta: self.max_alpha_delta,
+            max_alpha_mismatches: self.max_alpha_mismatches,
+            max_alpha_mismatches_beyond_one_lsb: self.max_alpha_mismatches_beyond_one_lsb,
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 struct PreviewCmd {
     /// Image or video files to preview.
@@ -200,6 +328,11 @@ struct PreviewCmd {
     /// ffmpeg executable for video thumbnails.
     #[arg(long, default_value = "ffmpeg")]
     ffmpeg: PathBuf,
+    /// Remote video frame to preview.
+    #[arg(long)]
+    video_frame: Option<u64>,
+    #[command(flatten)]
+    remote: RemoteArgs,
     /// Display at exact decoded pixel dimensions instead of fitting terminal area.
     #[arg(short, long)]
     actual_size: bool,
@@ -316,6 +449,10 @@ enum RawPixelFormatArg {
     Bgr8,
     Bgra8,
     Luma8,
+    Hsv8,
+    Hsva8,
+    Binary1Lsb,
+    Binary1Msb,
     Gray1Lsb,
     Gray1Msb,
     Gray2Lsb,
@@ -439,8 +576,8 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Compare(cmd) => run_compare(cmd),
-        Command::Image(cmd) => run_image(cmd),
+        Command::Compare(cmd) => run_compare(*cmd),
+        Command::Image(cmd) => run_image(*cmd),
         Command::Stats(cmd) => run_stats(cmd),
         #[cfg(feature = "ffmpeg")]
         Command::Video(cmd) => run_video(cmd),
@@ -451,7 +588,7 @@ fn main() -> Result<()> {
         Command::Formats(cmd) => run_formats(cmd),
         Command::Pack(cmd) => run_pack(cmd),
         Command::BundleInfo(cmd) => run_bundle_info(cmd),
-        Command::Preview(cmd) => run_preview(cmd),
+        Command::Preview(cmd) => run_preview(*cmd),
         Command::Tui(cmd) => run_tui(cmd),
     }
 }
@@ -480,16 +617,20 @@ fn run_compare(cmd: CompareCmd) -> Result<()> {
         bail!("DISTORTED is required unless --stats is used for a single image")
     };
 
-    let reference_is_video = is_video_path(&cmd.reference);
-    let distorted_is_video = is_video_path(distorted);
+    let reference = parse_input_spec(&cmd.reference, &cmd.remote)?;
+    let distorted_input = parse_input_spec(distorted, &cmd.remote)?;
+    let reference_is_video = is_video_input(&reference);
+    let distorted_is_video = is_video_input(&distorted_input);
     match (reference_is_video, distorted_is_video) {
         (false, false) => {
-            let (report, stats) = compare_image_paths(
-                &cmd.reference,
-                distorted,
+            let (report, stats) = compare_image_inputs(
+                &reference,
+                &distorted_input,
                 &cmd.metrics,
                 cmd.stdin,
                 cmd.stats.then_some(cmd.histogram_bins),
+                cmd.gate.thresholds(),
+                &cmd.remote.options(),
             )?;
             write_sqlite_report(cmd.output.sqlite.as_deref(), SqlReport::Image(&report))?;
             if let Some(stats) = &stats {
@@ -499,19 +640,21 @@ fn run_compare(cmd: CompareCmd) -> Result<()> {
             if let Some(stats) = stats {
                 emit_image_comparison_stats_report(
                     &ImageComparisonStatsReport {
-                        comparison: report,
+                        comparison: report.clone(),
                         stats,
                     },
                     output_format(cmd.json, cmd.output.format),
                     &cmd.output,
-                )
+                )?;
             } else {
                 emit_comparison_report(
                     &report,
                     output_format(cmd.json, cmd.output.format),
                     &cmd.output,
-                )
+                )?;
             }
+            exit_if_gate_failed(&report);
+            Ok(())
         }
         (true, true) => {
             if cmd.stats {
@@ -519,20 +662,59 @@ fn run_compare(cmd: CompareCmd) -> Result<()> {
             }
             #[cfg(feature = "ffmpeg")]
             {
-                run_video(VideoCmd {
-                    reference: cmd.reference,
-                    distorted: distorted.clone(),
-                    metrics: cmd.metrics,
-                    every: cmd.every,
-                    max_frames: cmd.max_frames,
-                    width: cmd.width,
-                    height: cmd.height,
-                    ffmpeg: cmd.ffmpeg,
-                    ffprobe: cmd.ffprobe,
-                    stream: cmd.stream,
-                    json: cmd.json,
-                    output: cmd.output,
-                })
+                let frame_pairs = selected_video_frame_pairs(cmd.video_frame, cmd.video_frames)?;
+                if let Some(pairs) = frame_pairs {
+                    if cmd.every != 1 || cmd.max_frames.is_some() {
+                        bail!("--video-frame(s) cannot be combined with --every or --max-frames")
+                    }
+                    let report = compare_video_frame_pair_inputs(
+                        &reference,
+                        &distorted_input,
+                        &pairs,
+                        &cmd.metrics,
+                        FfmpegCliOptions {
+                            ffmpeg: cmd.ffmpeg,
+                            ffprobe: cmd.ffprobe,
+                            stream: cmd.stream,
+                            width: cmd.width,
+                            height: cmd.height,
+                        },
+                        &cmd.remote.options(),
+                    )?;
+                    write_sqlite_report(
+                        cmd.output.sqlite.as_deref(),
+                        SqlReport::VideoPairs(&report),
+                    )?;
+                    emit_video_pair_report(
+                        &report,
+                        output_format(cmd.json, cmd.output.format),
+                        &cmd.output,
+                    )
+                } else if reference.is_local() && distorted_input.is_local() {
+                    let (InputSpec::Local(reference_path), InputSpec::Local(distorted_path)) =
+                        (reference, distorted_input)
+                    else {
+                        unreachable!("checked is_local")
+                    };
+                    run_video(VideoCmd {
+                        reference: reference_path,
+                        distorted: distorted_path,
+                        metrics: cmd.metrics,
+                        every: cmd.every,
+                        max_frames: cmd.max_frames,
+                        width: cmd.width,
+                        height: cmd.height,
+                        ffmpeg: cmd.ffmpeg,
+                        ffprobe: cmd.ffprobe,
+                        stream: cmd.stream,
+                        json: cmd.json,
+                        output: cmd.output,
+                    })
+                } else {
+                    bail!(
+                        "remote video comparison requires --video-frame or --video-frames. Full remote video comparison is intentionally not enabled by default."
+                    )
+                }
             }
             #[cfg(not(feature = "ffmpeg"))]
             {
@@ -550,6 +732,7 @@ fn run_image(cmd: ImageCmd) -> Result<()> {
         &cmd.metrics,
         cmd.stdin,
         cmd.stats.then_some(cmd.histogram_bins),
+        cmd.gate.thresholds(),
     )?;
     write_sqlite_report(cmd.output.sqlite.as_deref(), SqlReport::Image(&report))?;
     if let Some(stats) = stats {
@@ -557,7 +740,7 @@ fn run_image(cmd: ImageCmd) -> Result<()> {
         write_sqlite_stats(cmd.output.sqlite.as_deref(), &stats.distorted)?;
         emit_image_comparison_stats_report(
             &ImageComparisonStatsReport {
-                comparison: report,
+                comparison: report.clone(),
                 stats,
             },
             output_format(cmd.json, cmd.output.format),
@@ -570,6 +753,7 @@ fn run_image(cmd: ImageCmd) -> Result<()> {
             &cmd.output,
         )?;
     }
+    exit_if_gate_failed(&report);
     Ok(())
 }
 
@@ -579,59 +763,197 @@ fn compare_image_paths(
     metrics_csv: &str,
     stdin: StdinImageArgs,
     histogram_bins: Option<usize>,
+    thresholds: ComparisonThresholds,
 ) -> Result<(ComparisonReport, Option<ImageComparisonStats>)> {
-    let (reference, distorted, reference_label, distorted_label) = if is_stdin_path(reference_path)
-        && is_stdin_path(distorted_path)
+    let reference = InputSpec::Local(reference_path.to_path_buf());
+    let distorted = InputSpec::Local(distorted_path.to_path_buf());
+    compare_image_inputs(
+        &reference,
+        &distorted,
+        metrics_csv,
+        stdin,
+        histogram_bins,
+        thresholds,
+        &RemoteOptions::default(),
+    )
+}
+
+fn compare_image_inputs(
+    reference_input: &InputSpec,
+    distorted_input: &InputSpec,
+    metrics_csv: &str,
+    stdin: StdinImageArgs,
+    histogram_bins: Option<usize>,
+    thresholds: ComparisonThresholds,
+    remote: &RemoteOptions,
+) -> Result<(ComparisonReport, Option<ImageComparisonStats>)> {
+    let (reference, distorted) = if matches!(reference_input, InputSpec::Stdin)
+        && matches!(distorted_input, InputSpec::Stdin)
         && stdin.stdin_format == StdinImageFormatArg::Imqraw
     {
         load_imqraw_image_pair_from_stdin(&stdin)?
     } else {
-        reject_double_stdin(reference_path, Some(distorted_path))?;
-        let reference = load_image_input(reference_path, &stdin).with_context(|| {
-            format!(
-                "failed to decode reference image `{}`",
-                image_input_label(reference_path)
-            )
-        })?;
-        let distorted = load_image_input(distorted_path, &stdin).with_context(|| {
-            format!(
-                "failed to decode distorted image `{}`",
-                image_input_label(distorted_path)
-            )
-        })?;
-        (
-            reference,
-            distorted,
-            image_input_label(reference_path),
-            image_input_label(distorted_path),
-        )
+        reject_double_stdin_specs(reference_input, Some(distorted_input))?;
+        let reference =
+            load_image_input_spec(reference_input, &stdin, remote).with_context(|| {
+                format!(
+                    "failed to decode reference image `{}`",
+                    reference_input.display_label()
+                )
+            })?;
+        let distorted =
+            load_image_input_spec(distorted_input, &stdin, remote).with_context(|| {
+                format!(
+                    "failed to decode distorted image `{}`",
+                    distorted_input.display_label()
+                )
+            })?;
+        (reference, distorted)
     };
+    let reference_label = reference.display_label.clone();
+    let distorted_label = distorted.display_label.clone();
     let metrics = MetricSet::from_csv(metrics_csv)?;
-    let outputs = metrics.compare(&reference.as_view(), &distorted.as_view())?;
-    let report = ComparisonReport::new(
-        reference.dimensions(),
-        reference.format(),
-        distorted.format(),
+    let outputs = metrics.compare(&reference.frame.as_view(), &distorted.frame.as_view())?;
+    let alpha = imq::alpha_diagnostics(&reference.frame.as_view(), &distorted.frame.as_view())?;
+    let mut report = ComparisonReport::new(
+        reference.frame.dimensions(),
+        reference.frame.format(),
+        distorted.frame.format(),
         outputs,
     )
-    .with_labels(reference_label.clone(), distorted_label.clone());
+    .with_labels(reference_label.clone(), distorted_label.clone())
+    .with_inputs(reference.input.clone(), distorted.input.clone())
+    .with_alpha(alpha);
+    if thresholds_have_any(&thresholds) {
+        let gate = evaluate_gate(&report, thresholds)?;
+        report = report.with_gate(gate);
+    }
     let stats = histogram_bins
         .map(|histogram_bins| {
             Ok::<_, anyhow::Error>(ImageComparisonStats {
                 reference: image_stats_for_frame(
                     reference_label.clone(),
-                    &reference,
+                    &reference.frame,
                     histogram_bins,
                 )?,
                 distorted: image_stats_for_frame(
                     distorted_label.clone(),
-                    &distorted,
+                    &distorted.frame,
                     histogram_bins,
                 )?,
             })
         })
         .transpose()?;
     Ok((report, stats))
+}
+
+fn thresholds_have_any(thresholds: &ComparisonThresholds) -> bool {
+    thresholds.selected_metric.is_some()
+        || thresholds.fail_under.is_some()
+        || thresholds.max_selected_channel_delta.is_some()
+        || thresholds.max_alpha_delta.is_some()
+        || thresholds.max_alpha_mismatches.is_some()
+        || thresholds.max_alpha_mismatches_beyond_one_lsb.is_some()
+}
+
+fn evaluate_gate(
+    report: &ComparisonReport,
+    thresholds: ComparisonThresholds,
+) -> Result<ComparisonGateReport> {
+    let selected = selected_metric(report, thresholds.selected_metric.as_deref())?;
+    let mut failures = Vec::new();
+    if let Some(minimum) = thresholds.fail_under {
+        if selected.score < minimum {
+            failures.push(format!(
+                "{} score {:.8} is below --fail-under {:.8}",
+                selected.name, selected.score, minimum
+            ));
+        }
+    }
+    if let Some(max_delta) = thresholds.max_selected_channel_delta {
+        let actual = selected
+            .details
+            .get("max_channel_delta_code")
+            .copied()
+            .unwrap_or_else(|| {
+                selected
+                    .details
+                    .get("max_channel_delta")
+                    .copied()
+                    .unwrap_or(0.0)
+                    * 255.0
+            });
+        if actual > max_delta {
+            failures.push(format!(
+                "{} max channel delta {:.8} exceeds --max-selected-channel-delta {:.8}",
+                selected.name, actual, max_delta
+            ));
+        }
+    }
+    if let Some(alpha) = report.alpha {
+        if let Some(max_delta) = thresholds.max_alpha_delta {
+            if alpha.max_delta > max_delta {
+                failures.push(format!(
+                    "alpha max delta {} exceeds --max-alpha-delta {}",
+                    alpha.max_delta, max_delta
+                ));
+            }
+        }
+        if let Some(max_mismatches) = thresholds.max_alpha_mismatches {
+            if alpha.mismatch_count > max_mismatches {
+                failures.push(format!(
+                    "alpha mismatches {} exceeds --max-alpha-mismatches {}",
+                    alpha.mismatch_count, max_mismatches
+                ));
+            }
+        }
+        if let Some(max_mismatches) = thresholds.max_alpha_mismatches_beyond_one_lsb {
+            if alpha.mismatches_beyond_one_lsb > max_mismatches {
+                failures.push(format!(
+                    "alpha mismatches beyond one LSB {} exceeds --max-alpha-mismatches-beyond-one-lsb {}",
+                    alpha.mismatches_beyond_one_lsb, max_mismatches
+                ));
+            }
+        }
+    }
+    Ok(ComparisonGateReport {
+        thresholds,
+        passed: failures.is_empty(),
+        failures,
+    })
+}
+
+fn selected_metric<'a>(
+    report: &'a ComparisonReport,
+    requested: Option<&str>,
+) -> Result<&'a MetricOutput> {
+    let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
+        return report
+            .metrics
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("cannot apply threshold gate without metrics"));
+    };
+    report
+        .metrics
+        .iter()
+        .find(|metric| {
+            metric.name == requested
+                || metric
+                    .name
+                    .strip_prefix("psnr:")
+                    .is_some_and(|domain| domain == requested)
+                || metric
+                    .name
+                    .split_once(':')
+                    .is_some_and(|(_, domain)| domain == requested)
+        })
+        .ok_or_else(|| anyhow::anyhow!("selected metric `{requested}` was not computed"))
+}
+
+fn exit_if_gate_failed(report: &ComparisonReport) {
+    if report.gate.as_ref().is_some_and(|gate| !gate.passed) {
+        std::process::exit(1);
+    }
 }
 
 fn run_image_stats(
@@ -666,6 +988,27 @@ fn image_stats_for_frame(
         imq::ImageStatisticsOptions { histogram_bins },
     )?;
     Ok(ImageStatsReport { input, stats })
+}
+
+fn load_image_input_spec(
+    input: &InputSpec,
+    stdin: &StdinImageArgs,
+    remote: &RemoteOptions,
+) -> Result<LoadedImage> {
+    match input {
+        InputSpec::Local(path) => {
+            let frame = image_crate::load_image_path(path)?;
+            Ok(LoadedImage::from_input(input, frame))
+        }
+        InputSpec::Stdin => {
+            let frame = load_image_input(Path::new("-"), stdin)?;
+            Ok(LoadedImage::from_input(input, frame))
+        }
+        InputSpec::Ssh(spec) => {
+            let frame = load_remote_image(spec, remote)?;
+            Ok(LoadedImage::from_input(input, frame))
+        }
+    }
 }
 
 fn load_image_input(path: &Path, stdin: &StdinImageArgs) -> Result<imq::FrameOwned> {
@@ -713,6 +1056,21 @@ fn decode_raw_stdin_frame(
             &bytes, width, height, format, stride,
         )?);
     }
+    if let Some(format) = pixel_format.binary_pixel_format() {
+        let width = usize::try_from(width).map_err(|_| anyhow::anyhow!("width overflows usize"))?;
+        let height =
+            usize::try_from(height).map_err(|_| anyhow::anyhow!("height overflows usize"))?;
+        let tight_stride = width.div_ceil(8);
+        let stride = stride.unwrap_or(tight_stride);
+        if stride < tight_stride {
+            bail!("raw stride {stride} is smaller than tight binary row size {tight_stride}");
+        }
+        return Ok(imq::FrameOwned::new(
+            imq::Dimensions::new(width as u32, height as u32)?,
+            imq::FormatSpec::new(format),
+            vec![imq::OwnedPlane::new(bytes, stride)],
+        )?);
+    }
     let pixel_format = pixel_format
         .pixel_format()
         .ok_or_else(|| anyhow::anyhow!("raw pixel format is not a packed imq pixel format"))?;
@@ -734,9 +1092,32 @@ fn decode_raw_stdin_frame(
     }
 }
 
-fn load_imqraw_image_pair_from_stdin(
-    stdin: &StdinImageArgs,
-) -> Result<(imq::FrameOwned, imq::FrameOwned, String, String)> {
+struct LoadedImage {
+    frame: imq::FrameOwned,
+    display_label: String,
+    input: ComparisonInput,
+}
+
+impl LoadedImage {
+    fn from_input(input: &InputSpec, frame: imq::FrameOwned) -> Self {
+        let display_label = input.display_label();
+        let report_input = match input {
+            InputSpec::Local(path) => ComparisonInput::path(path.display().to_string()),
+            InputSpec::Stdin => ComparisonInput::label("stdin"),
+            InputSpec::Ssh(spec) => ComparisonInput {
+                path: Some(spec.uri()),
+                ..ComparisonInput::default()
+            },
+        };
+        Self {
+            frame,
+            display_label,
+            input: report_input,
+        }
+    }
+}
+
+fn load_imqraw_image_pair_from_stdin(stdin: &StdinImageArgs) -> Result<(LoadedImage, LoadedImage)> {
     let mut bytes = Vec::new();
     std::io::stdin()
         .read_to_end(&mut bytes)
@@ -746,11 +1127,20 @@ fn load_imqraw_image_pair_from_stdin(
     let reference = bundle.select(&reference_selector)?;
     let distorted = bundle.select(&distorted_selector)?;
     Ok((
-        reference.frame.clone(),
-        distorted.frame.clone(),
-        imqraw_record_label(reference, &reference_selector),
-        imqraw_record_label(distorted, &distorted_selector),
+        loaded_imqraw_image(reference, &reference_selector),
+        loaded_imqraw_image(distorted, &distorted_selector),
     ))
+}
+
+fn loaded_imqraw_image(
+    record: &imq::RawImageRecord,
+    selector: &imq::RawImageSelector,
+) -> LoadedImage {
+    LoadedImage {
+        frame: record.frame.clone(),
+        display_label: imqraw_record_label(record, selector),
+        input: imqraw_comparison_input(record, selector),
+    }
 }
 
 fn single_stdin_selector(stdin: &StdinImageArgs) -> imq::RawImageSelector {
@@ -786,8 +1176,198 @@ fn imqraw_record_label(record: &imq::RawImageRecord, selector: &imq::RawImageSel
     })
 }
 
-fn reject_double_stdin(first: &Path, second: Option<&Path>) -> Result<()> {
-    if is_stdin_path(first) && second.is_some_and(is_stdin_path) {
+fn imqraw_comparison_input(
+    record: &imq::RawImageRecord,
+    selector: &imq::RawImageSelector,
+) -> ComparisonInput {
+    match selector {
+        imq::RawImageSelector::Index(index) => {
+            ComparisonInput::imqraw_index(*index, record.label.clone())
+        }
+        imq::RawImageSelector::Tag(tag) => {
+            ComparisonInput::imqraw_tag(tag.clone(), record.label.clone())
+        }
+    }
+}
+
+fn parse_input_spec(path: &Path, remote: &RemoteArgs) -> Result<InputSpec> {
+    let raw = path.to_string_lossy();
+    let input = InputSpec::parse(raw.as_ref())?;
+    if matches!(input, InputSpec::Local(_))
+        && remote.ssh.is_some()
+        && !is_stdin_path(path)
+        && path.is_absolute()
+    {
+        return Ok(InputSpec::Ssh(SshInput {
+            user: None,
+            host: remote.ssh.clone().expect("checked is_some"),
+            port: None,
+            path: raw.into_owned(),
+        }));
+    }
+    Ok(input)
+}
+
+fn is_video_input(input: &InputSpec) -> bool {
+    input
+        .extension()
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "avi" | "m4v" | "mkv" | "mov" | "mp4" | "mpeg" | "mpg" | "webm" | "wmv"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn load_remote_image(spec: &SshInput, remote: &RemoteOptions) -> Result<imq::FrameOwned> {
+    match remote.transfer {
+        RemoteTransferMode::Stream => {
+            let bytes = ssh_capture_stdout(
+                spec,
+                &format!("cat -- {}", imq::shell_quote_posix(&spec.path)),
+                remote,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "remote stream failed for {}.\ncopy fallback is disabled by default.\nUse --remote-transfer copy-input to copy the input explicitly.\n{error}",
+                    spec.uri()
+                )
+            })?;
+            Ok(image_crate::decode_image_bytes(&bytes)?)
+        }
+        RemoteTransferMode::CopyInput => {
+            let temp = scp_to_temp(spec, remote, "input")?;
+            Ok(image_crate::load_image_path(&temp.path)?)
+        }
+        RemoteTransferMode::CopyFrame | RemoteTransferMode::CopySource => {
+            bail!("remote transfer mode is not valid for still image input")
+        }
+    }
+}
+
+fn ssh_capture_stdout(
+    spec: &SshInput,
+    remote_command: &str,
+    remote: &RemoteOptions,
+) -> Result<Vec<u8>> {
+    let mut command = ProcessCommand::new(&remote.ssh);
+    command.arg("-T");
+    if remote.batch_mode {
+        command.args(["-o", "BatchMode=yes"]);
+    }
+    if let Some(timeout) = remote.connect_timeout_seconds {
+        command.args(["-o", &format!("ConnectTimeout={timeout}")]);
+    }
+    if let Some(port) = spec.port {
+        command.args(["-p", &port.to_string()]);
+    }
+    command.arg(spec.ssh_target());
+    command.arg(remote_command);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to start `{}`", remote.ssh.display()))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to capture ssh stdout"))?;
+    let mut bytes = Vec::new();
+    stdout
+        .by_ref()
+        .take(remote.max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    let mut stderr = String::new();
+    if let Some(mut child_stderr) = child.stderr.take() {
+        child_stderr.read_to_string(&mut stderr)?;
+    }
+    let status = child.wait()?;
+    if bytes.len() > remote.max_bytes {
+        bail!("remote stream exceeded --remote-max-bytes")
+    }
+    if !status.success() {
+        bail!(
+            "ssh command failed for {}: {status}\n{}",
+            spec.uri(),
+            stderr.trim()
+        )
+    }
+    Ok(bytes)
+}
+
+struct ManagedTempPath {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl Drop for ManagedTempPath {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn scp_to_temp(spec: &SshInput, remote: &RemoteOptions, kind: &str) -> Result<ManagedTempPath> {
+    scp_path_to_temp(spec, &spec.path, remote, kind)
+}
+
+fn scp_path_to_temp(
+    spec: &SshInput,
+    remote_path: &str,
+    remote: &RemoteOptions,
+    kind: &str,
+) -> Result<ManagedTempPath> {
+    let dir = remote
+        .copy_dir
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join("imq-remote"));
+    std::fs::create_dir_all(&dir)?;
+    let filename = format!(
+        "{}-{}-{}",
+        kind,
+        std::process::id(),
+        remote_path.rsplit('/').next().unwrap_or("input")
+    );
+    let path = dir.join(filename);
+    let mut command = ProcessCommand::new(&remote.scp);
+    if let Some(port) = spec.port {
+        command.args(["-P", &port.to_string()]);
+    }
+    command.arg(format!(
+        "{}:{}",
+        spec.ssh_target(),
+        imq::shell_quote_posix(remote_path)
+    ));
+    command.arg(&path);
+    let output = command
+        .output()
+        .with_context(|| format!("failed to start `{}`", remote.scp.display()))?;
+    if !output.status.success() {
+        bail!(
+            "scp failed for {}: {}\n{}",
+            spec.uri(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    if remote.keep_temp {
+        eprintln!("kept remote copy temp: {}", path.display());
+    }
+    Ok(ManagedTempPath {
+        path,
+        keep: remote.keep_temp,
+    })
+}
+
+fn reject_double_stdin_specs(first: &InputSpec, second: Option<&InputSpec>) -> Result<()> {
+    if matches!(first, InputSpec::Stdin)
+        && second.is_some_and(|input| matches!(input, InputSpec::Stdin))
+    {
         bail!("stdin input `-` can only be used for one image argument")
     }
     Ok(())
@@ -813,12 +1393,23 @@ impl RawPixelFormatArg {
             Self::Bgr8 => Some(imq::PixelFormat::Bgr8),
             Self::Bgra8 => Some(imq::PixelFormat::Bgra8),
             Self::Luma8 => Some(imq::PixelFormat::Luma8),
+            Self::Hsv8 => Some(imq::PixelFormat::Hsv8),
+            Self::Hsva8 => Some(imq::PixelFormat::Hsva8),
+            Self::Binary1Lsb | Self::Binary1Msb => None,
             Self::Gray1Lsb
             | Self::Gray1Msb
             | Self::Gray2Lsb
             | Self::Gray2Msb
             | Self::Gray4Lsb
             | Self::Gray4Msb => None,
+        }
+    }
+
+    fn binary_pixel_format(self) -> Option<imq::PixelFormat> {
+        match self {
+            Self::Binary1Lsb => Some(imq::PixelFormat::Binary1Lsb),
+            Self::Binary1Msb => Some(imq::PixelFormat::Binary1Msb),
+            _ => None,
         }
     }
 
@@ -830,7 +1421,15 @@ impl RawPixelFormatArg {
             Self::Gray2Msb => Some(BitPackedGrayFormat::new(2, BitOrder::MsbFirst)?),
             Self::Gray4Lsb => Some(BitPackedGrayFormat::new(4, BitOrder::LsbFirst)?),
             Self::Gray4Msb => Some(BitPackedGrayFormat::new(4, BitOrder::MsbFirst)?),
-            Self::Rgb8 | Self::Rgba8 | Self::Bgr8 | Self::Bgra8 | Self::Luma8 => None,
+            Self::Rgb8
+            | Self::Rgba8
+            | Self::Bgr8
+            | Self::Bgra8
+            | Self::Luma8
+            | Self::Hsv8
+            | Self::Hsva8
+            | Self::Binary1Lsb
+            | Self::Binary1Msb => None,
         };
         Ok(format)
     }
@@ -885,6 +1484,291 @@ mod tests {
         assert_eq!(record.frame.format().pixel_format, imq::PixelFormat::Luma8);
         assert_eq!(plane_bytes(&record.frame), [255, 255, 0, 255]);
     }
+
+    #[test]
+    fn raw_stdin_binary1_lsb_stays_native_binary() {
+        let frame =
+            decode_raw_stdin_frame(vec![0b0000_1011], 4, 1, RawPixelFormatArg::Binary1Lsb, None)
+                .unwrap();
+
+        assert_eq!(frame.format().pixel_format, imq::PixelFormat::Binary1Lsb);
+        assert_eq!(plane_bytes(&frame), [0b0000_1011]);
+    }
+
+    #[test]
+    fn selected_metric_accepts_domain_only() {
+        let metric = MetricOutput::new(
+            "psnr:rgb-visible",
+            35.0,
+            "dB",
+            imq::metrics::Direction::HigherIsBetter,
+        )
+        .with_detail("max_channel_delta_code", 3.0);
+        let report = ComparisonReport::new(
+            imq::Dimensions::new(1, 1).unwrap(),
+            imq::FormatSpec::new(imq::PixelFormat::Rgba8),
+            imq::FormatSpec::new(imq::PixelFormat::Rgba8),
+            vec![metric],
+        );
+        let gate = evaluate_gate(
+            &report,
+            ComparisonThresholds {
+                selected_metric: Some("rgb-visible".to_string()),
+                fail_under: Some(34.0),
+                max_selected_channel_delta: Some(4.0),
+                ..ComparisonThresholds::default()
+            },
+        )
+        .unwrap();
+        assert!(gate.passed);
+    }
+}
+
+#[cfg(feature = "ffmpeg")]
+fn selected_video_frame_pairs(
+    video_frame: Option<u64>,
+    video_frames: Option<String>,
+) -> Result<Option<Vec<VideoFramePair>>> {
+    if let Some(frame) = video_frame {
+        return Ok(Some(vec![VideoFramePair::new(frame, frame)]));
+    }
+    video_frames
+        .as_deref()
+        .map(imq::parse_video_frame_pairs)
+        .transpose()
+        .map_err(Into::into)
+}
+
+#[cfg(feature = "ffmpeg")]
+fn compare_video_frame_pair_inputs(
+    reference: &InputSpec,
+    distorted: &InputSpec,
+    pairs: &[VideoFramePair],
+    metrics_csv: &str,
+    ffmpeg_cli: FfmpegCliOptions,
+    remote: &RemoteOptions,
+) -> Result<VideoFramePairComparisonReport> {
+    if pairs.is_empty() {
+        bail!("--video-frames must contain at least one frame or frame pair");
+    }
+    let metrics = MetricSet::from_csv(metrics_csv)?;
+    let ffmpeg = imq::video::FfmpegOptions {
+        ffmpeg: ffmpeg_cli.ffmpeg,
+        ffprobe: ffmpeg_cli.ffprobe,
+        stream_index: ffmpeg_cli.stream,
+        scale: parse_optional_scale(ffmpeg_cli.width, ffmpeg_cli.height)?,
+        input_args: Vec::new(),
+    };
+    let mut reports = Vec::with_capacity(pairs.len());
+    let mut dimensions = None;
+    for (pair_index, pair) in pairs.iter().enumerate() {
+        let reference_frame =
+            extract_video_frame_input_spec(reference, pair.reference, &ffmpeg, remote)
+                .with_context(|| format!("failed to extract reference frame {}", pair.reference))?;
+        let distorted_frame =
+            extract_video_frame_input_spec(distorted, pair.distorted, &ffmpeg, remote)
+                .with_context(|| format!("failed to extract distorted frame {}", pair.distorted))?;
+        if reference_frame.dimensions() != distorted_frame.dimensions() {
+            bail!(
+                "decoded frame dimensions differ: {:?} vs {:?}",
+                reference_frame.dimensions(),
+                distorted_frame.dimensions()
+            );
+        }
+        if let Some(expected) = dimensions {
+            if expected != reference_frame.dimensions() {
+                bail!(
+                    "decoded frame dimensions changed across pairs: {:?} vs {:?}",
+                    expected,
+                    reference_frame.dimensions()
+                );
+            }
+        } else {
+            dimensions = Some(reference_frame.dimensions());
+        }
+        let outputs = metrics.compare(&reference_frame.as_view(), &distorted_frame.as_view())?;
+        reports.push(imq::FramePairReport {
+            pair_index: u64::try_from(pair_index).unwrap_or(u64::MAX),
+            reference_frame_index: pair.reference,
+            distorted_frame_index: pair.distorted,
+            label_frame_index: pair.label_frame_index,
+            reference_pts_seconds: None,
+            distorted_pts_seconds: None,
+            metrics: outputs,
+        });
+    }
+    let mean_metrics = mean_pair_metric_outputs(&reports);
+    Ok(VideoFramePairComparisonReport {
+        reference: reference.display_label(),
+        distorted: distorted.display_label(),
+        dimensions: dimensions.ok_or_else(|| anyhow::anyhow!("no frame pairs were compared"))?,
+        pairs: reports,
+        mean_metrics,
+    })
+}
+
+#[cfg(feature = "ffmpeg")]
+fn extract_video_frame_input_spec(
+    input: &InputSpec,
+    frame_index: u64,
+    ffmpeg: &imq::video::FfmpegOptions,
+    remote: &RemoteOptions,
+) -> Result<imq::FrameOwned> {
+    match input {
+        InputSpec::Local(path) => Ok(imq::video::decode_single_frame(path, frame_index, ffmpeg)?),
+        InputSpec::Stdin => bail!("stdin video frame extraction is not supported yet"),
+        InputSpec::Ssh(spec) => extract_remote_video_frame(spec, frame_index, ffmpeg, remote),
+    }
+}
+
+#[cfg(feature = "ffmpeg")]
+fn extract_remote_video_frame(
+    spec: &SshInput,
+    frame_index: u64,
+    ffmpeg: &imq::video::FfmpegOptions,
+    remote: &RemoteOptions,
+) -> Result<imq::FrameOwned> {
+    match remote.transfer {
+        RemoteTransferMode::Stream => {
+            extract_remote_video_frame_png(spec, frame_index, ffmpeg, remote)
+        }
+        RemoteTransferMode::CopyFrame => {
+            let temp = remote_extract_frame_to_temp_then_scp(spec, frame_index, ffmpeg, remote)?;
+            Ok(image_crate::load_image_path(&temp.path)?)
+        }
+        RemoteTransferMode::CopySource => {
+            eprintln!(
+                "warning: --remote-transfer copy-source copies full remote video files to local temporary storage"
+            );
+            let temp = scp_to_temp(spec, remote, "source")?;
+            Ok(imq::video::decode_single_frame(
+                &temp.path,
+                frame_index,
+                ffmpeg,
+            )?)
+        }
+        RemoteTransferMode::CopyInput => {
+            bail!(
+                "copy-input is not allowed for video inputs; use copy-frame or copy-source explicitly"
+            )
+        }
+    }
+}
+
+#[cfg(feature = "ffmpeg")]
+fn extract_remote_video_frame_png(
+    spec: &SshInput,
+    frame_index: u64,
+    ffmpeg: &imq::video::FfmpegOptions,
+    remote: &RemoteOptions,
+) -> Result<imq::FrameOwned> {
+    let bytes = remote_video_frame_png_bytes(spec, frame_index, ffmpeg, remote).map_err(|error| {
+        anyhow::anyhow!(
+            "remote stream failed for {}.\ncopy fallback is disabled by default.\nUse --remote-transfer copy-frame to copy extracted frames, or --remote-transfer copy-source to copy the source file explicitly.\n{error}",
+            spec.uri()
+        )
+    })?;
+    Ok(image_crate::decode_image_bytes(&bytes)?)
+}
+
+#[cfg(feature = "ffmpeg")]
+fn remote_video_frame_png_bytes(
+    spec: &SshInput,
+    frame_index: u64,
+    ffmpeg: &imq::video::FfmpegOptions,
+    remote: &RemoteOptions,
+) -> Result<Vec<u8>> {
+    if remote.frame_format != RemoteFrameFormat::Png {
+        bail!("--remote-frame-format rgba is reserved for a future raw RGBA remote path")
+    }
+    let mut filters = format!("select=eq(n\\,{frame_index})");
+    if let Some(scale) = ffmpeg.scale {
+        filters.push_str(&format!(",scale={}:{}", scale.width, scale.height));
+    }
+    let command = format!(
+        "{} -hide_banner -loglevel error -i {} -vf {} -vsync 0 -frames:v 1 -f image2pipe -vcodec png pipe:1",
+        imq::shell_quote_posix(&ffmpeg.ffmpeg.to_string_lossy()),
+        imq::shell_quote_posix(&spec.path),
+        imq::shell_quote_posix(&filters),
+    );
+    ssh_capture_stdout(spec, &command, remote)
+}
+
+#[cfg(feature = "ffmpeg")]
+fn remote_extract_frame_to_temp_then_scp(
+    spec: &SshInput,
+    frame_index: u64,
+    ffmpeg: &imq::video::FfmpegOptions,
+    remote: &RemoteOptions,
+) -> Result<ManagedTempPath> {
+    if remote.frame_format != RemoteFrameFormat::Png {
+        bail!("--remote-frame-format rgba is reserved for a future raw RGBA remote path")
+    }
+    let mut filters = format!("select=eq(n\\,{frame_index})");
+    if let Some(scale) = ffmpeg.scale {
+        filters.push_str(&format!(",scale={}:{}", scale.width, scale.height));
+    }
+    let remote_path = format!("/tmp/imq-frame-{}-{}.png", std::process::id(), frame_index);
+    let command = format!(
+        "{} -hide_banner -loglevel error -i {} -vf {} -vsync 0 -frames:v 1 -f image2 -vcodec png {} && printf '%s\\n' {}",
+        imq::shell_quote_posix(&ffmpeg.ffmpeg.to_string_lossy()),
+        imq::shell_quote_posix(&spec.path),
+        imq::shell_quote_posix(&filters),
+        imq::shell_quote_posix(&remote_path),
+        imq::shell_quote_posix(&remote_path),
+    );
+    let output = ssh_capture_stdout(spec, &command, remote)?;
+    let remote_temp = String::from_utf8_lossy(&output).trim().to_string();
+    if remote_temp.is_empty() {
+        bail!("remote frame extraction did not report a temporary frame path")
+    }
+    let local = scp_path_to_temp(spec, &remote_temp, remote, "frame")?;
+    if !remote.keep_temp {
+        let _ = ssh_capture_stdout(
+            spec,
+            &format!("rm -f -- {}", imq::shell_quote_posix(&remote_temp)),
+            remote,
+        );
+    } else {
+        eprintln!("kept remote frame temp: {remote_temp}");
+    }
+    Ok(local)
+}
+
+#[cfg(feature = "ffmpeg")]
+fn mean_pair_metric_outputs(frames: &[imq::FramePairReport]) -> Vec<MetricOutput> {
+    use std::collections::BTreeMap;
+    let mut sums: BTreeMap<String, (MetricOutput, f64, u64, bool)> = BTreeMap::new();
+    for frame in frames {
+        for metric in &frame.metrics {
+            let entry = sums
+                .entry(metric.name.clone())
+                .or_insert_with(|| (metric.clone(), 0.0, 0, false));
+            if metric.score.is_infinite() {
+                entry.3 = true;
+            } else if metric.score.is_finite() {
+                entry.1 += metric.score;
+                entry.2 += 1;
+            }
+        }
+    }
+    sums.into_values()
+        .map(|(mut metric, sum, count, has_inf)| {
+            metric.score = if count == 0 && has_inf {
+                f64::INFINITY
+            } else if count > 0 {
+                sum / count as f64
+            } else {
+                f64::NAN
+            };
+            metric.details.clear();
+            metric
+                .details
+                .insert("pairs".to_string(), frames.len() as f64);
+            metric.name = format!("mean_{}", metric.name);
+            metric
+        })
+        .collect()
 }
 
 #[cfg(feature = "ffmpeg")]
@@ -1148,6 +2032,9 @@ struct MetricCsvRow {
     scope: &'static str,
     frame_index: Option<u64>,
     pts_seconds: Option<f64>,
+    pair_index: Option<u64>,
+    reference_frame_index: Option<u64>,
+    distorted_frame_index: Option<u64>,
     metric: String,
     score: f64,
     unit: String,
@@ -1206,11 +2093,23 @@ struct MetricCsvContext {
     scope: &'static str,
     frame_index: Option<u64>,
     pts_seconds: Option<f64>,
+    pair_index: Option<u64>,
+    reference_frame_index: Option<u64>,
+    distorted_frame_index: Option<u64>,
 }
 
 enum SqlReport<'a> {
     Image(&'a ComparisonReport),
     Video(&'a VideoReport),
+    VideoPairs(&'a VideoFramePairComparisonReport),
+}
+
+struct FfmpegCliOptions {
+    ffmpeg: PathBuf,
+    ffprobe: PathBuf,
+    stream: usize,
+    width: Option<u32>,
+    height: Option<u32>,
 }
 
 struct SqlReportInsert<'a> {
@@ -1297,6 +2196,21 @@ fn emit_video_report(
         OutputFormatArg::Yaml => serde_yaml_ng::to_string(report)?,
         OutputFormatArg::Toml => toml::to_string_pretty(report)?,
         OutputFormatArg::Csv => csv_string(video_csv_rows(report))?,
+    };
+    write_output(output.output.as_deref(), &content)
+}
+
+fn emit_video_pair_report(
+    report: &VideoFramePairComparisonReport,
+    format: OutputFormatArg,
+    output: &OutputArgs,
+) -> Result<()> {
+    let content = match format {
+        OutputFormatArg::Text => render_video_pair_text(report),
+        OutputFormatArg::Json => serde_json::to_string_pretty(report)?,
+        OutputFormatArg::Yaml => serde_yaml_ng::to_string(report)?,
+        OutputFormatArg::Toml => toml::to_string_pretty(report)?,
+        OutputFormatArg::Csv => csv_string(video_pair_csv_rows(report))?,
     };
     write_output(output.output.as_deref(), &content)
 }
@@ -1432,6 +2346,29 @@ fn render_comparison_text(report: &ComparisonReport) -> String {
         report.dimensions.width, report.dimensions.height
     ));
     output.push_str(&render_metrics(&report.metrics));
+    if let Some(alpha) = report.alpha {
+        output.push_str(&format!(
+            "alpha     : ref t/o/p={}/{}/{}  dist t/o/p={}/{}/{}  mismatches={}  max_delta={}  beyond_1_lsb={}\n",
+            alpha.reference.transparent,
+            alpha.reference.opaque,
+            alpha.reference.partial,
+            alpha.distorted.transparent,
+            alpha.distorted.opaque,
+            alpha.distorted.partial,
+            alpha.mismatch_count,
+            alpha.max_delta,
+            alpha.mismatches_beyond_one_lsb
+        ));
+    }
+    if let Some(gate) = &report.gate {
+        output.push_str(&format!(
+            "gate      : {}\n",
+            if gate.passed { "passed" } else { "failed" }
+        ));
+        for failure in &gate.failures {
+            output.push_str(&format!("  - {failure}\n"));
+        }
+    }
     output
 }
 
@@ -1488,6 +2425,31 @@ fn render_video_text(report: &VideoReport) -> String {
         report.dimensions.width, report.dimensions.height
     ));
     output.push_str(&format!("compared frames : {}\n", report.compared_frames));
+    output.push_str("\nmean metrics\n");
+    output.push_str(&render_metrics(&report.mean_metrics));
+    output
+}
+
+fn render_video_pair_text(report: &VideoFramePairComparisonReport) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("reference       : {}\n", report.reference));
+    output.push_str(&format!("distorted       : {}\n", report.distorted));
+    output.push_str(&format!(
+        "size            : {}x{}\n",
+        report.dimensions.width, report.dimensions.height
+    ));
+    output.push_str(&format!("compared pairs  : {}\n", report.pairs.len()));
+    for pair in &report.pairs {
+        output.push_str(&format!(
+            "\npair {}: ref={} distorted={}",
+            pair.pair_index, pair.reference_frame_index, pair.distorted_frame_index
+        ));
+        if let Some(label) = pair.label_frame_index {
+            output.push_str(&format!(" label={label}"));
+        }
+        output.push('\n');
+        output.push_str(&render_metrics(&pair.metrics));
+    }
     output.push_str("\nmean metrics\n");
     output.push_str(&render_metrics(&report.mean_metrics));
     output
@@ -1557,16 +2519,16 @@ fn render_bundle_info_text(report: &BundleInfoReport) -> String {
 fn render_metrics(metrics: &[MetricOutput]) -> String {
     let mut output = String::new();
     output.push_str(&format!(
-        "{:<18} {:>16}  {:<20}  direction\n",
+        "{:<32} {:>16}  {:<20}  direction\n",
         "metric", "score", "unit"
     ));
     output.push_str(&format!(
-        "{:-<18} {:-<16}  {:-<20}  {:-<12}\n",
+        "{:-<32} {:-<16}  {:-<20}  {:-<12}\n",
         "", "", "", ""
     ));
     metrics.iter().for_each(|metric| {
         output.push_str(&format!(
-            "{:<18} {:>16.8}  {:<20}  {:?}\n",
+            "{:<32} {:>16.8}  {:<20}  {:?}\n",
             metric.name, metric.score, metric.unit, metric.direction
         ));
     });
@@ -1605,6 +2567,9 @@ fn comparison_csv_rows(report: &ComparisonReport) -> Vec<MetricCsvRow> {
             scope: "image",
             frame_index: None,
             pts_seconds: None,
+            pair_index: None,
+            reference_frame_index: None,
+            distorted_frame_index: None,
         },
         &report.metrics,
     )
@@ -1660,6 +2625,9 @@ fn video_csv_rows(report: &VideoReport) -> Vec<MetricCsvRow> {
             scope: "mean",
             frame_index: None,
             pts_seconds: None,
+            pair_index: None,
+            reference_frame_index: None,
+            distorted_frame_index: None,
         },
         &report.mean_metrics,
     );
@@ -1674,11 +2642,52 @@ fn video_csv_rows(report: &VideoReport) -> Vec<MetricCsvRow> {
                 scope: "frame",
                 frame_index: Some(frame.frame_index),
                 pts_seconds: frame.pts_seconds,
+                pair_index: None,
+                reference_frame_index: None,
+                distorted_frame_index: None,
             },
             &frame.metrics,
         )
     });
     mean_rows.into_iter().chain(frame_rows).collect()
+}
+
+fn video_pair_csv_rows(report: &VideoFramePairComparisonReport) -> Vec<MetricCsvRow> {
+    let mean_rows = metric_csv_rows(
+        &MetricCsvContext {
+            report_kind: "video_pairs",
+            reference: report.reference.clone(),
+            distorted: report.distorted.clone(),
+            width: report.dimensions.width,
+            height: report.dimensions.height,
+            scope: "mean",
+            frame_index: None,
+            pts_seconds: None,
+            pair_index: None,
+            reference_frame_index: None,
+            distorted_frame_index: None,
+        },
+        &report.mean_metrics,
+    );
+    let pair_rows = report.pairs.iter().flat_map(|pair| {
+        metric_csv_rows(
+            &MetricCsvContext {
+                report_kind: "video_pairs",
+                reference: report.reference.clone(),
+                distorted: report.distorted.clone(),
+                width: report.dimensions.width,
+                height: report.dimensions.height,
+                scope: "pair",
+                frame_index: pair.label_frame_index,
+                pts_seconds: None,
+                pair_index: Some(pair.pair_index),
+                reference_frame_index: Some(pair.reference_frame_index),
+                distorted_frame_index: Some(pair.distorted_frame_index),
+            },
+            &pair.metrics,
+        )
+    });
+    mean_rows.into_iter().chain(pair_rows).collect()
 }
 
 fn metric_csv_rows(ctx: &MetricCsvContext, metrics: &[MetricOutput]) -> Vec<MetricCsvRow> {
@@ -1693,6 +2702,9 @@ fn metric_csv_rows(ctx: &MetricCsvContext, metrics: &[MetricOutput]) -> Vec<Metr
             scope: ctx.scope,
             frame_index: ctx.frame_index,
             pts_seconds: ctx.pts_seconds,
+            pair_index: ctx.pair_index,
+            reference_frame_index: ctx.reference_frame_index,
+            distorted_frame_index: ctx.distorted_frame_index,
             metric: metric.name.clone(),
             score: metric.score,
             unit: metric.unit.clone(),
@@ -1748,6 +2760,32 @@ fn write_sqlite_report(path: Option<&Path>, report: SqlReport<'_>) -> Result<()>
                     Some(sql_u64(frame.frame_index)),
                     frame.pts_seconds,
                     &frame.metrics,
+                )?;
+            }
+        }
+        SqlReport::VideoPairs(report) => {
+            let payload = serde_json::to_string(report)?;
+            let report_id = insert_sqlite_report(
+                &conn,
+                &SqlReportInsert {
+                    kind: "video_pairs",
+                    reference: Some(&report.reference),
+                    distorted: Some(&report.distorted),
+                    width: report.dimensions.width,
+                    height: report.dimensions.height,
+                    compared_frames: Some(sql_u64(report.pairs.len() as u64)),
+                    payload_json: &payload,
+                },
+            )?;
+            insert_sqlite_metrics(&conn, report_id, "mean", None, None, &report.mean_metrics)?;
+            for pair in &report.pairs {
+                insert_sqlite_metrics(
+                    &conn,
+                    report_id,
+                    "pair",
+                    Some(sql_u64(pair.label_frame_index.unwrap_or(pair.pair_index))),
+                    None,
+                    &pair.metrics,
                 )?;
             }
         }
@@ -1948,7 +2986,8 @@ fn sql_u64(value: u64) -> i64 {
 #[cfg(feature = "preview")]
 fn run_preview(cmd: PreviewCmd) -> Result<()> {
     use imq::preview::{
-        DecodeMode, DisplayMode, FitMode, PreviewOptions, preview_path, render_preview,
+        DecodeMode, DisplayMode, FitMode, PreviewOptions, preview_image_bytes, preview_path,
+        render_preview,
     };
 
     if cmd.inputs.is_empty() {
@@ -1992,8 +3031,56 @@ fn run_preview(cmd: PreviewCmd) -> Result<()> {
     };
     let mut previews = Vec::new();
     for input in &cmd.inputs {
-        let preview = preview_path(input, &options)
-            .with_context(|| format!("failed to preview `{}`", input.display()))?;
+        let spec = parse_input_spec(input, &cmd.remote)?;
+        let preview = match (&spec, is_video_input(&spec), cmd.video_frame) {
+            (InputSpec::Local(path), false, None) => preview_path(path, &options)
+                .with_context(|| format!("failed to preview `{}`", path.display()))?,
+            (InputSpec::Local(path), true, None) => preview_path(path, &options)
+                .with_context(|| format!("failed to preview `{}`", path.display()))?,
+            (InputSpec::Local(path), true, Some(frame_index)) => {
+                let ffmpeg = imq::video::FfmpegOptions {
+                    ffmpeg: options.ffmpeg.clone(),
+                    ..Default::default()
+                };
+                let frame = imq::video::decode_single_frame(path, frame_index, &ffmpeg)?;
+                preview_from_rgba_frame(frame, &options, format!("frame:{frame_index}"))?
+            }
+            (InputSpec::Ssh(spec), false, None) => {
+                let remote = cmd.remote.options();
+                let bytes = ssh_capture_stdout(
+                    spec,
+                    &format!("cat -- {}", imq::shell_quote_posix(&spec.path)),
+                    &remote,
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "remote stream failed for {}.\ncopy fallback is disabled by default.\nUse --remote-transfer copy-input to copy the input explicitly.\n{error}",
+                        spec.uri()
+                    )
+                })?;
+                preview_image_bytes(&bytes, &options, spec.uri())?
+            }
+            (InputSpec::Ssh(spec), true, Some(frame_index)) => {
+                let ffmpeg = imq::video::FfmpegOptions {
+                    ffmpeg: options.ffmpeg.clone(),
+                    ..Default::default()
+                };
+                let bytes = remote_video_frame_png_bytes(
+                    spec,
+                    frame_index,
+                    &ffmpeg,
+                    &cmd.remote.options(),
+                )?;
+                preview_image_bytes(&bytes, &options, format!("{}#{}", spec.uri(), frame_index))?
+            }
+            (InputSpec::Ssh(_), true, None) => {
+                bail!(
+                    "remote video preview requires --video-frame. Use --video-frame N to extract a frame over SSH."
+                )
+            }
+            (InputSpec::Stdin, _, _) => bail!("preview stdin input is not supported yet"),
+            (_, false, Some(_)) => bail!("--video-frame can only be used with video inputs"),
+        };
         previews.push(preview);
     }
 
@@ -2003,6 +3090,27 @@ fn run_preview(cmd: PreviewCmd) -> Result<()> {
     let image = montage_previews(&previews, Some(rows), Some(columns));
     print!("{}", render_preview(&image, display));
     Ok(())
+}
+
+#[cfg(feature = "preview")]
+fn preview_from_rgba_frame(
+    frame: imq::FrameOwned,
+    options: &imq::preview::PreviewOptions,
+    source: String,
+) -> Result<imq::preview::PreviewImage> {
+    let view = frame.as_view();
+    let plane = view.plane(0)?;
+    let image = image::RgbaImage::from_raw(
+        frame.dimensions().width,
+        frame.dimensions().height,
+        plane.data.to_vec(),
+    )
+    .ok_or_else(|| anyhow::anyhow!("decoded RGBA frame could not be represented as an image"))?;
+    Ok(imq::preview::preview_dynamic_image(
+        image::DynamicImage::ImageRgba8(image),
+        options,
+        source,
+    ))
 }
 
 fn parse_preview_size(input: &str) -> std::result::Result<PreviewSize, String> {
@@ -2164,18 +3272,6 @@ fn parse_optional_scale(width: Option<u32>, height: Option<u32>) -> Result<Optio
         (None, None) => Ok(None),
         _ => bail!("--width and --height must be specified together"),
     }
-}
-
-fn is_video_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| {
-            matches!(
-                ext.to_ascii_lowercase().as_str(),
-                "avi" | "m4v" | "mkv" | "mov" | "mp4" | "mpeg" | "mpg" | "webm" | "wmv"
-            )
-        })
-        .unwrap_or(false)
 }
 
 #[cfg(feature = "tui")]

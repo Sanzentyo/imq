@@ -163,6 +163,14 @@ pub enum PixelFormat {
     Yuv420p8,
     /// NV12, 8-bit: Y plane + interleaved UV plane.
     Nv12,
+    /// 8-bit HSV, packed. Hue, saturation, and value are normalized over 0..255.
+    Hsv8,
+    /// 8-bit HSVA, packed. Hue, saturation, value, and alpha are normalized over 0..255.
+    Hsva8,
+    /// 1-bit binary mask, one row at a time, least-significant bit first.
+    Binary1Lsb,
+    /// 1-bit binary mask, one row at a time, most-significant bit first.
+    Binary1Msb,
 }
 
 impl PixelFormat {
@@ -180,7 +188,14 @@ impl PixelFormat {
                 | Self::Rgba16Le
                 | Self::RgbF32
                 | Self::RgbaF32
+                | Self::Hsv8
+                | Self::Hsva8
         )
+    }
+
+    /// Returns `true` for 1-bit packed mask layouts.
+    pub fn is_bit_packed(self) -> bool {
+        matches!(self, Self::Binary1Lsb | Self::Binary1Msb)
     }
 
     /// Returns `true` for planar/interleaved YUV layouts.
@@ -204,8 +219,8 @@ impl PixelFormat {
     pub fn bytes_per_pixel(self) -> Option<usize> {
         match self {
             Self::Luma8 => Some(1),
-            Self::Rgb8 | Self::Bgr8 => Some(3),
-            Self::Rgba8 | Self::Bgra8 => Some(4),
+            Self::Rgb8 | Self::Bgr8 | Self::Hsv8 => Some(3),
+            Self::Rgba8 | Self::Bgra8 | Self::Hsva8 => Some(4),
             Self::Luma16Le => Some(2),
             Self::Rgb16Le => Some(6),
             Self::Rgba16Le => Some(8),
@@ -219,10 +234,11 @@ impl PixelFormat {
     pub fn channel_count(self) -> usize {
         match self {
             Self::Luma8 | Self::Luma16Le => 1,
-            Self::Rgb8 | Self::Bgr8 | Self::Rgb16Le | Self::RgbF32 => 3,
-            Self::Rgba8 | Self::Bgra8 | Self::Rgba16Le | Self::RgbaF32 => 4,
+            Self::Rgb8 | Self::Bgr8 | Self::Rgb16Le | Self::RgbF32 | Self::Hsv8 => 3,
+            Self::Rgba8 | Self::Bgra8 | Self::Rgba16Le | Self::RgbaF32 | Self::Hsva8 => 4,
             Self::Yuv444p8 | Self::Yuv422p8 | Self::Yuv420p8 => 3,
             Self::Nv12 => 3,
+            Self::Binary1Lsb | Self::Binary1Msb => 1,
         }
     }
 
@@ -231,6 +247,7 @@ impl PixelFormat {
         match self {
             Self::Luma16Le | Self::Rgb16Le | Self::Rgba16Le => 65_535.0,
             Self::RgbF32 | Self::RgbaF32 => 1.0,
+            Self::Binary1Lsb | Self::Binary1Msb => 1.0,
             _ => 255.0,
         }
     }
@@ -266,6 +283,14 @@ impl PixelFormat {
                 0 => (w, h),
                 1 => (w.div_ceil(2) * 2, h.div_ceil(2)),
                 _ => return Err(Error::invalid_frame("NV12 has exactly two planes")),
+            },
+            Self::Binary1Lsb | Self::Binary1Msb => match plane {
+                0 => (w.div_ceil(8), h),
+                _ => {
+                    return Err(Error::invalid_frame(
+                        "binary packed formats have exactly one plane",
+                    ));
+                }
             },
             _ => match plane {
                 0 => (w * self.bytes_per_pixel().unwrap_or(1), h),
@@ -633,6 +658,9 @@ fn validate_parts(dims: Dimensions, format: FormatSpec, planes: &[PlaneView<'_>]
                     .ok_or_else(|| Error::invalid_frame("row bytes overflow"))?,
                 h,
             )
+        } else if format.pixel_format.is_bit_packed() {
+            let (w, h) = dims.as_usize()?;
+            (w.div_ceil(8), h)
         } else {
             let (pw, ph) = plane_dims.as_usize()?;
             (pw, ph)

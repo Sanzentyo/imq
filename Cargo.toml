@@ -21,6 +21,11 @@ name = "imq"
 path = "src/bin/imq.rs"
 required-features = ["cli"]
 
+[[bin]]
+name = "imq-quality"
+path = "src/bin/imq-quality.rs"
+required-features = ["cli"]
+
 [features]
 default = ["std", "serde", "image-codecs", "cli", "tui", "preview"]
 std = []

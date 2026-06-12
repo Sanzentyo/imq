@@ -1,8 +1,8 @@
 //! WebAssembly bindings for `imqraw` browser and Node pipelines.
 
 use imq::{
-    FrameOwned, PixelFormat, RawImageBundle, RawImageRecord, decode_imqraw_bundle,
-    encode_imqraw_bundle,
+    Dimensions, FormatSpec, FrameOwned, OwnedPlane, PixelFormat, RawImageBundle, RawImageRecord,
+    decode_imqraw_bundle, encode_imqraw_bundle,
 };
 use js_sys::{Array, Reflect, Uint8Array};
 use wasm_bindgen::JsCast;
@@ -44,6 +44,30 @@ pub fn encode_imqraw_rgba8_bundle(images: Array) -> Result<Vec<u8>, JsValue> {
     encode_imqraw_bundle(&RawImageBundle::new(records)).map_err(js_error)
 }
 
+/// Encodes one tightly packed image as an `imqraw` bundle using a stable pixel-format code.
+#[wasm_bindgen]
+pub fn encode_imqraw_image(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    pixel_format: u16,
+    stride: usize,
+    label: String,
+    tags: Array,
+) -> Result<Vec<u8>, JsValue> {
+    let pixel_format = pixel_format_from_code(pixel_format)?;
+    let record = image_record(
+        data.to_vec(),
+        width,
+        height,
+        pixel_format,
+        (stride != 0).then_some(stride),
+        label,
+        parse_tags(&tags)?,
+    )?;
+    encode_imqraw_bundle(&RawImageBundle::new(vec![record])).map_err(js_error)
+}
+
 /// Returns the number of images in an encoded `imqraw` bundle.
 #[wasm_bindgen]
 pub fn imqraw_image_count(bytes: &[u8]) -> Result<usize, JsValue> {
@@ -62,6 +86,60 @@ fn rgba8_record(
     let frame =
         FrameOwned::packed_tight(data, width, height, PixelFormat::Rgba8).map_err(js_error)?;
     Ok(RawImageRecord::new(non_empty(label), tags, frame))
+}
+
+fn image_record(
+    data: Vec<u8>,
+    width: u32,
+    height: u32,
+    pixel_format: PixelFormat,
+    stride: Option<usize>,
+    label: String,
+    tags: Vec<String>,
+) -> Result<RawImageRecord, JsValue> {
+    let frame = if pixel_format.is_bit_packed() {
+        let row_bytes = usize::try_from(width)
+            .map_err(|_| JsValue::from_str("width overflows usize"))?
+            .div_ceil(8);
+        let stride = stride.unwrap_or(row_bytes);
+        FrameOwned::new(
+            Dimensions::new(width, height).map_err(js_error)?,
+            FormatSpec::new(pixel_format),
+            vec![OwnedPlane::new(data, stride)],
+        )
+    } else if let Some(stride) = stride {
+        FrameOwned::packed(data, width, height, pixel_format, stride)
+    } else {
+        FrameOwned::packed_tight(data, width, height, pixel_format)
+    }
+    .map_err(js_error)?;
+    Ok(RawImageRecord::new(non_empty(label), tags, frame))
+}
+
+fn pixel_format_from_code(code: u16) -> Result<PixelFormat, JsValue> {
+    match code {
+        1 => Ok(PixelFormat::Luma8),
+        2 => Ok(PixelFormat::Rgb8),
+        3 => Ok(PixelFormat::Rgba8),
+        4 => Ok(PixelFormat::Bgr8),
+        5 => Ok(PixelFormat::Bgra8),
+        6 => Ok(PixelFormat::Luma16Le),
+        7 => Ok(PixelFormat::Rgb16Le),
+        8 => Ok(PixelFormat::Rgba16Le),
+        9 => Ok(PixelFormat::RgbF32),
+        10 => Ok(PixelFormat::RgbaF32),
+        11 => Ok(PixelFormat::Yuv444p8),
+        12 => Ok(PixelFormat::Yuv422p8),
+        13 => Ok(PixelFormat::Yuv420p8),
+        14 => Ok(PixelFormat::Nv12),
+        15 => Ok(PixelFormat::Hsv8),
+        16 => Ok(PixelFormat::Hsva8),
+        17 => Ok(PixelFormat::Binary1Lsb),
+        18 => Ok(PixelFormat::Binary1Msb),
+        _ => Err(JsValue::from_str(&format!(
+            "unsupported imqraw pixel format code {code}"
+        ))),
+    }
 }
 
 fn non_empty(value: String) -> Option<String> {

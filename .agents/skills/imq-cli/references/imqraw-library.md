@@ -13,7 +13,9 @@ import {
   init,
   encodeRgba8,
   encodeBundle,
+  encodeImage,
   imqraw_image_count,
+  PixelFormatCode,
 } from "https://sanzentyo.github.io/imq/imqraw/v0.1.0/imqraw.js";
 
 await init();
@@ -37,7 +39,12 @@ const bundle = encodeBundle([
   { data: distorted, width: 2, height: 1, label: "distorted", tags: ["dist"] },
 ]);
 
-console.log(single.byteLength, imqraw_image_count(bundle));
+const mask = encodeImage(new Uint8Array([0b00000011]), 2, 1, PixelFormatCode.Binary1Lsb, {
+  label: "mask",
+  tags: ["binary"],
+});
+
+console.log(single.byteLength, mask.byteLength, imqraw_image_count(bundle));
 ```
 
 Three.js/WebGL capture:
@@ -70,7 +77,9 @@ setup, point TypeScript at the declaration file:
 import {
   init,
   encodeBundle,
+  encodeImage,
   imqraw_image_count,
+  PixelFormatCode,
   type Rgba8Image,
 } from "https://sanzentyo.github.io/imq/imqraw/v0.1.0/imqraw.js";
 
@@ -93,6 +102,13 @@ const candidate: Rgba8Image = {
 };
 
 const bytes: Uint8Array = encodeBundle([reference, candidate]);
+const hsvBytes: Uint8Array = encodeImage(
+  new Uint8Array([0, 255, 255]),
+  1,
+  1,
+  PixelFormatCode.Hsv8,
+  { label: "hsv" },
+);
 console.log(imqraw_image_count(bytes));
 ```
 
@@ -112,7 +128,7 @@ Encode and decode a tagged multi-image bundle:
 
 ```rust
 use imq::{
-    FrameOwned, PixelFormat, RawImageBundle, RawImageRecord, Result,
+    Dimensions, FormatSpec, FrameOwned, OwnedPlane, PixelFormat, RawImageBundle, RawImageRecord, Result,
     decode_imqraw_bundle, encode_imqraw_bundle,
 };
 
@@ -129,6 +145,11 @@ fn main() -> Result<()> {
         1,
         PixelFormat::Rgba8,
     )?;
+    let mask = FrameOwned::new(
+        Dimensions::new(2, 1)?,
+        FormatSpec::new(PixelFormat::Binary1Lsb),
+        vec![OwnedPlane::new(vec![0b0000_0011], 1)],
+    )?;
 
     let bundle = RawImageBundle::new(vec![
         RawImageRecord::new(
@@ -141,6 +162,7 @@ fn main() -> Result<()> {
             vec!["dist".to_string()],
             distorted,
         ),
+        RawImageRecord::new(Some("mask".to_string()), vec!["mask".to_string()], mask),
     ]);
 
     let bytes = encode_imqraw_bundle(&bundle)?;

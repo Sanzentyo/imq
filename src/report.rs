@@ -1,7 +1,7 @@
 //! Report structs returned by image and video comparisons.
 
 use crate::frame::{Dimensions, FormatSpec};
-use crate::metrics::MetricOutput;
+use crate::metrics::{AlphaDiagnostics, MetricOutput};
 
 /// Full-reference comparison report for one pair of images/frames.
 #[derive(Debug, Clone)]
@@ -11,6 +11,12 @@ pub struct ComparisonReport {
     pub reference: Option<String>,
     /// Optional caller-provided distorted label/path.
     pub distorted: Option<String>,
+    /// Structured reference input metadata.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub reference_input: Option<ComparisonInput>,
+    /// Structured candidate/distorted input metadata.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub candidate_input: Option<ComparisonInput>,
     /// Frame dimensions.
     pub dimensions: Dimensions,
     /// Reference format.
@@ -19,6 +25,12 @@ pub struct ComparisonReport {
     pub distorted_format: FormatSpec,
     /// Metric outputs.
     pub metrics: Vec<MetricOutput>,
+    /// Alpha diagnostics, when computed.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub alpha: Option<AlphaDiagnostics>,
+    /// Threshold gate result, when thresholds were requested.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub gate: Option<ComparisonGateReport>,
 }
 
 impl ComparisonReport {
@@ -32,10 +44,14 @@ impl ComparisonReport {
         Self {
             reference: None,
             distorted: None,
+            reference_input: None,
+            candidate_input: None,
             dimensions,
             reference_format,
             distorted_format,
             metrics,
+            alpha: None,
+            gate: None,
         }
     }
 
@@ -50,12 +66,121 @@ impl ComparisonReport {
         self
     }
 
+    /// Adds structured input metadata.
+    pub fn with_inputs(mut self, reference: ComparisonInput, candidate: ComparisonInput) -> Self {
+        self.reference_input = Some(reference);
+        self.candidate_input = Some(candidate);
+        self
+    }
+
+    /// Adds alpha diagnostics.
+    pub fn with_alpha(mut self, alpha: AlphaDiagnostics) -> Self {
+        self.alpha = Some(alpha);
+        self
+    }
+
+    /// Adds threshold gate details.
+    pub fn with_gate(mut self, gate: ComparisonGateReport) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
     /// Serializes as pretty JSON.
     #[cfg(feature = "serde")]
     #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
     pub fn to_json_pretty(&self) -> crate::Result<String> {
         Ok(serde_json::to_string_pretty(self)?)
     }
+}
+
+/// Minimal machine-readable input metadata for comparison reports.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ComparisonInput {
+    /// Filesystem path when the input came from a path.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub path: Option<String>,
+    /// `imqraw` bundle index when selected by index.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub index: Option<usize>,
+    /// `imqraw` tag when selected by tag.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub tag: Option<String>,
+    /// Record label when provided by the input.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub label: Option<String>,
+}
+
+impl ComparisonInput {
+    /// Creates metadata for a path input.
+    pub fn path(path: impl Into<String>) -> Self {
+        Self {
+            path: Some(path.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Creates metadata for a labeled non-path input such as stdin.
+    pub fn label(label: impl Into<String>) -> Self {
+        Self {
+            label: Some(label.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Creates metadata for an `imqraw` index selection.
+    pub fn imqraw_index(index: usize, label: Option<String>) -> Self {
+        Self {
+            index: Some(index),
+            label,
+            ..Self::default()
+        }
+    }
+
+    /// Creates metadata for an `imqraw` tag selection.
+    pub fn imqraw_tag(tag: impl Into<String>, label: Option<String>) -> Self {
+        Self {
+            tag: Some(tag.into()),
+            label,
+            ..Self::default()
+        }
+    }
+}
+
+/// Thresholds applied to an image comparison.
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ComparisonThresholds {
+    /// Metric key selected for PSNR gate checks.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub selected_metric: Option<String>,
+    /// Minimum selected metric score.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub fail_under: Option<f64>,
+    /// Maximum selected metric channel delta in normalized units.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub max_selected_channel_delta: Option<f64>,
+    /// Maximum alpha delta in 8-bit code units.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub max_alpha_delta: Option<u8>,
+    /// Maximum alpha mismatch count.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub max_alpha_mismatches: Option<u64>,
+    /// Maximum alpha mismatch count above one 8-bit LSB.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub max_alpha_mismatches_beyond_one_lsb: Option<u64>,
+}
+
+/// Result of applying comparison thresholds.
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ComparisonGateReport {
+    /// Thresholds that were applied.
+    pub thresholds: ComparisonThresholds,
+    /// Whether all thresholds passed.
+    pub passed: bool,
+    /// Human-readable failure reasons.
+    pub failures: Vec<String>,
 }
 
 /// Report for one frame pair in a video comparison.
@@ -89,6 +214,52 @@ pub struct VideoReport {
 }
 
 impl VideoReport {
+    /// Serializes as pretty JSON.
+    #[cfg(feature = "serde")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+    pub fn to_json_pretty(&self) -> crate::Result<String> {
+        Ok(serde_json::to_string_pretty(self)?)
+    }
+}
+
+/// Report for one explicitly ordered video frame pair.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FramePairReport {
+    /// Zero-based pair index preserving user input order.
+    pub pair_index: u64,
+    /// Reference frame index.
+    pub reference_frame_index: u64,
+    /// Distorted/candidate frame index.
+    pub distorted_frame_index: u64,
+    /// Optional canonical/reporting frame index from 3-tuple syntax.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub label_frame_index: Option<u64>,
+    /// Reference PTS when known.
+    pub reference_pts_seconds: Option<f64>,
+    /// Distorted/candidate PTS when known.
+    pub distorted_pts_seconds: Option<f64>,
+    /// Per-pair metric results.
+    pub metrics: Vec<MetricOutput>,
+}
+
+/// Report for explicitly ordered video frame-pair comparisons.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct VideoFramePairComparisonReport {
+    /// Reference label/path/URI.
+    pub reference: String,
+    /// Distorted label/path/URI.
+    pub distorted: String,
+    /// Compared dimensions.
+    pub dimensions: Dimensions,
+    /// Ordered frame-pair reports.
+    pub pairs: Vec<FramePairReport>,
+    /// Mean metric scores over all pairs.
+    pub mean_metrics: Vec<MetricOutput>,
+}
+
+impl VideoFramePairComparisonReport {
     /// Serializes as pretty JSON.
     #[cfg(feature = "serde")]
     #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]

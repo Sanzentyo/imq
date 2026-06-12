@@ -111,6 +111,33 @@ pub fn preview_image(path: &Path, options: &PreviewOptions) -> Result<PreviewIma
     ))
 }
 
+/// Generates a preview from encoded image bytes.
+pub fn preview_image_bytes(
+    bytes: &[u8],
+    options: &PreviewOptions,
+    source: String,
+) -> Result<PreviewImage> {
+    let image = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()?
+        .decode()?;
+    Ok(dynamic_to_preview(
+        image,
+        options.width,
+        options.height,
+        options.fit,
+        source,
+    ))
+}
+
+/// Generates a preview from a decoded dynamic image.
+pub fn preview_dynamic_image(
+    image: DynamicImage,
+    options: &PreviewOptions,
+    source: String,
+) -> PreviewImage {
+    dynamic_to_preview(image, options.width, options.height, options.fit, source)
+}
+
 /// Generates a preview for a video by extracting a frame with ffmpeg.
 pub fn preview_video(path: &Path, options: &PreviewOptions) -> Result<PreviewImage> {
     let frame = ffmpeg::thumbnail_png(path, options)?;

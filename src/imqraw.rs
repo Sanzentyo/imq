@@ -219,6 +219,10 @@ fn pixel_format_code(value: PixelFormat) -> u16 {
         PixelFormat::Yuv422p8 => 12,
         PixelFormat::Yuv420p8 => 13,
         PixelFormat::Nv12 => 14,
+        PixelFormat::Hsv8 => 15,
+        PixelFormat::Hsva8 => 16,
+        PixelFormat::Binary1Lsb => 17,
+        PixelFormat::Binary1Msb => 18,
     }
 }
 
@@ -238,6 +242,10 @@ fn pixel_format_from_code(code: u16) -> Result<PixelFormat> {
         12 => Ok(PixelFormat::Yuv422p8),
         13 => Ok(PixelFormat::Yuv420p8),
         14 => Ok(PixelFormat::Nv12),
+        15 => Ok(PixelFormat::Hsv8),
+        16 => Ok(PixelFormat::Hsva8),
+        17 => Ok(PixelFormat::Binary1Lsb),
+        18 => Ok(PixelFormat::Binary1Msb),
         _ => Err(Error::unsupported(format!(
             "unknown imqraw pixel format code {code}"
         ))),
