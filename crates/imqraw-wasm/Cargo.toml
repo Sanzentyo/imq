@@ -2,7 +2,7 @@
 name = "imqraw-wasm"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.95"
 description = "WebAssembly bindings for imqraw lossless raw image bundles."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Sanzentyo/imq"
@@ -11,6 +11,6 @@ repository = "https://github.com/Sanzentyo/imq"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-imq = { path = "../..", default-features = false }
+imq = { version = "0.1.0", path = "../..", default-features = false }
 js-sys = "0.3.99"
 wasm-bindgen = "0.2.122"
