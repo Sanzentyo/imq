@@ -6,6 +6,7 @@
 
 use crate::frame::{FrameView, PixelFormat, Validated};
 use crate::{Error, Result};
+#[cfg(feature = "image-codecs")]
 use std::path::Path;
 
 /// RGBA8 image data returned by diff/heatmap helpers.
@@ -70,6 +71,7 @@ pub struct DiffImageOptions {
     /// Visual encoding mode.
     pub mode: DiffImageMode,
     /// Multiplier applied before converting normalized differences to 8-bit colors.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub scale: f64,
     /// Whether alpha differences should affect the output alpha channel when both frames contain alpha.
     pub include_alpha: bool,

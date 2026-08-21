@@ -31,7 +31,10 @@ pub mod reference_vectors;
 #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
 pub mod remote;
 pub mod report;
+#[cfg(feature = "serde")]
+mod serde_f64;
 pub mod stats;
+pub mod suite;
 pub mod video_analysis;
 
 #[cfg(feature = "ffmpeg")]
@@ -62,11 +65,18 @@ pub use frame::{
     FullRange, LimitedRange, OwnedPlane, PixelFormat, PlaneView, Transfer, Unchecked, Validated,
 };
 pub use gate::{
-    GateEvaluation, GateOperator, MetricThresholdCheck, MetricThresholdRule, evaluate_thresholds,
+    BaselineGateEvaluation, BaselineThresholdCheck, BaselineThresholdRule, GateEvaluation,
+    GateOperator, MetricThresholdCheck, MetricThresholdRule, evaluate_baseline_thresholds,
+    evaluate_thresholds,
 };
 pub use imqraw::{
-    RawImageBundle, RawImageRecord, RawImageSelector, decode_bundle as decode_imqraw_bundle,
-    encode_bundle as encode_imqraw_bundle,
+    RawImageBundle, RawImageRecord, RawImageSelector, bundle_find_tag as imqraw_find_tag,
+    bundle_record_count as imqraw_record_count, decode_bundle as decode_imqraw_bundle,
+    decode_bundle_from_reader as decode_imqraw_bundle_from_reader,
+    decode_bundle_record as decode_imqraw_record, encode_bundle as encode_imqraw_bundle,
+    encode_bundle_to_writer as encode_imqraw_bundle_to_writer,
+    encode_records_to_writer as encode_imqraw_records_to_writer,
+    validate_bundle as validate_imqraw_bundle,
 };
 pub use metrics::{
     AlphaBucketCounts, AlphaDiagnostics, Direction, Metric, MetricOutput, MetricSet, MetricSpec,
@@ -85,10 +95,19 @@ pub use remote::{
 };
 pub use report::{
     ComparisonGateReport, ComparisonInput, ComparisonReport, ComparisonThresholds, FramePairReport,
-    FrameReport, VideoFramePairComparisonReport, VideoReport,
+    FrameReport, QualityGateReport, VideoFramePairComparisonReport, VideoReport,
 };
+#[cfg(feature = "serde")]
+#[doc(hidden)]
+pub use serde_f64::map_to_json as metric_details_to_json;
 pub use stats::{ImageStatistics, ImageStatisticsOptions, image_statistics};
+pub use suite::{
+    CandidateComparison, CandidateFailurePolicy, ComparisonCandidate, ComparisonSuiteOptions,
+    ComparisonSuiteReport, MetricRanking, RankedCandidate, ScoreTolerance, compare_candidate_suite,
+};
 pub use video_analysis::{
-    MetricSeriesAggregate, PercentileValue, TimestampFramePair, TimestampPairingOptions,
-    TimestampedFrame, VideoAggregationPolicy, aggregate_video_report, pair_frames_by_timestamp,
+    MetricSeriesAggregate, PercentileValue, TimestampAlignmentReport, TimestampFramePair,
+    TimestampPairingOptions, TimestampTransform, TimestampedFrame, VideoAggregationPolicy,
+    aggregate_video_report, align_frames_by_timestamp, estimate_timestamp_transform,
+    pair_frames_by_timestamp, pair_frames_by_timestamp_with_transform,
 };

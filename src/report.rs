@@ -1,6 +1,7 @@
 //! Report structs returned by image and video comparisons.
 
 use crate::frame::{Dimensions, FormatSpec};
+use crate::gate::{BaselineGateEvaluation, GateEvaluation};
 use crate::metrics::{AlphaDiagnostics, MetricOutput};
 
 /// Full-reference comparison report for one pair of images/frames.
@@ -155,10 +156,22 @@ pub struct ComparisonThresholds {
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub selected_metric: Option<String>,
     /// Minimum selected metric score.
-    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(
+            with = "crate::serde_f64::option",
+            skip_serializing_if = "Option::is_none"
+        )
+    )]
     pub fail_under: Option<f64>,
     /// Maximum selected metric channel delta in normalized units.
-    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(
+            with = "crate::serde_f64::option",
+            skip_serializing_if = "Option::is_none"
+        )
+    )]
     pub max_selected_channel_delta: Option<f64>,
     /// Maximum alpha delta in 8-bit code units.
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
@@ -183,6 +196,92 @@ pub struct ComparisonGateReport {
     pub failures: Vec<String>,
 }
 
+/// Structured report produced by the supplemental still-image quality gate.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct QualityGateReport {
+    /// Reference/original image label or path.
+    pub reference: String,
+    /// Candidate/distorted image label or path.
+    pub candidate: String,
+    /// Compared frame dimensions.
+    pub dimensions: Dimensions,
+    /// Reference format metadata used by metric conversion.
+    pub reference_format: FormatSpec,
+    /// Candidate format metadata used by metric conversion.
+    pub candidate_format: FormatSpec,
+    /// Optional baseline candidate label or path used by relative rules.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub baseline: Option<String>,
+    /// Baseline format metadata, when a baseline was compared.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub baseline_format: Option<FormatSpec>,
+    /// Candidate metric outputs, including distribution and channel details.
+    pub candidate_metrics: Vec<MetricOutput>,
+    /// Baseline metric outputs, when a baseline was compared.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub baseline_metrics: Option<Vec<MetricOutput>>,
+    /// Absolute threshold evaluation.
+    pub thresholds: GateEvaluation,
+    /// Baseline-relative threshold evaluation, when requested.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub baseline_thresholds: Option<BaselineGateEvaluation>,
+    /// Whether every absolute and baseline-relative check passed.
+    pub passed: bool,
+}
+
+impl QualityGateReport {
+    /// Creates a structured quality gate report and derives its aggregate status.
+    pub fn new(
+        reference: impl Into<String>,
+        candidate: impl Into<String>,
+        dimensions: Dimensions,
+        reference_format: FormatSpec,
+        candidate_format: FormatSpec,
+        candidate_metrics: Vec<MetricOutput>,
+        thresholds: GateEvaluation,
+    ) -> Self {
+        let passed = thresholds.passed;
+        Self {
+            reference: reference.into(),
+            candidate: candidate.into(),
+            dimensions,
+            reference_format,
+            candidate_format,
+            baseline: None,
+            baseline_format: None,
+            candidate_metrics,
+            baseline_metrics: None,
+            thresholds,
+            baseline_thresholds: None,
+            passed,
+        }
+    }
+
+    /// Adds baseline metrics and their threshold evaluation.
+    pub fn with_baseline(
+        mut self,
+        baseline: impl Into<String>,
+        format: FormatSpec,
+        metrics: Vec<MetricOutput>,
+        evaluation: BaselineGateEvaluation,
+    ) -> Self {
+        self.passed &= evaluation.passed;
+        self.baseline = Some(baseline.into());
+        self.baseline_format = Some(format);
+        self.baseline_metrics = Some(metrics);
+        self.baseline_thresholds = Some(evaluation);
+        self
+    }
+
+    /// Serializes as pretty JSON.
+    #[cfg(feature = "serde")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+    pub fn to_json_pretty(&self) -> crate::Result<String> {
+        Ok(serde_json::to_string_pretty(self)?)
+    }
+}
+
 /// Report for one frame pair in a video comparison.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -190,6 +289,7 @@ pub struct FrameReport {
     /// Zero-based compared frame index in decode order.
     pub frame_index: u64,
     /// Optional presentation timestamp in seconds when known.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::option"))]
     pub pts_seconds: Option<f64>,
     /// Per-frame metric results.
     pub metrics: Vec<MetricOutput>,
@@ -236,8 +336,10 @@ pub struct FramePairReport {
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub label_frame_index: Option<u64>,
     /// Reference PTS when known.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::option"))]
     pub reference_pts_seconds: Option<f64>,
     /// Distorted/candidate PTS when known.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::option"))]
     pub distorted_pts_seconds: Option<f64>,
     /// Per-pair metric results.
     pub metrics: Vec<MetricOutput>,

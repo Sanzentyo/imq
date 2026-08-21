@@ -3,6 +3,8 @@
 pub mod ffmpeg;
 
 pub use ffmpeg::{
-    FfmpegFrameIter, FfmpegOptions, VideoCompareOptions, VideoInfo, compare_videos,
-    decode_single_frame, probe_video,
+    DecodedVideoFrame, FfmpegFrameIter, FfmpegOptions, FfmpegTimestampedFrameIter,
+    TimestampVideoCompareOptions, TimestampVideoComparison, VideoCompareOptions, VideoFrameInfo,
+    VideoInfo, VideoStreamControl, VideoStreamSummary, compare_videos, compare_videos_by_timestamp,
+    compare_videos_streaming, decode_single_frame, probe_video, probe_video_frames,
 };

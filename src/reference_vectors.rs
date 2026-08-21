@@ -17,10 +17,13 @@ const HALF_ERROR_DIST: [u8; 4] = [0, 255, 255, 0];
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ReferenceMetricExpectations {
     /// Expected normalized MSE.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub mse: f64,
     /// Expected normalized MAE.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub mae: f64,
     /// Expected PSNR in dB; may be infinity for identical images.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub psnr: f64,
 }
 

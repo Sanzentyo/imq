@@ -13,6 +13,7 @@ use crate::{Error, Result};
 const DEFAULT_WINDOW_WIDTH: usize = 8;
 const DEFAULT_WINDOW_HEIGHT: usize = 8;
 const DEFAULT_MS_SSIM_STRIDE: usize = 4;
+const SSIM_HISTOGRAM_BINS: usize = 4096;
 const DEFAULT_MS_SSIM_WEIGHTS: [f64; 5] = [0.0448, 0.2856, 0.3001, 0.2363, 0.1333];
 
 /// Global-luma SSIM.
@@ -103,9 +104,11 @@ impl Metric for Ssim {
 
 /// Mean local luma SSIM over deterministic box windows.
 ///
-/// `new()` keeps the first implementation's non-overlapping 8x8 behavior. Use
-/// [`WindowedSsim::with_sliding_window`] to request overlapping windows such as
-/// an 8x8 window with a 4-pixel stride.
+/// `new()` keeps the first implementation's 8x8 window and 8-pixel stride.
+/// When a dimension is not divisible by eight, the final full-size window is
+/// anchored to the image edge and can overlap its predecessor. Use
+/// [`WindowedSsim::with_sliding_window`] to request another layout such as an
+/// 8x8 window with a 4-pixel stride.
 #[derive(Debug, Clone, Copy)]
 pub struct WindowedSsim {
     c1: f64,
@@ -117,17 +120,17 @@ pub struct WindowedSsim {
 }
 
 impl WindowedSsim {
-    /// Default non-overlapping SSIM window width in luma samples.
+    /// Default SSIM window width in luma samples.
     pub const DEFAULT_WINDOW_WIDTH: usize = DEFAULT_WINDOW_WIDTH;
-    /// Default non-overlapping SSIM window height in luma samples.
+    /// Default SSIM window height in luma samples.
     pub const DEFAULT_WINDOW_HEIGHT: usize = DEFAULT_WINDOW_HEIGHT;
 
-    /// Creates windowed SSIM with 8x8 non-overlapping windows and common constants.
+    /// Creates windowed SSIM with 8x8 windows, 8-pixel strides, and common constants.
     pub fn new() -> Self {
         Self::with_window(Self::DEFAULT_WINDOW_WIDTH, Self::DEFAULT_WINDOW_HEIGHT)
     }
 
-    /// Creates windowed SSIM with an explicit non-overlapping window size.
+    /// Creates windowed SSIM with window-sized strides.
     ///
     /// Zero dimensions are clamped to one luma sample to preserve infallible
     /// construction and avoid zero-step iteration.
@@ -236,7 +239,13 @@ impl Metric for WindowedSsim {
         .with_detail("mean_contrast_structure", stats.mean_cs)
         .with_detail("unweighted_mean", stats.mean_ssim)
         .with_detail("min_window_ssim", stats.min_ssim)
-        .with_detail("max_window_ssim", stats.max_ssim))
+        .with_detail("max_window_ssim", stats.max_ssim)
+        .with_detail("worst_window_x", stats.worst_window_x as f64)
+        .with_detail("worst_window_y", stats.worst_window_y as f64)
+        .with_detail("p01_window_ssim", stats.p01_ssim)
+        .with_detail("p05_window_ssim", stats.p05_ssim)
+        .with_detail("p50_window_ssim", stats.p50_ssim)
+        .with_detail("window_ssim_histogram_bins", SSIM_HISTOGRAM_BINS as f64))
     }
 }
 
@@ -332,6 +341,11 @@ impl Metric for MsSsim {
         let mut scale_cs = Vec::with_capacity(self.weights.len());
         let mut scale_widths = Vec::with_capacity(self.weights.len());
         let mut scale_heights = Vec::with_capacity(self.weights.len());
+        let mut scale_windows = Vec::with_capacity(self.weights.len());
+        let mut scale_min_ssim = Vec::with_capacity(self.weights.len());
+        let mut scale_p05_ssim = Vec::with_capacity(self.weights.len());
+        let mut scale_worst_x = Vec::with_capacity(self.weights.len());
+        let mut scale_worst_y = Vec::with_capacity(self.weights.len());
 
         for scale in 0..self.weights.len() {
             let stats = windowed_luma_stats(
@@ -353,6 +367,11 @@ impl Metric for MsSsim {
             scale_cs.push(stats.mean_cs);
             scale_widths.push(width);
             scale_heights.push(height);
+            scale_windows.push(stats.windows);
+            scale_min_ssim.push(stats.min_ssim);
+            scale_p05_ssim.push(stats.p05_ssim);
+            scale_worst_x.push(stats.worst_window_x);
+            scale_worst_y.push(stats.worst_window_y);
 
             if scale + 1 == self.weights.len() || (width == 1 && height == 1) {
                 break;
@@ -408,6 +427,26 @@ impl Metric for MsSsim {
                 .with_detail(
                     format!("scale{}_height", scale + 1),
                     scale_heights[scale] as f64,
+                )
+                .with_detail(
+                    format!("scale{}_windows", scale + 1),
+                    scale_windows[scale] as f64,
+                )
+                .with_detail(
+                    format!("scale{}_min_window_ssim", scale + 1),
+                    scale_min_ssim[scale],
+                )
+                .with_detail(
+                    format!("scale{}_p05_window_ssim", scale + 1),
+                    scale_p05_ssim[scale],
+                )
+                .with_detail(
+                    format!("scale{}_worst_window_x", scale + 1),
+                    scale_worst_x[scale] as f64,
+                )
+                .with_detail(
+                    format!("scale{}_worst_window_y", scale + 1),
+                    scale_worst_y[scale] as f64,
                 );
         }
 
@@ -421,6 +460,11 @@ struct WindowStats {
     mean_cs: f64,
     min_ssim: f64,
     max_ssim: f64,
+    p01_ssim: f64,
+    p05_ssim: f64,
+    p50_ssim: f64,
+    worst_window_x: usize,
+    worst_window_y: usize,
     windows: usize,
     window_width: usize,
     window_height: usize,
@@ -498,6 +542,9 @@ fn windowed_luma_stats(
     let mut sum_cs = 0.0;
     let mut min_ssim = f64::INFINITY;
     let mut max_ssim = f64::NEG_INFINITY;
+    let mut worst_window_x = 0usize;
+    let mut worst_window_y = 0usize;
+    let mut histogram = vec![0u64; SSIM_HISTOGRAM_BINS + 1];
 
     for y0 in y_starts {
         for &x0 in &x_starts {
@@ -518,8 +565,16 @@ fn windowed_luma_stats(
             windows += 1;
             sum_ssim += ssim;
             sum_cs += cs;
-            min_ssim = min_ssim.min(ssim);
+            if ssim < min_ssim {
+                min_ssim = ssim;
+                worst_window_x = x0;
+                worst_window_y = y0;
+            }
             max_ssim = max_ssim.max(ssim);
+            let histogram_index = (((ssim.clamp(-1.0, 1.0) + 1.0) * 0.5)
+                * SSIM_HISTOGRAM_BINS as f64)
+                .round() as usize;
+            histogram[histogram_index] += 1;
         }
     }
 
@@ -532,10 +587,27 @@ fn windowed_luma_stats(
         mean_cs: sum_cs / windows as f64,
         min_ssim,
         max_ssim,
+        p01_ssim: ssim_percentile(&histogram, windows, 0.01),
+        p05_ssim: ssim_percentile(&histogram, windows, 0.05),
+        p50_ssim: ssim_percentile(&histogram, windows, 0.50),
+        worst_window_x,
+        worst_window_y,
         windows,
         window_width,
         window_height,
     })
+}
+
+fn ssim_percentile(histogram: &[u64], count: usize, percentile: f64) -> f64 {
+    let rank = (percentile.clamp(0.0, 1.0) * count as f64).ceil().max(1.0) as u64;
+    let mut cumulative = 0u64;
+    for (index, bin_count) in histogram.iter().copied().enumerate() {
+        cumulative += bin_count;
+        if cumulative >= rank {
+            return (index as f64 / SSIM_HISTOGRAM_BINS as f64) * 2.0 - 1.0;
+        }
+    }
+    1.0
 }
 
 fn window_starts(size: usize, window: usize, stride: usize) -> Vec<usize> {
@@ -678,6 +750,10 @@ mod tests {
         assert!((output.score - 1.0).abs() < 1e-12);
         assert_eq!(output.details.get("windows").copied(), Some(2.0));
         assert_eq!(output.details.get("samples").copied(), Some(8.0));
+        assert_eq!(output.details.get("p01_window_ssim").copied(), Some(1.0));
+        assert_eq!(output.details.get("p50_window_ssim").copied(), Some(1.0));
+        assert_eq!(output.details.get("worst_window_x").copied(), Some(0.0));
+        assert_eq!(output.details.get("worst_window_y").copied(), Some(0.0));
     }
 
     #[test]
@@ -713,6 +789,8 @@ mod tests {
 
         assert!((output.score - 1.0).abs() < 1e-12);
         assert!(*output.details.get("scales").unwrap() >= 1.0);
+        assert_eq!(output.details.get("scale1_min_window_ssim"), Some(&1.0));
+        assert_eq!(output.details.get("scale1_p05_window_ssim"), Some(&1.0));
     }
 
     #[test]

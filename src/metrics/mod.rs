@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::thread;
 
 const PARALLEL_ERROR_MIN_PIXELS: usize = 512 * 512;
+const ERROR_HISTOGRAM_BINS: usize = 4096;
 
 mod basic;
 mod ssim;
@@ -93,12 +94,14 @@ pub struct MetricOutput {
     /// Stable metric name.
     pub name: String,
     /// Numeric score. Some metrics may be `f64::INFINITY` for perfect matches.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub score: f64,
     /// Score unit, e.g. `dB`, `unitless`, `normalized_code`.
     pub unit: String,
     /// Direction of quality.
     pub direction: Direction,
     /// Extra metric-specific values.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::map"))]
     pub details: BTreeMap<String, f64>,
 }
 
@@ -153,7 +156,7 @@ impl MetricOutput {
         self
     }
 
-    fn with_error_details(mut self, stats: &ErrorStats) -> Self {
+    fn with_error_details(mut self, stats: &ErrorStats, domain: SampleDomain) -> Self {
         self.details
             .insert("samples".to_string(), stats.count as f64);
         self.details
@@ -161,20 +164,101 @@ impl MetricOutput {
         self.details
             .insert("pixel_count".to_string(), stats.pixel_count as f64);
         self.details.insert("mae".to_string(), stats.mae());
+        self.details.insert("mse".to_string(), stats.mse());
+        self.details.insert("rmse".to_string(), stats.rmse());
+        self.details
+            .insert("mean_error".to_string(), stats.mean_error());
         self.details
             .insert("max_channel_delta".to_string(), stats.max_abs);
+        if let Some(location) = stats.max_error_location {
+            self.details
+                .insert("max_error_x".to_string(), location.x as f64);
+            self.details
+                .insert("max_error_y".to_string(), location.y as f64);
+            self.details
+                .insert("max_error_channel".to_string(), location.channel as f64);
+        }
         self.details
             .insert("max_pixel_delta".to_string(), stats.max_pixel_delta);
         self.details
             .insert("mse_code".to_string(), stats.mse() * 255.0 * 255.0);
         self.details
+            .insert("rmse_code".to_string(), stats.rmse() * 255.0);
+        self.details
             .insert("mae_code".to_string(), stats.mae() * 255.0);
+        self.details
+            .insert("mean_error_code".to_string(), stats.mean_error() * 255.0);
         self.details
             .insert("max_channel_delta_code".to_string(), stats.max_abs * 255.0);
         self.details.insert(
             "max_pixel_delta_code".to_string(),
             stats.max_pixel_delta * 255.0,
         );
+        self.details
+            .insert("changed_samples".to_string(), stats.changed_samples as f64);
+        self.details.insert(
+            "changed_sample_ratio".to_string(),
+            stats.changed_samples as f64 / stats.count as f64,
+        );
+        if stats.pixel_observations == stats.pixel_count {
+            self.details
+                .insert("changed_pixels".to_string(), stats.changed_pixels as f64);
+            self.details.insert(
+                "changed_pixel_ratio".to_string(),
+                stats.changed_pixels as f64 / stats.pixel_count as f64,
+            );
+            for (index, threshold) in [1u8, 2, 4, 8].into_iter().enumerate() {
+                let count = stats.pixels_beyond_lsb[index];
+                self.details
+                    .insert(format!("pixels_beyond_{threshold}_lsb"), count as f64);
+                self.details.insert(
+                    format!("pixel_ratio_beyond_{threshold}_lsb"),
+                    count as f64 / stats.pixel_count as f64,
+                );
+            }
+        }
+        for (index, threshold) in [1u8, 2, 4, 8].into_iter().enumerate() {
+            let count = stats.samples_beyond_lsb[index];
+            self.details
+                .insert(format!("samples_beyond_{threshold}_lsb"), count as f64);
+            self.details.insert(
+                format!("sample_ratio_beyond_{threshold}_lsb"),
+                count as f64 / stats.count as f64,
+            );
+        }
+        self.details.insert(
+            "error_histogram_bins".to_string(),
+            ERROR_HISTOGRAM_BINS as f64,
+        );
+        for (label, percentile) in [("p50", 0.50), ("p90", 0.90), ("p95", 0.95), ("p99", 0.99)] {
+            let value = stats.absolute_error_percentile(percentile);
+            self.details.insert(format!("abs_error_{label}"), value);
+            self.details
+                .insert(format!("abs_error_{label}_code"), value * 255.0);
+        }
+        self.details
+            .insert("channel_count".to_string(), stats.channel_count as f64);
+        for channel in 0..stats.channel_count {
+            let channel_stats = stats.channels[channel];
+            let channel_histogram = &stats.channel_histograms[channel];
+            let generic = format!("channel_{channel}");
+            add_channel_error_details(
+                &mut self.details,
+                &generic,
+                channel_stats,
+                channel_histogram,
+            );
+            if let Some(label) =
+                stats.channel_labels[channel].or_else(|| semantic_channel_label(domain, channel))
+            {
+                add_channel_error_details(
+                    &mut self.details,
+                    label,
+                    channel_stats,
+                    channel_histogram,
+                );
+            }
+        }
         self
     }
 }
@@ -570,39 +654,49 @@ fn aggregate_error_rows(
     end_y: Option<usize>,
 ) -> Result<ErrorStats> {
     let dims = ensure_same_dimensions(a, b)?;
-    let (_, h) = dims.as_usize()?;
+    let (w, h) = dims.as_usize()?;
     let end_y = end_y.unwrap_or(h).min(h);
-    let mut sum_sq = 0.0;
-    let mut sum_abs = 0.0;
-    let mut max_abs = 0.0;
-    let mut count = 0usize;
+    let mut stats = ErrorStats {
+        channel_labels: error_channel_labels(domain, a.pixel_format(), b.pixel_format()),
+        ..ErrorStats::default()
+    };
 
     match domain {
         SampleDomain::Luma => {
             for y in start_y..end_y {
-                for x in 0..usize::try_from(dims.width)
-                    .map_err(|_| Error::invalid_frame("width overflows usize"))?
-                {
+                for x in 0..w {
                     let x_value = read_luma(a, x, y)?;
                     let y_value = read_luma(b, x, y)?;
-                    push_error_sample(&mut sum_sq, &mut sum_abs, &mut max_abs, x_value, y_value);
-                    count += 1;
+                    let delta = x_value - y_value;
+                    stats.push_sample(delta, Some(0), Some(SampleLocation { x, y, channel: 0 }));
+                    stats.push_pixel(delta.abs());
+                    stats.max_pixel_delta = stats.max_pixel_delta.max(delta.abs());
                 }
             }
+            stats.pixel_count = (end_y - start_y) * w;
         }
         SampleDomain::Color => {
             for y in start_y..end_y {
-                for x in 0..usize::try_from(dims.width)
-                    .map_err(|_| Error::invalid_frame("width overflows usize"))?
-                {
+                for x in 0..w {
                     let ca = read_rgb(a, x, y)?;
                     let cb = read_rgb(b, x, y)?;
+                    let mut pixel_sum_sq = 0.0;
+                    let mut pixel_max = 0.0_f64;
                     for c in 0..3 {
-                        push_error_sample(&mut sum_sq, &mut sum_abs, &mut max_abs, ca[c], cb[c]);
-                        count += 1;
+                        let delta = ca[c] - cb[c];
+                        stats.push_sample(
+                            delta,
+                            Some(c),
+                            Some(SampleLocation { x, y, channel: c }),
+                        );
+                        pixel_sum_sq += delta * delta;
+                        pixel_max = pixel_max.max(delta.abs());
                     }
+                    stats.push_pixel(pixel_max);
+                    stats.max_pixel_delta = stats.max_pixel_delta.max(pixel_sum_sq.sqrt());
                 }
             }
+            stats.pixel_count = (end_y - start_y) * w;
         }
         SampleDomain::All if !a.pixel_format().is_yuv() && !b.pixel_format().is_yuv() => {
             let channels_a = stored_channel_count(a.pixel_format());
@@ -613,17 +707,34 @@ fn aggregate_error_rows(
                 )));
             }
             for y in start_y..end_y {
-                for x in 0..usize::try_from(dims.width)
-                    .map_err(|_| Error::invalid_frame("width overflows usize"))?
-                {
+                for x in 0..w {
                     let ca = read_stored_channels(a, x, y)?;
                     let cb = read_stored_channels(b, x, y)?;
+                    let mut pixel_sum_sq = 0.0;
+                    let mut pixel_max = 0.0_f64;
                     for c in 0..channels_a {
-                        push_error_sample(&mut sum_sq, &mut sum_abs, &mut max_abs, ca[c], cb[c]);
-                        count += 1;
+                        let delta = ca[c] - cb[c];
+                        stats.push_sample(
+                            delta,
+                            Some(c),
+                            Some(SampleLocation { x, y, channel: c }),
+                        );
+                        pixel_sum_sq += delta * delta;
+                        pixel_max = pixel_max.max(delta.abs());
                     }
+                    stats.push_pixel(pixel_max);
+                    stats.max_pixel_delta = stats.max_pixel_delta.max(pixel_sum_sq.sqrt());
                 }
             }
+            stats.pixel_count = (end_y - start_y) * w;
+        }
+        SampleDomain::All => {
+            if start_y != 0 || end_y != h {
+                return Err(Error::unsupported(
+                    "row-range aggregation is unsupported for stored YUV samples",
+                ));
+            }
+            return aggregate_yuv_storage_error(a, b);
         }
         SampleDomain::Render(domain) => {
             return aggregate_render_error_rows(a, b, domain, start_y, Some(end_y));
@@ -634,25 +745,74 @@ fn aggregate_error_rows(
                     "row-range aggregation is unsupported for this sample domain",
                 ));
             }
-            count = for_each_sample_pair(a, b, domain, |x, y| {
-                push_error_sample(&mut sum_sq, &mut sum_abs, &mut max_abs, x, y);
+            for_each_sample_pair(a, b, domain, |x, y| {
+                let delta = x - y;
+                stats.push_sample(
+                    delta,
+                    matches!(domain, SampleDomain::Plane(_)).then_some(0),
+                    None,
+                );
+                stats.push_pixel(delta.abs());
+                stats.max_pixel_delta = stats.max_pixel_delta.max(delta.abs());
             })?;
+            stats.pixel_count = match domain {
+                SampleDomain::All => dims.pixels().unwrap_or(stats.count),
+                _ => stats.count,
+            };
         }
     }
 
-    if count == 0 {
+    if stats.count == 0 {
         return Err(Error::unsupported(
             "metric received zero comparable samples",
         ));
     }
-    Ok(ErrorStats {
-        count,
-        pixel_count: inferred_pixel_count(domain, count),
-        sum_sq,
-        sum_abs,
-        max_abs,
-        max_pixel_delta: max_abs,
-    })
+    Ok(stats)
+}
+
+fn aggregate_yuv_storage_error(
+    a: &FrameView<'_, Validated>,
+    b: &FrameView<'_, Validated>,
+) -> Result<ErrorStats> {
+    ensure_same_dimensions(a, b)?;
+    if a.pixel_format() != b.pixel_format() || !a.pixel_format().is_yuv() {
+        return Err(Error::incompatible(
+            "SampleDomain::All requires identical YUV pixel formats",
+        ));
+    }
+
+    let format = a.pixel_format();
+    let mut stats = ErrorStats {
+        channel_labels: [Some("y"), Some("u"), Some("v"), None],
+        ..ErrorStats::default()
+    };
+    for plane_index in 0..format.plane_count() {
+        let plane_dimensions = format.plane_dimensions(a.dimensions(), plane_index)?;
+        let (row_bytes, height) = plane_dimensions.as_usize()?;
+        let reference_plane = a.plane(plane_index)?;
+        let distorted_plane = b.plane(plane_index)?;
+        for y in 0..height {
+            let reference_row = reference_plane.row(y, row_bytes)?;
+            let distorted_row = distorted_plane.row(y, row_bytes)?;
+            for x in 0..row_bytes {
+                let channel = if format == PixelFormat::Nv12 && plane_index == 1 {
+                    1 + x % 2
+                } else {
+                    plane_index
+                };
+                let delta = (reference_row[x] as f64 - distorted_row[x] as f64) / 255.0;
+                stats.push_sample(delta, Some(channel), None);
+            }
+        }
+    }
+    stats.pixel_count = a.dimensions().pixels()?;
+    if stats.count == 0 {
+        return Err(Error::unsupported(
+            "metric received zero comparable samples",
+        ));
+    }
+    stats.max_pixel_delta = stats.max_abs;
+    Ok(stats)
 }
 
 fn aggregate_error_parallel(
@@ -700,26 +860,12 @@ fn can_parallelize_error_domain(
     b: &FrameView<'_, Validated>,
     domain: SampleDomain,
 ) -> bool {
-    matches!(domain, SampleDomain::Luma | SampleDomain::Color)
-        || (matches!(domain, SampleDomain::All)
-            && !a.pixel_format().is_yuv()
-            && !b.pixel_format().is_yuv())
-}
-
-fn push_error_sample(
-    sum_sq: &mut f64,
-    sum_abs: &mut f64,
-    max_abs: &mut f64,
-    reference: f64,
-    distorted: f64,
-) {
-    let d = reference - distorted;
-    let ad = d.abs();
-    *sum_sq += d * d;
-    *sum_abs += ad;
-    if ad > *max_abs {
-        *max_abs = ad;
-    }
+    matches!(
+        domain,
+        SampleDomain::Luma | SampleDomain::Color | SampleDomain::Render(_)
+    ) || (matches!(domain, SampleDomain::All)
+        && !a.pixel_format().is_yuv()
+        && !b.pixel_format().is_yuv())
 }
 
 fn combine_error_stats(partials: Vec<ErrorStats>) -> ErrorStats {
@@ -730,8 +876,45 @@ fn combine_error_stats(partials: Vec<ErrorStats>) -> ErrorStats {
             acc.pixel_count += stats.pixel_count;
             acc.sum_sq += stats.sum_sq;
             acc.sum_abs += stats.sum_abs;
+            acc.sum_signed += stats.sum_signed;
+            if stats.max_abs > acc.max_abs {
+                acc.max_error_location = stats.max_error_location;
+            }
             acc.max_abs = acc.max_abs.max(stats.max_abs);
             acc.max_pixel_delta = acc.max_pixel_delta.max(stats.max_pixel_delta);
+            acc.changed_samples += stats.changed_samples;
+            acc.pixel_observations += stats.pixel_observations;
+            acc.changed_pixels += stats.changed_pixels;
+            for (target, source) in acc
+                .samples_beyond_lsb
+                .iter_mut()
+                .zip(stats.samples_beyond_lsb)
+            {
+                *target += source;
+            }
+            for (target, source) in acc
+                .pixels_beyond_lsb
+                .iter_mut()
+                .zip(stats.pixels_beyond_lsb)
+            {
+                *target += source;
+            }
+            acc.channel_count = acc.channel_count.max(stats.channel_count);
+            if acc.channel_labels.iter().all(Option::is_none) {
+                acc.channel_labels = stats.channel_labels;
+            }
+            for channel in 0..stats.channel_count {
+                acc.channels[channel].merge(stats.channels[channel]);
+                for (target, source) in acc.channel_histograms[channel]
+                    .iter_mut()
+                    .zip(stats.channel_histograms[channel].iter())
+                {
+                    *target += source;
+                }
+            }
+            for (target, source) in acc.histogram.iter_mut().zip(stats.histogram.iter()) {
+                *target += source;
+            }
             acc
         })
 }
@@ -827,14 +1010,14 @@ fn error_metric_output(spec: &MetricSpec, stats: &ErrorStats) -> MetricOutput {
             "normalized_code^2",
             Direction::LowerIsBetter,
         )
-        .with_error_details(stats),
+        .with_error_details(stats, spec.domain),
         "rmse" => MetricOutput::new(
             name,
             stats.rmse(),
             "normalized_code",
             Direction::LowerIsBetter,
         )
-        .with_error_details(stats),
+        .with_error_details(stats, spec.domain),
         "psnr" => {
             let mse = stats.mse();
             let psnr = if mse == 0.0 {
@@ -844,7 +1027,7 @@ fn error_metric_output(spec: &MetricSpec, stats: &ErrorStats) -> MetricOutput {
             };
             MetricOutput::new(name, psnr, "dB", Direction::HigherIsBetter)
                 .with_detail("mse", mse)
-                .with_error_details(stats)
+                .with_error_details(stats, spec.domain)
         }
         "mae" => MetricOutput::new(
             name,
@@ -852,14 +1035,14 @@ fn error_metric_output(spec: &MetricSpec, stats: &ErrorStats) -> MetricOutput {
             "normalized_code",
             Direction::LowerIsBetter,
         )
-        .with_error_details(stats),
+        .with_error_details(stats, spec.domain),
         "maxae" | "max_ae" | "max-error" => MetricOutput::new(
             name,
             stats.max_abs,
             "normalized_code",
             Direction::LowerIsBetter,
         )
-        .with_error_details(stats),
+        .with_error_details(stats, spec.domain),
         _ => unreachable!("error metric names are filtered before output"),
     }
 }
@@ -880,7 +1063,14 @@ fn aggregate_render_error_rows(
     let dims = ensure_same_dimensions(a, b)?;
     let (w, h) = dims.as_usize()?;
     let end_y = end_y.unwrap_or(h).min(h);
-    let mut stats = ErrorStats::default();
+    let mut stats = ErrorStats {
+        channel_labels: error_channel_labels(
+            SampleDomain::Render(domain),
+            a.pixel_format(),
+            b.pixel_format(),
+        ),
+        ..ErrorStats::default()
+    };
     for y in start_y..end_y {
         for x in 0..w {
             if !render_pixel_included(a, b, domain, x, y, w, h)? {
@@ -890,16 +1080,15 @@ fn aggregate_render_error_rows(
             let distorted = render_values(b, domain.channels, x, y)?;
             let channels = render_channel_count(domain.channels);
             let mut pixel_sum_sq = 0.0;
+            let mut pixel_max = 0.0_f64;
             for c in 0..channels {
                 let delta = render_channel_delta(domain.channels, c, reference[c], distorted[c]);
-                let abs = delta.abs();
-                stats.count += 1;
-                stats.sum_sq += delta * delta;
-                stats.sum_abs += abs;
-                stats.max_abs = stats.max_abs.max(abs);
+                stats.push_sample(delta, Some(c), Some(SampleLocation { x, y, channel: c }));
                 pixel_sum_sq += delta * delta;
+                pixel_max = pixel_max.max(delta.abs());
             }
             stats.pixel_count += 1;
+            stats.push_pixel(pixel_max);
             stats.max_pixel_delta = stats.max_pixel_delta.max(pixel_sum_sq.sqrt());
         }
     }
@@ -952,7 +1141,8 @@ fn render_pixel_included(
         return render_base_pixel_included(a, b, domain.mask, x, y);
     }
     let radius = domain.interior_radius;
-    if x < radius || y < radius || x + radius >= w || y + radius >= h {
+    if radius >= w || radius >= h || x < radius || y < radius || x >= w - radius || y >= h - radius
+    {
         return Ok(false);
     }
     for ny in (y - radius)..=(y + radius) {
@@ -1053,26 +1243,156 @@ fn render_channel_delta(
     }
 }
 
-fn inferred_pixel_count(domain: SampleDomain, count: usize) -> usize {
-    match domain {
-        SampleDomain::Luma | SampleDomain::Plane(_) => count,
-        SampleDomain::Color => count / 3,
-        SampleDomain::All => count,
-        SampleDomain::Render(domain) => count / render_channel_count(domain.channels),
+#[derive(Debug, Clone, Copy, Default)]
+struct ChannelErrorStats {
+    count: usize,
+    sum_sq: f64,
+    sum_abs: f64,
+    sum_signed: f64,
+    max_abs: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SampleLocation {
+    x: usize,
+    y: usize,
+    channel: usize,
+}
+
+impl ChannelErrorStats {
+    fn push(&mut self, delta: f64) {
+        let absolute = delta.abs();
+        self.count += 1;
+        self.sum_sq += delta * delta;
+        self.sum_abs += absolute;
+        self.sum_signed += delta;
+        self.max_abs = self.max_abs.max(absolute);
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.count += other.count;
+        self.sum_sq += other.sum_sq;
+        self.sum_abs += other.sum_abs;
+        self.sum_signed += other.sum_signed;
+        self.max_abs = self.max_abs.max(other.max_abs);
+    }
+
+    fn mse(self) -> f64 {
+        self.sum_sq / self.count as f64
+    }
+
+    fn rmse(self) -> f64 {
+        self.mse().sqrt()
+    }
+
+    fn mae(self) -> f64 {
+        self.sum_abs / self.count as f64
+    }
+
+    fn mean_error(self) -> f64 {
+        self.sum_signed / self.count as f64
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct ErrorStats {
     pub count: usize,
     pub pixel_count: usize,
     pub sum_sq: f64,
     pub sum_abs: f64,
+    pub sum_signed: f64,
     pub max_abs: f64,
     pub max_pixel_delta: f64,
+    max_error_location: Option<SampleLocation>,
+    changed_samples: usize,
+    samples_beyond_lsb: [usize; 4],
+    pixel_observations: usize,
+    changed_pixels: usize,
+    pixels_beyond_lsb: [usize; 4],
+    channel_count: usize,
+    channels: [ChannelErrorStats; 4],
+    channel_histograms: [Box<[u64]>; 4],
+    channel_labels: [Option<&'static str>; 4],
+    histogram: Box<[u64]>,
+}
+
+impl Default for ErrorStats {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            pixel_count: 0,
+            sum_sq: 0.0,
+            sum_abs: 0.0,
+            sum_signed: 0.0,
+            max_abs: 0.0,
+            max_pixel_delta: 0.0,
+            max_error_location: None,
+            changed_samples: 0,
+            samples_beyond_lsb: [0; 4],
+            pixel_observations: 0,
+            changed_pixels: 0,
+            pixels_beyond_lsb: [0; 4],
+            channel_count: 0,
+            channels: [ChannelErrorStats::default(); 4],
+            channel_histograms: std::array::from_fn(|_| {
+                vec![0; ERROR_HISTOGRAM_BINS + 1].into_boxed_slice()
+            }),
+            channel_labels: [None; 4],
+            histogram: vec![0; ERROR_HISTOGRAM_BINS + 1].into_boxed_slice(),
+        }
+    }
 }
 
 impl ErrorStats {
+    fn push_sample(
+        &mut self,
+        delta: f64,
+        channel: Option<usize>,
+        location: Option<SampleLocation>,
+    ) {
+        let absolute = delta.abs();
+        self.count += 1;
+        self.sum_sq += delta * delta;
+        self.sum_abs += absolute;
+        self.sum_signed += delta;
+        if absolute > self.max_abs {
+            self.max_abs = absolute;
+            self.max_error_location = location;
+        }
+        if absolute != 0.0 {
+            self.changed_samples += 1;
+        }
+        for (index, threshold) in [1.0, 2.0, 4.0, 8.0].into_iter().enumerate() {
+            if absolute * 255.0 > threshold {
+                self.samples_beyond_lsb[index] += 1;
+            }
+        }
+        let histogram_index = if !absolute.is_finite() || absolute >= 1.0 {
+            ERROR_HISTOGRAM_BINS
+        } else {
+            (absolute * ERROR_HISTOGRAM_BINS as f64).round() as usize
+        };
+        self.histogram[histogram_index] += 1;
+
+        if let Some(channel) = channel.filter(|channel| *channel < self.channels.len()) {
+            self.channel_count = self.channel_count.max(channel + 1);
+            self.channels[channel].push(delta);
+            self.channel_histograms[channel][histogram_index] += 1;
+        }
+    }
+
+    fn push_pixel(&mut self, max_channel_absolute_error: f64) {
+        self.pixel_observations += 1;
+        if max_channel_absolute_error != 0.0 {
+            self.changed_pixels += 1;
+        }
+        for (index, threshold) in [1.0, 2.0, 4.0, 8.0].into_iter().enumerate() {
+            if max_channel_absolute_error * 255.0 > threshold {
+                self.pixels_beyond_lsb[index] += 1;
+            }
+        }
+    }
+
     pub fn mse(&self) -> f64 {
         self.sum_sq / self.count as f64
     }
@@ -1084,6 +1404,158 @@ impl ErrorStats {
     pub fn mae(&self) -> f64 {
         self.sum_abs / self.count as f64
     }
+
+    fn mean_error(&self) -> f64 {
+        self.sum_signed / self.count as f64
+    }
+
+    fn absolute_error_percentile(&self, percentile: f64) -> f64 {
+        histogram_percentile(&self.histogram, self.count, self.max_abs, percentile)
+    }
+}
+
+fn add_channel_error_details(
+    details: &mut BTreeMap<String, f64>,
+    prefix: &str,
+    stats: ChannelErrorStats,
+    histogram: &[u64],
+) {
+    details.insert(format!("{prefix}_samples"), stats.count as f64);
+    details.insert(format!("{prefix}_mse"), stats.mse());
+    details.insert(format!("{prefix}_rmse"), stats.rmse());
+    details.insert(format!("{prefix}_mae"), stats.mae());
+    details.insert(format!("{prefix}_mean_error"), stats.mean_error());
+    details.insert(format!("{prefix}_max_delta"), stats.max_abs);
+    let mse = stats.mse();
+    details.insert(
+        format!("{prefix}_psnr"),
+        if mse == 0.0 {
+            f64::INFINITY
+        } else {
+            10.0 * (1.0 / mse).log10()
+        },
+    );
+    details.insert(format!("{prefix}_mae_code"), stats.mae() * 255.0);
+    details.insert(
+        format!("{prefix}_mean_error_code"),
+        stats.mean_error() * 255.0,
+    );
+    details.insert(format!("{prefix}_max_delta_code"), stats.max_abs * 255.0);
+    for (label, percentile) in [("p50", 0.50), ("p90", 0.90), ("p95", 0.95), ("p99", 0.99)] {
+        let value = histogram_percentile(histogram, stats.count, stats.max_abs, percentile);
+        details.insert(format!("{prefix}_abs_error_{label}"), value);
+        details.insert(format!("{prefix}_abs_error_{label}_code"), value * 255.0);
+    }
+}
+
+fn histogram_percentile(histogram: &[u64], count: usize, max_abs: f64, percentile: f64) -> f64 {
+    let rank = (percentile.clamp(0.0, 1.0) * count as f64).ceil().max(1.0) as u64;
+    let mut cumulative = 0u64;
+    for (index, bin_count) in histogram.iter().copied().enumerate() {
+        cumulative += bin_count;
+        if cumulative >= rank {
+            return if index == ERROR_HISTOGRAM_BINS && max_abs > 1.0 {
+                max_abs
+            } else {
+                index as f64 / ERROR_HISTOGRAM_BINS as f64
+            };
+        }
+    }
+    max_abs
+}
+
+fn semantic_channel_label(domain: SampleDomain, channel: usize) -> Option<&'static str> {
+    let labels: &[&str] = match domain {
+        SampleDomain::Luma => &["luma"],
+        SampleDomain::Color => &["red", "green", "blue"],
+        SampleDomain::Plane(_) => &["plane"],
+        SampleDomain::Render(RenderDomain {
+            channels: RenderChannels::Rgb,
+            ..
+        }) => &["red", "green", "blue"],
+        SampleDomain::Render(RenderDomain {
+            channels: RenderChannels::Rgba,
+            ..
+        }) => &["red", "green", "blue", "alpha"],
+        SampleDomain::Render(RenderDomain {
+            channels: RenderChannels::Gray,
+            ..
+        }) => &["gray"],
+        SampleDomain::Render(RenderDomain {
+            channels: RenderChannels::Binary,
+            ..
+        }) => &["binary"],
+        SampleDomain::Render(RenderDomain {
+            channels: RenderChannels::Hsv,
+            ..
+        }) => &["hue", "saturation", "value"],
+        SampleDomain::Render(RenderDomain {
+            channels: RenderChannels::Hsva,
+            ..
+        }) => &["hue", "saturation", "value", "alpha"],
+        SampleDomain::All => &[],
+    };
+    labels.get(channel).copied()
+}
+
+fn error_channel_labels(
+    domain: SampleDomain,
+    reference_format: PixelFormat,
+    distorted_format: PixelFormat,
+) -> [Option<&'static str>; 4] {
+    let labels: &[&str] = match domain {
+        SampleDomain::Luma => &["luma"],
+        SampleDomain::Color => &["red", "green", "blue"],
+        SampleDomain::Plane(_) => &["plane"],
+        SampleDomain::Render(RenderDomain {
+            channels: RenderChannels::Rgb,
+            ..
+        }) => &["red", "green", "blue"],
+        SampleDomain::Render(RenderDomain {
+            channels: RenderChannels::Rgba,
+            ..
+        }) => &["red", "green", "blue", "alpha"],
+        SampleDomain::Render(RenderDomain {
+            channels: RenderChannels::Gray,
+            ..
+        }) => &["gray"],
+        SampleDomain::Render(RenderDomain {
+            channels: RenderChannels::Binary,
+            ..
+        }) => &["binary"],
+        SampleDomain::Render(RenderDomain {
+            channels: RenderChannels::Hsv,
+            ..
+        }) => &["hue", "saturation", "value"],
+        SampleDomain::Render(RenderDomain {
+            channels: RenderChannels::Hsva,
+            ..
+        }) => &["hue", "saturation", "value", "alpha"],
+        SampleDomain::All if reference_format != distorted_format => &[],
+        SampleDomain::All => match reference_format {
+            PixelFormat::Luma8 | PixelFormat::Luma16Le => &["luma"],
+            PixelFormat::Rgb8 | PixelFormat::Rgb16Le | PixelFormat::RgbF32 => {
+                &["red", "green", "blue"]
+            }
+            PixelFormat::Rgba8 | PixelFormat::Rgba16Le | PixelFormat::RgbaF32 => {
+                &["red", "green", "blue", "alpha"]
+            }
+            PixelFormat::Bgr8 => &["blue", "green", "red"],
+            PixelFormat::Bgra8 => &["blue", "green", "red", "alpha"],
+            PixelFormat::Hsv8 => &["hue", "saturation", "value"],
+            PixelFormat::Hsva8 => &["hue", "saturation", "value", "alpha"],
+            PixelFormat::Yuv444p8
+            | PixelFormat::Yuv422p8
+            | PixelFormat::Yuv420p8
+            | PixelFormat::Nv12 => &["y", "u", "v"],
+            PixelFormat::Binary1Lsb | PixelFormat::Binary1Msb => &["binary"],
+        },
+    };
+    let mut output = [None; 4];
+    for (index, label) in labels.iter().copied().enumerate().take(output.len()) {
+        output[index] = Some(label);
+    }
+    output
 }
 
 fn stored_channel_count(format: PixelFormat) -> usize {
@@ -1577,6 +2049,18 @@ mod tests {
     }
 
     #[test]
+    fn oversized_interior_radius_returns_error_without_overflow() {
+        let frame = FrameOwned::packed_tight(vec![0, 0, 0, 255], 1, 1, PixelFormat::Rgba8).unwrap();
+        let domain = SampleDomain::Render(RenderDomain {
+            channels: RenderChannels::Rgb,
+            mask: RenderMask::Visible,
+            interior_radius: usize::MAX,
+        });
+        let error = aggregate_error(&frame.as_view(), &frame.as_view(), domain).unwrap_err();
+        assert!(error.to_string().contains("zero comparable samples"));
+    }
+
+    #[test]
     fn alpha_diagnostics_counts_buckets_and_mismatches() {
         let reference =
             FrameOwned::packed_tight(vec![0, 0, 0, 0, 0, 0, 0, 128], 2, 1, PixelFormat::Rgba8)
@@ -1631,5 +2115,128 @@ mod tests {
         let stats = aggregate_error(&reference.as_view(), &distorted.as_view(), domain).unwrap();
         assert_eq!(stats.pixel_count, 4);
         assert_eq!(stats.max_abs, 1.0);
+    }
+
+    #[test]
+    fn error_metrics_report_distribution_and_semantic_channels() {
+        let reference =
+            FrameOwned::packed_tight(vec![0, 0, 0, 0, 0, 0], 2, 1, PixelFormat::Rgb8).unwrap();
+        let distorted =
+            FrameOwned::packed_tight(vec![0, 10, 20, 30, 40, 50], 2, 1, PixelFormat::Rgb8).unwrap();
+        let output = MetricSet::from_csv("mae:color")
+            .unwrap()
+            .compare(&reference.as_view(), &distorted.as_view())
+            .unwrap()
+            .remove(0);
+
+        assert_eq!(output.details["pixel_count"], 2.0);
+        assert_eq!(output.details["channel_sample_count"], 6.0);
+        assert_eq!(output.details["changed_samples"], 5.0);
+        assert_eq!(output.details["changed_pixels"], 2.0);
+        assert_eq!(output.details["pixels_beyond_8_lsb"], 2.0);
+        assert_eq!(output.details["samples_beyond_1_lsb"], 5.0);
+        assert_eq!(output.details["samples_beyond_8_lsb"], 5.0);
+        assert_eq!(output.details["channel_count"], 3.0);
+        assert!((output.details["red_mae_code"] - 15.0).abs() < 1e-12);
+        assert!((output.details["red_abs_error_p99_code"] - 30.0).abs() < 0.04);
+        assert!((output.details["green_mae_code"] - 25.0).abs() < 1e-12);
+        assert!((output.details["blue_mae_code"] - 35.0).abs() < 1e-12);
+        assert!((output.details["max_pixel_delta_code"] - 70.710_678).abs() < 1e-5);
+        assert_eq!(output.details["max_error_x"], 1.0);
+        assert_eq!(output.details["max_error_y"], 0.0);
+        assert_eq!(output.details["max_error_channel"], 2.0);
+        assert!((output.details["abs_error_p50_code"] - 20.0).abs() < 0.04);
+        assert!((output.details["abs_error_p99_code"] - 50.0).abs() < 0.04);
+    }
+
+    #[test]
+    fn error_histograms_merge_without_losing_percentiles() {
+        let reference =
+            FrameOwned::packed_tight(vec![0, 0, 0, 0], 2, 2, PixelFormat::Luma8).unwrap();
+        let distorted =
+            FrameOwned::packed_tight(vec![0, 10, 20, 30], 2, 2, PixelFormat::Luma8).unwrap();
+        let top = aggregate_error_rows(
+            &reference.as_view(),
+            &distorted.as_view(),
+            SampleDomain::Luma,
+            0,
+            Some(1),
+        )
+        .unwrap();
+        let bottom = aggregate_error_rows(
+            &reference.as_view(),
+            &distorted.as_view(),
+            SampleDomain::Luma,
+            1,
+            Some(2),
+        )
+        .unwrap();
+        let combined = combine_error_stats(vec![top, bottom]);
+        let full = aggregate_error(
+            &reference.as_view(),
+            &distorted.as_view(),
+            SampleDomain::Luma,
+        )
+        .unwrap();
+
+        assert_eq!(combined.count, full.count);
+        assert_eq!(combined.changed_samples, full.changed_samples);
+        assert_eq!(
+            combined.absolute_error_percentile(0.95),
+            full.absolute_error_percentile(0.95)
+        );
+        assert_eq!(combined.channels[0].sum_abs, full.channels[0].sum_abs);
+    }
+
+    #[test]
+    fn plane_domain_reports_channel_statistics() {
+        let reference = FrameOwned::packed_tight(vec![0, 10], 2, 1, PixelFormat::Luma8).unwrap();
+        let distorted = FrameOwned::packed_tight(vec![0, 20], 2, 1, PixelFormat::Luma8).unwrap();
+        let output = MetricSet::from_csv("mae:plane0")
+            .unwrap()
+            .compare(&reference.as_view(), &distorted.as_view())
+            .unwrap()
+            .remove(0);
+        assert_eq!(output.details["channel_count"], 1.0);
+        assert!((output.details["plane_mae_code"] - 5.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn nv12_all_domain_keeps_y_u_v_channel_statistics() {
+        let dimensions = Dimensions::new(2, 2).unwrap();
+        let reference = FrameOwned::new(
+            dimensions,
+            crate::frame::FormatSpec::new(PixelFormat::Nv12),
+            vec![
+                crate::frame::OwnedPlane::new(vec![0; 4], 2),
+                crate::frame::OwnedPlane::new(vec![0; 2], 2),
+            ],
+        )
+        .unwrap();
+        let distorted = FrameOwned::new(
+            dimensions,
+            crate::frame::FormatSpec::new(PixelFormat::Nv12),
+            vec![
+                crate::frame::OwnedPlane::new(vec![0, 10, 0, 10], 2),
+                crate::frame::OwnedPlane::new(vec![20, 30], 2),
+            ],
+        )
+        .unwrap();
+        let output = MetricSet::from_csv("mae:all")
+            .unwrap()
+            .compare(&reference.as_view(), &distorted.as_view())
+            .unwrap()
+            .remove(0);
+
+        assert_eq!(output.details["channel_count"], 3.0);
+        assert_eq!(output.details["channel_0_samples"], 4.0);
+        assert_eq!(output.details["channel_1_samples"], 1.0);
+        assert_eq!(output.details["channel_2_samples"], 1.0);
+        assert!((output.details["channel_0_mae_code"] - 5.0).abs() < 1e-12);
+        assert!((output.details["channel_1_mae_code"] - 20.0).abs() < 1e-12);
+        assert!((output.details["channel_2_mae_code"] - 30.0).abs() < 1e-12);
+        assert!((output.details["y_mae_code"] - 5.0).abs() < 1e-12);
+        assert!((output.details["u_mae_code"] - 20.0).abs() < 1e-12);
+        assert!((output.details["v_mae_code"] - 30.0).abs() < 1e-12);
     }
 }

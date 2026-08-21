@@ -34,7 +34,7 @@ impl Metric for Mse {
             "normalized_code^2",
             Direction::LowerIsBetter,
         )
-        .with_detail("samples", stats.count as f64))
+        .with_error_details(&stats, self.domain))
     }
 }
 
@@ -68,7 +68,7 @@ impl Metric for Rmse {
             "normalized_code",
             Direction::LowerIsBetter,
         )
-        .with_detail("samples", stats.count as f64))
+        .with_error_details(&stats, self.domain))
     }
 }
 
@@ -111,7 +111,7 @@ impl Metric for Psnr {
         Ok(
             MetricOutput::new("psnr", psnr, "dB", Direction::HigherIsBetter)
                 .with_detail("mse", mse)
-                .with_detail("samples", stats.count as f64),
+                .with_error_details(&stats, self.domain),
         )
     }
 }
@@ -146,7 +146,7 @@ impl Metric for Mae {
             "normalized_code",
             Direction::LowerIsBetter,
         )
-        .with_detail("samples", stats.count as f64))
+        .with_error_details(&stats, self.domain))
     }
 }
 
@@ -180,6 +180,6 @@ impl Metric for MaxAbsoluteError {
             "normalized_code",
             Direction::LowerIsBetter,
         )
-        .with_detail("samples", stats.count as f64))
+        .with_error_details(&stats, self.domain))
     }
 }

@@ -80,15 +80,35 @@ impl SshInput {
                 (Some(user.to_string()), host_port)
             });
         let (host, port) = parse_host_port(host_port)?;
-        if host.is_empty() {
-            return Err(Error::unsupported("ssh URI host must not be empty"));
-        }
-        Ok(Self {
+        let input = Self {
             user,
             host,
             port,
             path,
-        })
+        };
+        input.validate()?;
+        Ok(input)
+    }
+
+    /// Validates values before they are passed to SSH/SCP command-line tools.
+    pub fn validate(&self) -> Result<()> {
+        validate_ssh_component("host", &self.host)?;
+        if let Some(user) = &self.user {
+            validate_ssh_component("user", user)?;
+            if user.contains('@') {
+                return Err(Error::unsupported("ssh user must not contain `@`"));
+            }
+        }
+        if self.port == Some(0) {
+            return Err(Error::unsupported("ssh port must be greater than zero"));
+        }
+        if !self.path.starts_with('/') {
+            return Err(Error::unsupported("ssh path must be absolute"));
+        }
+        if self.path.contains('\0') {
+            return Err(Error::unsupported("ssh path must not contain NUL"));
+        }
+        Ok(())
     }
 
     /// Returns the canonical URI string.
@@ -98,7 +118,13 @@ impl SshInput {
             uri.push_str(user);
             uri.push('@');
         }
-        uri.push_str(&self.host);
+        if self.host.contains(':') {
+            uri.push('[');
+            uri.push_str(&self.host);
+            uri.push(']');
+        } else {
+            uri.push_str(&self.host);
+        }
         if let Some(port) = self.port {
             uri.push(':');
             uri.push_str(&port.to_string());
@@ -113,9 +139,42 @@ impl SshInput {
             .as_ref()
             .map_or_else(|| self.host.clone(), |user| format!("{user}@{}", self.host))
     }
+
+    /// Host prefix suitable for an SCP remote-path argument.
+    pub fn scp_target(&self) -> String {
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        self.user
+            .as_ref()
+            .map_or(host.clone(), |user| format!("{user}@{host}"))
+    }
 }
 
 fn parse_host_port(input: &str) -> Result<(String, Option<u16>)> {
+    if let Some(bracketed) = input.strip_prefix('[') {
+        let (host, rest) = bracketed
+            .split_once(']')
+            .ok_or_else(|| Error::unsupported("invalid bracketed IPv6 ssh host"))?;
+        if host.is_empty() {
+            return Err(Error::unsupported("ssh URI host must not be empty"));
+        }
+        let port = match rest {
+            "" => None,
+            rest if rest.starts_with(':') => Some(parse_ssh_port(&rest[1..])?),
+            _ => {
+                return Err(Error::unsupported(
+                    "unexpected characters after bracketed ssh host",
+                ));
+            }
+        };
+        return Ok((host.to_string(), port));
+    }
+    if input.matches(':').count() > 1 {
+        return Ok((input.to_string(), None));
+    }
     let Some((host, port)) = input.rsplit_once(':') else {
         return Ok((input.to_string(), None));
     };
@@ -123,13 +182,38 @@ fn parse_host_port(input: &str) -> Result<(String, Option<u16>)> {
         return Ok((input.to_string(), None));
     }
     if port.chars().all(|c| c.is_ascii_digit()) {
-        let port = port
-            .parse::<u16>()
-            .map_err(|_| Error::unsupported(format!("invalid ssh URI port `{port}`")))?;
-        Ok((host.to_string(), Some(port)))
+        Ok((host.to_string(), Some(parse_ssh_port(port)?)))
     } else {
         Ok((input.to_string(), None))
     }
+}
+
+fn parse_ssh_port(port: &str) -> Result<u16> {
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| Error::unsupported(format!("invalid ssh URI port `{port}`")))?;
+    if port == 0 {
+        Err(Error::unsupported("ssh port must be greater than zero"))
+    } else {
+        Ok(port)
+    }
+}
+
+fn validate_ssh_component(label: &str, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(Error::unsupported(format!("ssh {label} must not be empty")));
+    }
+    if value.starts_with('-') {
+        return Err(Error::unsupported(format!(
+            "ssh {label} must not start with `-`"
+        )));
+    }
+    if value.chars().any(char::is_whitespace) || value.chars().any(char::is_control) {
+        return Err(Error::unsupported(format!(
+            "ssh {label} must not contain whitespace or control characters"
+        )));
+    }
+    Ok(())
 }
 
 /// Remote file transfer behavior.
@@ -399,6 +483,33 @@ mod tests {
         assert_eq!(input.host, "example.com");
         assert_eq!(input.port, Some(2222));
         assert_eq!(input.path, "/home/alice/a.png");
+    }
+
+    #[test]
+    fn parses_ipv6_ssh_uri_and_formats_targets() {
+        let InputSpec::Ssh(input) =
+            InputSpec::parse("ssh://alice@[2001:db8::1]:2222/home/a.mp4").unwrap()
+        else {
+            panic!("expected ssh input");
+        };
+        assert_eq!(input.host, "2001:db8::1");
+        assert_eq!(input.port, Some(2222));
+        assert_eq!(input.uri(), "ssh://alice@[2001:db8::1]:2222/home/a.mp4");
+        assert_eq!(input.ssh_target(), "alice@2001:db8::1");
+        assert_eq!(input.scp_target(), "alice@[2001:db8::1]");
+    }
+
+    #[test]
+    fn rejects_ssh_option_injection_and_invalid_authority() {
+        for input in [
+            "ssh://-oProxyCommand=evil/tmp/a.png",
+            "ssh://-user@example.com/tmp/a.png",
+            "ssh://user name@example.com/tmp/a.png",
+            "ssh://host:0/tmp/a.png",
+            "ssh://[2001:db8::1]junk/tmp/a.png",
+        ] {
+            assert!(InputSpec::parse(input).is_err(), "{input}");
+        }
     }
 
     #[test]

@@ -306,6 +306,50 @@ impl PixelFormat {
             u32::try_from(ph).map_err(|_| Error::invalid_frame("plane height overflows u32"))?,
         )
     }
+
+    /// Minimum useful bytes in one row for the requested plane.
+    pub fn plane_row_bytes(self, dims: Dimensions, plane: usize) -> Result<usize> {
+        if plane >= self.plane_count() {
+            return Err(Error::invalid_frame(format!(
+                "plane {plane} does not exist for {self:?}"
+            )));
+        }
+        if self.is_packed() {
+            let width = usize::try_from(dims.width)
+                .map_err(|_| Error::invalid_frame("width overflows usize"))?;
+            width
+                .checked_mul(self.bytes_per_pixel().expect("packed format has bpp"))
+                .ok_or_else(|| Error::invalid_frame("row byte count overflows usize"))
+        } else if self.is_bit_packed() {
+            usize::try_from(dims.width)
+                .map_err(|_| Error::invalid_frame("width overflows usize"))
+                .map(|width| width.div_ceil(8))
+        } else {
+            usize::try_from(self.plane_dimensions(dims, plane)?.width)
+                .map_err(|_| Error::invalid_frame("plane row bytes overflow usize"))
+        }
+    }
+
+    /// Minimum valid byte length for a plane using the supplied row stride.
+    pub fn plane_buffer_len(self, dims: Dimensions, plane: usize, stride: usize) -> Result<usize> {
+        let row_bytes = self.plane_row_bytes(dims, plane)?;
+        if stride < row_bytes {
+            return Err(Error::invalid_frame(format!(
+                "plane {plane} stride {stride} is smaller than required row bytes {row_bytes}"
+            )));
+        }
+        let height = if self.is_packed() || self.is_bit_packed() {
+            usize::try_from(dims.height)
+                .map_err(|_| Error::invalid_frame("height overflows usize"))?
+        } else {
+            usize::try_from(self.plane_dimensions(dims, plane)?.height)
+                .map_err(|_| Error::invalid_frame("plane height overflows usize"))?
+        };
+        stride
+            .checked_mul(height.saturating_sub(1))
+            .and_then(|length| length.checked_add(row_bytes))
+            .ok_or_else(|| Error::invalid_frame("plane buffer length overflows usize"))
+    }
 }
 
 /// Pixel-format metadata attached to a frame.
@@ -637,6 +681,44 @@ impl FrameOwned {
     pub fn into_parts(self) -> (Dimensions, FormatSpec, Vec<OwnedPlane>) {
         (self.dims, self.format, self.planes)
     }
+
+    /// Returns a tightly packed copy with per-row padding removed.
+    ///
+    /// The frame is cloned unchanged when every plane is already tight.
+    pub fn to_tightly_packed(&self) -> Result<Self> {
+        let planes =
+            self.planes
+                .iter()
+                .enumerate()
+                .map(|(index, plane)| {
+                    let row_bytes = self.format.pixel_format.plane_row_bytes(self.dims, index)?;
+                    let height = if self.format.pixel_format.is_packed()
+                        || self.format.pixel_format.is_bit_packed()
+                    {
+                        usize::try_from(self.dims.height)
+                            .map_err(|_| Error::invalid_frame("height overflows usize"))?
+                    } else {
+                        usize::try_from(
+                            self.format
+                                .pixel_format
+                                .plane_dimensions(self.dims, index)?
+                                .height,
+                        )
+                        .map_err(|_| Error::invalid_frame("plane height overflows usize"))?
+                    };
+                    let mut data =
+                        Vec::with_capacity(row_bytes.checked_mul(height).ok_or_else(|| {
+                            Error::invalid_frame("tight plane size overflows usize")
+                        })?);
+                    let view = plane.as_view();
+                    for y in 0..height {
+                        data.extend_from_slice(view.row(y, row_bytes)?);
+                    }
+                    Ok(OwnedPlane::new(data, row_bytes))
+                })
+                .collect::<Result<Vec<_>>>()?;
+        Self::new(self.dims, self.format, planes)
+    }
 }
 
 fn validate_parts(dims: Dimensions, format: FormatSpec, planes: &[PlaneView<'_>]) -> Result<()> {
@@ -650,20 +732,11 @@ fn validate_parts(dims: Dimensions, format: FormatSpec, planes: &[PlaneView<'_>]
 
     for (i, plane) in planes.iter().copied().enumerate() {
         let plane_dims = format.pixel_format.plane_dimensions(dims, i)?;
-        let (logical_row_bytes, plane_h) = if format.pixel_format.is_packed() {
-            let (w, h) = dims.as_usize()?;
-            let bpp = format.pixel_format.bytes_per_pixel().expect("packed bpp");
-            (
-                w.checked_mul(bpp)
-                    .ok_or_else(|| Error::invalid_frame("row bytes overflow"))?,
-                h,
-            )
-        } else if format.pixel_format.is_bit_packed() {
-            let (w, h) = dims.as_usize()?;
-            (w.div_ceil(8), h)
+        let logical_row_bytes = format.pixel_format.plane_row_bytes(dims, i)?;
+        let plane_h = if format.pixel_format.is_packed() || format.pixel_format.is_bit_packed() {
+            dims.as_usize()?.1
         } else {
-            let (pw, ph) = plane_dims.as_usize()?;
-            (pw, ph)
+            plane_dims.as_usize()?.1
         };
 
         if plane.stride < logical_row_bytes {
@@ -675,11 +748,9 @@ fn validate_parts(dims: Dimensions, format: FormatSpec, planes: &[PlaneView<'_>]
         if plane_h == 0 {
             return Err(Error::invalid_frame(format!("plane {i} has zero height")));
         }
-        let min_len = plane
-            .stride
-            .checked_mul(plane_h - 1)
-            .and_then(|n| n.checked_add(logical_row_bytes))
-            .ok_or_else(|| Error::invalid_frame("plane length calculation overflows usize"))?;
+        let min_len = format
+            .pixel_format
+            .plane_buffer_len(dims, i, plane.stride)?;
         if plane.data.len() < min_len {
             return Err(Error::invalid_frame(format!(
                 "plane {i} data length {} is smaller than required {min_len}",
@@ -705,5 +776,33 @@ mod tests {
     fn rejects_short_plane() {
         let err = FrameOwned::packed_tight(vec![0u8; 3], 2, 1, PixelFormat::Rgba8).unwrap_err();
         assert!(matches!(err, Error::InvalidFrame(_)));
+    }
+
+    #[test]
+    fn computes_minimum_plane_layouts() {
+        let dims = Dimensions::new(5, 3).unwrap();
+        assert_eq!(PixelFormat::Rgba8.plane_row_bytes(dims, 0).unwrap(), 20);
+        assert_eq!(PixelFormat::Yuv420p8.plane_row_bytes(dims, 1).unwrap(), 3);
+        assert_eq!(PixelFormat::Nv12.plane_row_bytes(dims, 1).unwrap(), 6);
+        assert_eq!(PixelFormat::Binary1Lsb.plane_row_bytes(dims, 0).unwrap(), 1);
+        assert_eq!(
+            PixelFormat::Rgba8.plane_buffer_len(dims, 0, 24).unwrap(),
+            68
+        );
+    }
+
+    #[test]
+    fn strips_row_padding_without_changing_pixels() {
+        let frame = FrameOwned::packed(
+            vec![1, 2, 3, 4, 99, 99, 5, 6, 7, 8],
+            1,
+            2,
+            PixelFormat::Rgba8,
+            6,
+        )
+        .unwrap();
+        let tight = frame.to_tightly_packed().unwrap();
+        assert_eq!(tight.owned_planes()[0].stride, 4);
+        assert_eq!(tight.owned_planes()[0].data, [1, 2, 3, 4, 5, 6, 7, 8]);
     }
 }

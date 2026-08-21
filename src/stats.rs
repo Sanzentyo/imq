@@ -64,28 +64,40 @@ pub struct ChannelStatisticsSet {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ChannelStatistics {
     /// Minimum value, normalized to 0..1.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub min: f64,
     /// Maximum value, normalized to 0..1.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub max: f64,
     /// Mean value.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub mean: f64,
     /// Standard deviation.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub std_dev: f64,
     /// Median value.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub median: f64,
     /// First percentile.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub p01: f64,
     /// Fifth percentile.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub p05: f64,
     /// Ninety-fifth percentile.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub p95: f64,
     /// Ninety-ninth percentile.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub p99: f64,
     /// Shannon entropy, in bits.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub entropy_bits: f64,
     /// Ratio of samples near 0.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub clipped_low_ratio: f64,
     /// Ratio of samples near 1.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub clipped_high_ratio: f64,
 }
 
@@ -94,10 +106,13 @@ pub struct ChannelStatistics {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct HsvStatistics {
     /// Circular mean hue in degrees.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub mean_hue_degrees: f64,
     /// Mean saturation.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub mean_saturation: f64,
     /// Mean value/brightness.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub mean_value: f64,
     /// Saturation channel statistics.
     pub saturation: ChannelStatistics,
@@ -110,20 +125,28 @@ pub struct HsvStatistics {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ColorBalance {
     /// Mean red value.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub red_mean: f64,
     /// Mean green value.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub green_mean: f64,
     /// Mean blue value.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub blue_mean: f64,
     /// RGB mean ratios summing to 1.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::array3"))]
     pub normalized_rgb: [f64; 3],
     /// Red minus blue mean. Positive is warmer.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub red_minus_blue: f64,
     /// Green minus average magenta axis.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub green_magenta: f64,
     /// Simple warm/cool score.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub warm_cool_score: f64,
     /// Approximate white balance gains to equalize channel means.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::array3"))]
     pub white_balance_gains: [f64; 3],
     /// Dominant mean channel.
     pub dominant_channel: String,
@@ -166,18 +189,25 @@ pub struct ImageTendencies {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SpatialStatistics {
     /// Mean luma in the image center.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub center_luma_mean: f64,
     /// Mean luma in the image border.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub border_luma_mean: f64,
     /// Center minus border luma.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub center_border_delta: f64,
     /// Top half mean luma.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub top_luma_mean: f64,
     /// Bottom half mean luma.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub bottom_luma_mean: f64,
     /// Left half mean luma.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub left_luma_mean: f64,
     /// Right half mean luma.
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_f64::value"))]
     pub right_luma_mean: f64,
 }
 
@@ -615,7 +645,7 @@ impl RunningMean {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "image-codecs"))]
 mod tests {
     use super::*;
     use crate::adapters::image_crate;

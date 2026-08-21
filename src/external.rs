@@ -135,10 +135,10 @@ fn parse_first_float(stdout: &str) -> Result<f64> {
         if token.is_empty() || token == "+" || token == "-" || token == "." {
             continue;
         }
-        if let Ok(value) = token.parse::<f64>() {
-            if value.is_finite() {
-                return Ok(value);
-            }
+        if let Ok(value) = token.parse::<f64>()
+            && value.is_finite()
+        {
+            return Ok(value);
         }
     }
     Err(Error::unsupported(

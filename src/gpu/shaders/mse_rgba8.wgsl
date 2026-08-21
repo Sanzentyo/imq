@@ -1,8 +1,8 @@
 struct Params {
     pixel_count: u32,
     groups_x: u32,
-    _pad1: u32,
-    _pad2: u32,
+    group_count: u32,
+    pair_count: u32,
 };
 
 struct PartialStats {
@@ -30,20 +30,25 @@ fn rgba8_to_f32(px: u32) -> vec4<f32> {
 
 @compute @workgroup_size(256)
 fn main(
-    @builtin(global_invocation_id) global_id: vec3<u32>,
     @builtin(local_invocation_id) local_id: vec3<u32>,
     @builtin(workgroup_id) workgroup_id: vec3<u32>,
 ) {
     let linear_workgroup_id = workgroup_id.x + workgroup_id.y * params.groups_x;
-    let pixel_index = global_id.x + global_id.y * params.groups_x * 256u;
+    let pixel_index = linear_workgroup_id * 256u + local_id.x;
+    let pair_index = workgroup_id.z;
     let lane = local_id.x;
 
     var sum_sq = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     var sum_abs = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     var max_abs = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-    if (pixel_index < params.pixel_count) {
+    if (
+        pair_index < params.pair_count &&
+        linear_workgroup_id < params.group_count &&
+        pixel_index < params.pixel_count
+    ) {
         let a = rgba8_to_f32(reference_pixels[pixel_index]);
-        let b = rgba8_to_f32(distorted_pixels[pixel_index]);
+        let distorted_index = pair_index * params.pixel_count + pixel_index;
+        let b = rgba8_to_f32(distorted_pixels[distorted_index]);
         let ad = abs(a - b);
         sum_sq = ad * ad;
         sum_abs = ad;
@@ -69,9 +74,14 @@ fn main(
         stride = stride / 2u;
     }
 
-    if (lane == 0u) {
-        partial_stats[linear_workgroup_id].sum_sq = local_sum_sq[0];
-        partial_stats[linear_workgroup_id].sum_abs = local_sum_abs[0];
-        partial_stats[linear_workgroup_id].max_abs = local_max_abs[0];
+    if (
+        lane == 0u &&
+        pair_index < params.pair_count &&
+        linear_workgroup_id < params.group_count
+    ) {
+        let partial_index = pair_index * params.group_count + linear_workgroup_id;
+        partial_stats[partial_index].sum_sq = local_sum_sq[0];
+        partial_stats[partial_index].sum_abs = local_sum_abs[0];
+        partial_stats[partial_index].max_abs = local_max_abs[0];
     }
 }

@@ -2,10 +2,12 @@
 name = "imq"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.95"
 description = "Sans-I/O image and video quality evaluation toolkit with CLI/TUI, ffmpeg pipes, Burn NN metrics, and wgpu kernels."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/Sanzentyo/imq"
+homepage = "https://github.com/Sanzentyo/imq"
 keywords = ["image", "quality", "psnr", "ssim", "ffmpeg"]
 categories = ["multimedia::images", "multimedia::video", "command-line-utilities"]
 
@@ -48,7 +50,7 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 image = { version = "0.25.10", optional = true }
 base64 = { version = "0.22.1", optional = true }
-anyhow = { version = "1.0.102", optional = true }
+anyhow = { version = "1.0.103", optional = true }
 clap = { version = "4.6.1", features = ["derive", "wrap_help"], optional = true }
 csv = { version = "1.4.0", optional = true }
 rusqlite = { version = "0.40.0", features = ["bundled"], optional = true }
