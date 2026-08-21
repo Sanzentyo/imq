@@ -14,6 +14,9 @@ import {
   encodeRgba8,
   encodeBundle,
   encodeImage,
+  decodeBundle,
+  decodeImage,
+  compareBundle,
   imqraw_image_count,
   PixelFormatCode,
 } from "https://sanzentyo.github.io/imq/imqraw/v0.1.0/imqraw.js";
@@ -44,7 +47,12 @@ const mask = encodeImage(new Uint8Array([0b00000011]), 2, 1, PixelFormatCode.Bin
   tags: ["binary"],
 });
 
-console.log(single.byteLength, mask.byteLength, imqraw_image_count(bundle));
+const decoded = decodeBundle(bundle);
+const byTag = decodeImage(bundle, { tag: "dist" });
+const metrics = compareBundle(bundle, { tag: "ref" }, { tag: "dist" }, {
+  metrics: ["psnr", "mse", "mae"],
+});
+console.log(single.byteLength, mask.byteLength, decoded.length, byTag.label, metrics);
 ```
 
 Three.js/WebGL capture:
@@ -66,6 +74,27 @@ const bytes = encodeThreeRenderer(renderer, {
 
 For reliable WebGL reads, render to a readable target or use a context whose
 drawing buffer is still available when `readPixels` runs.
+
+Browser `Blob`/`ImageBitmap` and WebGPU capture are also available. WebGPU
+textures must be RGBA8/BGRA8 and created with `COPY_SRC`; row-padding and BGRA
+conversion are handled by the wrapper.
+
+```js
+import {
+  captureWebGPUTexture,
+  compareImages,
+} from "https://sanzentyo.github.io/imq/imqraw/v0.1.0/imqraw.js";
+
+const captured = await captureWebGPUTexture(device, texture, {
+  width,
+  height,
+  format: "bgra8unorm",
+  label: "candidate",
+});
+const metrics = compareImages(referenceImage, captured, {
+  metrics: ["psnr", "mse"],
+});
+```
 
 ## TypeScript
 

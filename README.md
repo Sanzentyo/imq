@@ -4,11 +4,16 @@
 
 The crate is intended as a practical starting point for full-reference evaluation pipelines:
 
-- still-image metrics: MSE, RMSE, PSNR, MAE, max absolute error, global SSIM, and windowed luma SSIM (`wssim`);
+- still-image metrics: MSE, RMSE, PSNR, MAE, max absolute error, global SSIM,
+  windowed luma SSIM (`wssim`), and multi-scale SSIM (`ms-ssim`);
+- multi-candidate suites with parallel comparison, per-metric and consensus
+  ranking, Pareto-frontier detection, absolute/relative regression gates, and
+  baseline deltas;
 - frame and video comparison through `ffmpeg`/`ffprobe` rawvideo pipes;
 - `image` crate adapters for broad still-image decoding;
 - zero-copy borrowed inputs for `&[u8]`, camera buffers, planar YUV, NV12, packed RGB/RGBA/BGR/BGRA, and owned `Vec<u8>`;
-- optional `wgpu` compute kernel for RGBA8 MSE;
+- optional reusable `wgpu` kernels for batched RGBA8 error statistics and
+  windowed luma SSIM, with adapter diagnostics and deterministic CPU fallback;
 - optional Burn tensor adapter and feature-distance scaffolding for LPIPS/DISTS/MUSIQ/CLIP-IQA-like research metrics;
 - CLI and optional TUI.
 
@@ -33,6 +38,10 @@ The crate is intended as a practical starting point for full-reference evaluatio
 Default features are `std`, `serde`, `image-codecs`, `cli`, `tui`, and `preview`.
 `imqraw-image` is intentionally not a default feature; the raw bundle format
 itself is available without codec adapter conversions.
+
+The workspace minimum supported Rust version is 1.95. This is verified against
+the all-feature graph, including the CLI/SQLite and optional Burn/CubeCL
+backends.
 
 ## CLI examples
 
@@ -60,19 +69,46 @@ cargo run --bin imq -- image reference.png distorted.webp --format yaml --output
 cargo run --bin imq -- image reference.png distorted.webp --format csv --sqlite reports.sqlite
 ```
 
+Compare and rank any number of candidates under exactly the same policy:
+
+```bash
+cargo run --bin imq -- suite reference.png baseline.png candidate-a.png candidate-b.png \
+  --primary-metric psnr --baseline baseline.png \
+  --rule 'psnr>=35' --rule 'psnr>=baseline-0.5' --format json
+```
+
+The `suite` command retains caller order in the report while metric work runs in
+parallel. It reports each directional metric's competition rank, a unit-safe
+consensus mean rank, the top-level rank, baseline score deltas, and the Pareto
+frontier. Use `-j/--jobs`, `--rank-abs-tolerance`,
+`--rank-rel-tolerance`, repeated `--weight metric=value`, and `--fail-fast` to
+control execution and failure semantics. See
+[docs/comparison-suite.md](docs/comparison-suite.md).
+
 Explicit video comparison by decoding RGBA frames with `ffmpeg`:
 
 ```bash
 cargo run --bin imq -- video reference.mp4 distorted.mp4 --every 30 --max-frames 120
 cargo run --bin imq -- video reference.mp4 distorted.mp4 --width 1920 --height 1080 --json
 cargo run --bin imq -- video reference.mp4 distorted.mp4 --format toml --output video-report.toml
+cargo run --bin imq -- video reference-vfr.mkv distorted-vfr.mkv --align timestamp \
+  --max-timestamp-delta 0.02 --format json
 ```
 
+`--align timestamp` pairs frames by presentation time, estimates constant
+offset and clock drift by default, and reports the transform, planned pairs,
+unmatched frames, and residual timing error. Use `--timestamp-scale` and
+`--timestamp-offset` for a known transform, or
+`--no-estimate-timestamp-transform` for identity alignment.
+
 Structured output is available on `compare`, `stats`, `image`, `video`, `probe`,
-and `formats` with `--format text|json|yaml|toml|csv`; `--json` is kept as an
-alias for `--format json`. Use `--output PATH` to write the selected
-representation to a file. Use `--sqlite PATH` to append reports, metric rows,
-probe rows, image statistics, and format hints to SQLite tables.
+`formats`, `suite`, and GPU commands with `--format text|json|yaml|toml|csv`;
+`--json` is kept as an alias for `--format json`. Use `--output PATH` to write
+the selected representation to a file. Use `--sqlite PATH` to append reports,
+metric rows, probe rows, image statistics, and format hints to SQLite tables.
+Finite floating-point values remain numbers in structured reports. Non-finite
+values are encoded reversibly as `"Infinity"`, `"-Infinity"`, or `"NaN"`, while
+`null` is reserved for a missing optional value.
 
 Use `-` as an image input to read encoded image bytes from stdin. For raw packed
 stdin bytes, pass `--stdin-format raw` with `--raw-width`, `--raw-height`, and
@@ -256,6 +292,7 @@ Run the bundled crate-level example with:
 
 ```bash
 cargo run --example imqraw_bundle
+cargo run --example compare_suite
 ```
 
 With `--features imqraw-image`, helper constructors are enabled for common
@@ -264,8 +301,11 @@ feature is opt-in so the raw container can stay independent from codec adapters.
 
 ### Browser and Three.js capture
 
-The `imqraw-wasm` package exposes a WebAssembly encoder for browser and Node
-pipelines. Published builds are served from GitHub Pages:
+The `imqraw-wasm` package exposes browser and Node encode, decode, tag-select,
+and full-reference comparison APIs. The JavaScript wrapper can capture
+Blob/ImageBitmap/canvas sources, WebGL drawing buffers, and WebGPU textures
+(including BGRA conversion and 256-byte row alignment). Published builds are
+served from GitHub Pages:
 
 ```js
 import { init, encodeRgba8, encodeThreeRenderer } from "https://sanzentyo.github.io/imq/imqraw/v0.1.0/imqraw.js";
@@ -274,6 +314,19 @@ await init();
 const bytes = encodeRgba8(rgbaBytes, width, height, {
   label: "frame-0001",
   tags: ["threejs", "reference"],
+});
+
+const decoded = decodeImage(bytes, 0);
+const metrics = compareImages(
+  { data: referenceRgba, width, height },
+  { data: decoded.data, width, height },
+  { metrics: ["psnr:color", "ssim", "mse:all"] },
+);
+
+const gpuCapture = await captureWebGPUTexture(device, texture, {
+  width,
+  height,
+  format: "bgra8unorm",
 });
 ```
 
@@ -289,7 +342,18 @@ With `--features gpu`, `GpuContext::error_stats_rgba8` dispatches a WGSL
 compute shader for RGBA8 frames. Tight RGBA8 buffers are uploaded directly;
 strided rows are compacted only when required. The shader reduces squared
 error, absolute error, and max absolute error in one pass, so MSE, RMSE, PSNR,
-MAE, and maxAE can be reported from one dispatch.
+MAE, and maxAE can be reported from one dispatch. One-reference/many-candidate
+workloads use a Z-dispatch batch that uploads the reference once and performs a
+single submit/readback. Windowed luma SSIM uses a separately cached compute
+pipeline. Adapter selection, device limits, backend provenance, and explicit
+CPU fallback policy are available through `GpuComparator` and the CLI.
+
+```bash
+cargo run --bin imq --features gpu -- gpu info --format json
+cargo run --bin imq --features gpu -- gpu compare reference.png a.png b.png \
+  --metrics mse,rmse,psnr,mae,maxae,wssim --window 8 --window-stride 4 \
+  --domain color --fallback any --format json
+```
 
 ```rust
 use imq::gpu::GpuContext;
@@ -327,11 +391,15 @@ src/
   bin/imq.rs            CLI/TUI frontend
 ```
 
-See `docs/architecture.md`, `docs/metrics.md`, `docs/ffmpeg.md`, and `docs/nn-burn.md` for implementation notes.
+See `docs/architecture.md`, `docs/metrics.md`, `docs/comparison-suite.md`,
+`docs/ffmpeg.md`, and `docs/nn-burn.md` for implementation notes.
 
 ## Current limitations
 
-- `ssim` is a global luma implementation. `wssim` provides CPU non-overlapping windowed luma SSIM, but multi-scale SSIM is not implemented yet.
-- GPU acceleration currently covers RGBA8 MSE, RMSE, PSNR, MAE, and maxAE error statistics. SSIM still runs on CPU.
+- `ssim` is a global luma implementation. `wssim` and `ms-ssim` provide local
+  and multi-scale structural comparisons; they are deterministic rather than
+  bit-identical adapters for every third-party SSIM implementation.
+- GPU acceleration currently targets RGBA8 error statistics and windowed luma
+  SSIM. Other formats and MS-SSIM use the CPU core.
 - Neural metrics provide Burn integration and feature-distance scaffolding; model definitions/checkpoints are caller-supplied.
 - The `ffmpeg` module uses external executables by path. The core library remains pure Rust and Sans I/O.

@@ -1,6 +1,6 @@
 ---
 name: imq-cli
-description: Use the `imq` and supplemental `imq-quality` command-line tools and Rust crate for full-reference image/video quality evaluation, and reference imqraw Rust/JavaScript/TypeScript examples when needed. Trigger when Codex needs to compare reference/distorted images or videos, compute PSNR/SSIM/windowed SSIM/MS-SSIM/MSE/RMSE/MAE/maxAE, produce JSON metric reports, create diff/heatmap images, enforce CI metric gates, list supported still-image formats, probe video metadata, extract video frames, use imq as a Rust library, or use imqraw from Rust, JS, or TS.
+description: Use the `imq` and supplemental `imq-quality` command-line tools and Rust crate for full-reference image/video quality evaluation, multi-candidate suites, GPU comparison, and imqraw Rust/JavaScript/TypeScript workflows. Trigger when Codex needs to compare or rank reference/distorted images or videos, compute PSNR/SSIM/windowed SSIM/MS-SSIM/MSE/RMSE/MAE/maxAE, produce structured metric reports, create diff/heatmap images, enforce absolute or baseline-relative CI gates, inspect WGPU capabilities, align VFR video by timestamp, list supported still-image formats, probe or extract video, use imq as a Rust library, or use imqraw from Rust, JS, or TS.
 ---
 
 # imq CLI
@@ -62,7 +62,11 @@ imq image reference.png distorted.png --format csv --sqlite reports.sqlite
 Metric selection:
 
 - `ssim`: global luma SSIM over the whole frame.
-- `wssim`: non-overlapping 8x8 windowed luma SSIM. Use this when local structure changes should count more than a whole-frame aggregate. Aliases are `windowed-ssim`, `windowed_ssim`, `ssim-windowed`, and `ssim_windowed`.
+- `wssim`: 8x8 windowed luma SSIM by default. Full windows are anchored at
+  image edges, so the final windows can overlap when dimensions are not evenly
+  divisible by the stride. Use this when local structure changes should count
+  more than a whole-frame aggregate. Aliases are `windowed-ssim`,
+  `windowed_ssim`, `ssim-windowed`, and `ssim_windowed`.
 - `ms-ssim`: deterministic luma multi-scale SSIM. Aliases are `ms_ssim` and `msssim`.
 - `mse`, `rmse`, `psnr`, `mae`, and `maxae`: error metrics over the selected sample domain.
 
@@ -80,6 +84,19 @@ Metric domains:
   `--max-alpha-mismatches`, or `--max-alpha-mismatches-beyond-one-lsb`.
 
 `ssim`, `wssim`, and `ms-ssim` currently operate on luma even when a domain suffix is present.
+
+## Compare Candidate Suites
+
+Use `suite` (aliases `rank` and `batch`) to compare several candidates under
+one policy. Results retain candidate input order while metric ranks, weighted
+consensus rank, baseline deltas, and the Pareto frontier are deterministic.
+The command exits non-zero when a gate fails or a retained candidate error is
+present.
+
+```bash
+imq suite reference.png candidate-a.png candidate-b.png --metrics psnr,wssim,mse --format json
+imq suite reference.png baseline.png candidate.png --baseline baseline.png --rule 'psnr>=baseline-0.5' --rule 'mse<=baseline*1.1' --weight psnr=2 --jobs 4 --format csv
+```
 
 ## Advanced Helpers with imq-quality
 
@@ -106,10 +123,16 @@ imq-quality external reference.mp4 distorted.mp4 --program ffmpeg-quality-metric
 Use `imq formats` to list the image adapter's supported format hints.
 
 Structured output is supported by `compare`, `stats`, `image`, `video`, `probe`,
-and `formats` with `--format text|json|yaml|toml|csv`. `--json` is a
+`formats`, `suite`, and GPU commands with `--format text|json|yaml|toml|csv`.
+`--json` is a
 compatibility alias for `--format json`. Use `--output PATH` to write the
 selected representation to a file, and `--sqlite PATH` to append reports, metric
 rows, probe rows, image statistics, and format hints to a SQLite database.
+
+Structured numeric fields use ordinary numbers when finite and the strings
+`"Infinity"`, `"-Infinity"`, or `"NaN"` when non-finite. A JSON `null` means a
+missing optional value, not a non-finite score. This distinction is preserved
+when reports are deserialized again.
 
 Use `-` as an image input to read encoded image bytes from stdin. For raw packed
 stdin bytes, pass `--stdin-format raw` with `--raw-width`, `--raw-height`, and
@@ -144,6 +167,7 @@ Video commands require working `ffmpeg` and `ffprobe` executables. Use `video` f
 imq video reference.mp4 distorted.mp4 --metrics psnr,ssim,wssim,ms-ssim,mse --every 30 --max-frames 120
 imq video reference.mp4 distorted.mp4 --width 1920 --height 1080 --json
 imq video reference.mp4 distorted.mp4 --format toml --output video-report.toml
+imq video reference-vfr.mkv distorted-vfr.mkv --align timestamp --max-timestamp-delta 0.02 --format json
 imq compare reference.mp4 distorted.mp4 --video-frames 0:1,30:31
 imq compare reference.mp4 distorted.mp4 --video-frames '(0,1,0),(2,3,2)'
 ```
@@ -153,6 +177,10 @@ Rules:
 - Specify `--width` and `--height` together.
 - Use `--every N` to sample every Nth decoded frame.
 - Use `--max-frames N` to cap runtime.
+- Use `--align timestamp` for VFR, duplicated, dropped, or offset frames. Adjust
+  `--max-timestamp-delta`, or provide `--timestamp-scale` and
+  `--timestamp-offset` when the clock transform is known. Reports distinguish
+  planned timestamp pairs from the subset sampled by `--every`/`--max-frames`.
 - Use `--ffmpeg`, `--ffprobe`, and `--stream` when the defaults are wrong.
 - Use `--video-frame N` or ordered `--video-frames 0:1,30:31` on `compare`
   when specific frame pairs should be compared. Tuple syntax
@@ -173,16 +201,27 @@ imq extract-frame input.mp4 150 frame-150.png
 
 ## Other Commands
 
+With the `gpu` feature enabled, inspect the selected WGPU adapter or compare
+one reference against several RGBA8 candidates through a cached context. Error
+metrics share one reduction pass; `wssim` uses the configured window kernel.
+Every result reports whether GPU or deterministic CPU fallback executed.
+
+```bash
+imq gpu info --format json
+imq gpu compare reference.png a.png b.png --metrics mse,rmse,psnr,mae,maxae,wssim --domain color --fallback any --format json
+```
+
 Subcommand aliases are available: `i` for `image`, `v` for `video`, `p` for
 `preview`, `t` for `tui`, `fmt` for `formats`, `raw-pack`/`bundle` for `pack`,
-`raw-info` for `bundle-info`, and `x`/`extract` for `extract-frame`.
+`raw-info` for `bundle-info`, `rank`/`batch` for `suite`, `wgpu` for `gpu`, and
+`x`/`extract` for `extract-frame`.
 
 Use `preview` or `tui` only when the user explicitly asks to inspect images in a
 terminal UI. For using `imq` as a Rust crate, read
 `references/imq-rust-crate.md`. For Rust, JavaScript, or TypeScript `imqraw`
-bundle usage, read `references/imqraw-library.md`. For GPU, benchmark, or NN
-usage, refer to repository documentation instead of expanding those workflows in
-this skill.
+bundle usage, read `references/imqraw-library.md`. For GPU library usage, read
+`references/imq-rust-crate.md`; use repository documentation for benchmark or NN
+workflows.
 
 For video aggregation or timestamp-aware pairing in Rust, use
 `imq::video_analysis::{aggregate_video_report, pair_frames_by_timestamp}`. Use
@@ -191,7 +230,7 @@ pairing unreliable.
 
 ## Reporting Results
 
-Report exact commands that passed or failed. If a command depends on missing external tools, say which executable is missing. For metric outputs, summarize the metric names, compared dimensions, frame count, threshold rules, and whether JSON/text output was requested. For `wssim`, also mention that it is non-overlapping windowed luma SSIM and include the reported window count when JSON/details are available.
+Report exact commands that passed or failed. If a command depends on missing external tools, say which executable is missing. For metric outputs, summarize the metric names, compared dimensions, frame count, threshold rules, and requested output format. For `wssim`, identify it as windowed luma SSIM and include the reported window count and worst-window coordinates when details are available. For GPU comparisons, report the execution backend and fallback reason. For timestamp video comparisons, distinguish accepted pairs from compared/sampled frames and include unmatched counts and residual diagnostics.
 
 ## License
 

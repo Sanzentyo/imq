@@ -26,6 +26,9 @@ imq = { git = "https://github.com/Sanzentyo/imq.git", tag = "v0.1.0", default-fe
 
 # Video comparison through external ffmpeg/ffprobe.
 imq = { git = "https://github.com/Sanzentyo/imq.git", tag = "v0.1.0", default-features = false, features = ["serde", "image-codecs", "ffmpeg"] }
+
+# Reusable WGPU comparison with deterministic CPU fallback.
+imq = { git = "https://github.com/Sanzentyo/imq.git", tag = "v0.1.0", default-features = false, features = ["serde", "gpu"] }
 ```
 
 The default feature set includes `std`, `serde`, `image-codecs`, `cli`, `tui`,
@@ -101,6 +104,33 @@ fn main() -> Result<()> {
 Use `image_crate::decode_image_bytes(&bytes)` when input comes from HTTP, SSH,
 stdin, or another byte stream.
 
+## Multi-Candidate Suites
+
+`compare_candidate_suite` performs candidate comparisons in parallel while
+preserving input order, then builds per-metric ranks, a weighted consensus rank,
+baseline deltas, gates, and the Pareto frontier.
+
+```rust
+use imq::{
+    ComparisonCandidate, ComparisonSuiteOptions, MetricSet, Result,
+    compare_candidate_suite,
+};
+
+fn rank<'a>(
+    reference: &imq::FrameView<'a, imq::Validated>,
+    candidates: &[ComparisonCandidate<'a>],
+) -> Result<imq::ComparisonSuiteReport> {
+    let metrics = MetricSet::from_csv("psnr,wssim,mse")?;
+    compare_candidate_suite(
+        Some("reference".into()),
+        reference,
+        candidates,
+        &metrics,
+        &ComparisonSuiteOptions::default(),
+    )
+}
+```
+
 ## imqraw Bundles
 
 Use `imqraw` when a renderer or test harness should emit exact raw frames with
@@ -162,6 +192,38 @@ fn main() -> Result<()> {
 Use `imq::video::decode_single_frame(path, frame_index, &FfmpegOptions::default())`
 when a video frame should be compared by the still-image metric pipeline.
 
+For VFR-safe comparison, call `imq::video::compare_videos_by_timestamp` with
+`TimestampVideoCompareOptions`. Its alignment report contains the accepted
+pairs, unmatched frame indices, the applied clock scale/offset, and residual
+statistics. Sampling and `max_frames` are applied after pairing.
+
+## WGPU
+
+Enable `gpu` and reuse one `GpuComparator` across comparisons. It caches the
+WGPU context and pipelines, batches candidates in one submission where limits
+permit, derives MSE/RMSE/PSNR/MAE/maxAE from one reduction, and records GPU vs
+CPU-fallback provenance.
+
+```rust
+use imq::gpu::{
+    GpuComparator, GpuErrorDomain, GpuErrorMetric,
+};
+use imq::Result;
+
+fn compare_rgba8(
+    reference: &imq::FrameView<'_, imq::Validated>,
+    candidate: &imq::FrameView<'_, imq::Validated>,
+) -> Result<imq::GpuRgba8Comparison> {
+    let gpu = GpuComparator::new()?;
+    gpu.compare_rgba8_in_domain(
+        reference,
+        candidate,
+        &GpuErrorMetric::ALL,
+        GpuErrorDomain::Color,
+    )
+}
+```
+
 ## Metric and Report Patterns
 
 `MetricSet::from_csv` accepts the same metric domain strings as the CLI, such as
@@ -171,6 +233,10 @@ when a video frame should be compared by the still-image metric pipeline.
 Use `ComparisonReport` for still-image reports and `VideoReport` for full video
 reports. With `serde` enabled, reports can be serialized by the caller or
 rendered with `to_json_pretty()`.
+
+Finite floating-point values serialize as numbers. Non-finite values serialize
+reversibly as `"Infinity"`, `"-Infinity"`, or `"NaN"`; `null` remains reserved
+for absent optional values.
 
 ## Remote and Frame-Pair Helpers
 
