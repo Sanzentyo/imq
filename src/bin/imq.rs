@@ -14,9 +14,17 @@ use imq::{
     SshInput, VideoFramePair,
 };
 use serde::Serialize;
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::{Child, Command as ProcessCommand, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread::JoinHandle;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const REMOTE_STDERR_TAIL_BYTES: usize = 64 * 1024;
+static REMOTE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Parser)]
 #[command(name = "imq")]
@@ -35,6 +43,13 @@ enum Command {
     /// Compare two still images decoded by the image crate.
     #[command(alias = "i")]
     Image(Box<ImageCmd>),
+    /// Compare, gate, and rank multiple candidate images against one reference.
+    #[command(alias = "rank", alias = "batch")]
+    Suite(Box<SuiteCmd>),
+    /// Inspect wgpu capabilities or run reusable GPU comparisons.
+    #[cfg(feature = "gpu")]
+    #[command(alias = "wgpu")]
+    Gpu(GpuCmd),
     /// Report still-image statistics, color balance, histograms, and tendencies.
     #[command(alias = "s", alias = "stat")]
     Stats(StatsCmd),
@@ -91,6 +106,152 @@ struct ImageCmd {
     gate: GateArgs,
     #[command(flatten)]
     output: OutputArgs,
+}
+
+#[derive(Debug, Args)]
+struct SuiteCmd {
+    /// Reference/original image.
+    reference: PathBuf,
+    /// Candidate images to compare and rank.
+    #[arg(required = true, num_args = 1..)]
+    candidates: Vec<PathBuf>,
+    /// Comma-separated metrics shared by every candidate.
+    #[arg(
+        short,
+        long,
+        default_value = "psnr,ssim,wssim,ms-ssim,mse,rmse,mae,maxae"
+    )]
+    metrics: String,
+    /// Metric output name used for the top-level rank; defaults to consensus rank.
+    #[arg(long)]
+    primary_metric: Option<String>,
+    /// Consensus-rank metric weight, e.g. --weight psnr=2 or --weight mse=0.
+    #[arg(long = "weight")]
+    weights: Vec<String>,
+    /// Candidate path used as the score-delta baseline.
+    #[arg(long)]
+    baseline: Option<PathBuf>,
+    /// Threshold rule applied to every candidate. Supports absolute values and
+    /// baseline-relative expressions such as psnr>=baseline-0.5.
+    #[arg(long = "rule")]
+    rules: Vec<String>,
+    /// Maximum comparison workers; 0 uses available parallelism.
+    #[arg(short = 'j', long, default_value_t = 0)]
+    jobs: usize,
+    /// Abort the suite on the first candidate comparison error.
+    #[arg(long)]
+    fail_fast: bool,
+    /// Absolute tolerance used to assign tied ranks.
+    #[arg(long, default_value_t = 1e-12)]
+    rank_abs_tolerance: f64,
+    /// Relative tolerance used to assign tied ranks.
+    #[arg(long, default_value_t = 1e-9)]
+    rank_rel_tolerance: f64,
+    /// Print JSON instead of text.
+    #[arg(long)]
+    json: bool,
+    /// Structured output format.
+    #[arg(long, value_enum, default_value_t = OutputFormatArg::Text)]
+    format: OutputFormatArg,
+    /// Write output to a file instead of stdout.
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Debug, Args)]
+struct GpuCmd {
+    #[command(subcommand)]
+    command: GpuSubcommand,
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Debug, Subcommand)]
+enum GpuSubcommand {
+    /// Report the selected adapter, backend, driver, and effective limits.
+    Info(GpuInfoCmd),
+    /// Compare one reference against one or more candidates with one reusable context.
+    Compare(GpuCompareCmd),
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Debug, Args)]
+struct GpuInfoCmd {
+    #[command(flatten)]
+    adapter: GpuAdapterArgs,
+    /// Structured output format.
+    #[arg(long, value_enum, default_value_t = OutputFormatArg::Text)]
+    format: OutputFormatArg,
+    /// Write output to a file instead of stdout.
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Debug, Args)]
+struct GpuCompareCmd {
+    /// Reference/original image.
+    reference: PathBuf,
+    /// Candidate images compared in caller-provided order.
+    #[arg(required = true, num_args = 1..)]
+    candidates: Vec<PathBuf>,
+    /// GPU metrics: mse,rmse,psnr,mae,maxae share one reduction; wssim uses a cached window kernel.
+    #[arg(short, long, default_value = "mse,rmse,psnr,mae,maxae,wssim")]
+    metrics: String,
+    /// Error sample domain. Color compares RGB; all includes alpha.
+    #[arg(long, value_enum, default_value_t = GpuDomainArg::Color)]
+    domain: GpuDomainArg,
+    /// Square window size used by wssim.
+    #[arg(long, default_value_t = 8)]
+    window: usize,
+    /// Horizontal and vertical stride used by wssim.
+    #[arg(long, default_value_t = 8)]
+    window_stride: usize,
+    #[command(flatten)]
+    adapter: GpuAdapterArgs,
+    /// CPU fallback policy for initialization or execution errors.
+    #[arg(long, value_enum, default_value_t = GpuFallbackArg::Any)]
+    fallback: GpuFallbackArg,
+    /// Structured output format.
+    #[arg(long, value_enum, default_value_t = OutputFormatArg::Text)]
+    format: OutputFormatArg,
+    /// Write output to a file instead of stdout.
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Debug, Args)]
+struct GpuAdapterArgs {
+    /// Adapter power preference.
+    #[arg(long, value_enum, default_value_t = GpuPowerArg::High)]
+    power: GpuPowerArg,
+    /// Require a fallback/software adapter.
+    #[arg(long)]
+    fallback_adapter: bool,
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum GpuPowerArg {
+    None,
+    Low,
+    High,
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum GpuFallbackArg {
+    Never,
+    Initialization,
+    Any,
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum GpuDomainArg {
+    Color,
+    All,
 }
 
 #[derive(Debug, Args)]
@@ -183,6 +344,30 @@ struct CompareCmd {
     #[cfg(feature = "ffmpeg")]
     #[arg(long, default_value_t = 0)]
     stream: usize,
+    /// Video frame alignment: decode-order pairing or VFR-safe timestamp pairing.
+    #[cfg(feature = "ffmpeg")]
+    #[arg(long, value_enum, default_value_t = VideoAlignmentArg::Decode)]
+    align: VideoAlignmentArg,
+    /// Maximum timestamp residual accepted when --align timestamp is selected.
+    #[cfg(feature = "ffmpeg")]
+    #[arg(long)]
+    max_timestamp_delta: Option<f64>,
+    /// Permit one distorted frame to match multiple reference frames.
+    #[cfg(feature = "ffmpeg")]
+    #[arg(long)]
+    allow_reuse_distorted: bool,
+    /// Disable automatic timestamp offset and clock-drift estimation.
+    #[cfg(feature = "ffmpeg")]
+    #[arg(long)]
+    no_estimate_timestamp_transform: bool,
+    /// Explicit distorted-timeline scale for timestamp alignment.
+    #[cfg(feature = "ffmpeg")]
+    #[arg(long)]
+    timestamp_scale: Option<f64>,
+    /// Explicit distorted-timeline offset in seconds for timestamp alignment.
+    #[cfg(feature = "ffmpeg")]
+    #[arg(long, allow_hyphen_values = true)]
+    timestamp_offset: Option<f64>,
     /// Print JSON instead of text.
     #[arg(short, long)]
     json: bool,
@@ -395,6 +580,15 @@ enum OutputFormatArg {
     Csv,
 }
 
+#[cfg(feature = "ffmpeg")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum VideoAlignmentArg {
+    /// Pair frames by decode order (fast, compatible default).
+    Decode,
+    /// Pair frames by presentation timestamp with alignment diagnostics.
+    Timestamp,
+}
+
 #[derive(Debug, Args, Clone)]
 struct StdinImageArgs {
     /// How to decode `-` image input from stdin.
@@ -523,6 +717,24 @@ struct VideoCmd {
     /// Video stream index.
     #[arg(long, default_value_t = 0)]
     stream: usize,
+    /// Frame alignment: decode-order pairing or VFR-safe timestamp pairing.
+    #[arg(long, value_enum, default_value_t = VideoAlignmentArg::Decode)]
+    align: VideoAlignmentArg,
+    /// Maximum timestamp residual accepted when --align timestamp is selected.
+    #[arg(long)]
+    max_timestamp_delta: Option<f64>,
+    /// Permit one distorted frame to match multiple reference frames.
+    #[arg(long)]
+    allow_reuse_distorted: bool,
+    /// Disable automatic timestamp offset and clock-drift estimation.
+    #[arg(long)]
+    no_estimate_timestamp_transform: bool,
+    /// Explicit distorted-timeline scale for timestamp alignment.
+    #[arg(long)]
+    timestamp_scale: Option<f64>,
+    /// Explicit distorted-timeline offset in seconds for timestamp alignment.
+    #[arg(long, allow_hyphen_values = true)]
+    timestamp_offset: Option<f64>,
     /// Print JSON instead of a text table.
     #[arg(short, long)]
     json: bool,
@@ -578,6 +790,9 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Compare(cmd) => run_compare(*cmd),
         Command::Image(cmd) => run_image(*cmd),
+        Command::Suite(cmd) => run_suite(*cmd),
+        #[cfg(feature = "gpu")]
+        Command::Gpu(cmd) => run_gpu(cmd),
         Command::Stats(cmd) => run_stats(cmd),
         #[cfg(feature = "ffmpeg")]
         Command::Video(cmd) => run_video(cmd),
@@ -605,6 +820,10 @@ fn run_stats(cmd: StatsCmd) -> Result<()> {
 
 fn run_compare(cmd: CompareCmd) -> Result<()> {
     let Some(distorted) = cmd.distorted.as_ref() else {
+        #[cfg(feature = "ffmpeg")]
+        if compare_uses_timestamp_options(&cmd) {
+            bail!("timestamp alignment options require two local video inputs")
+        }
         if cmd.stats {
             return run_image_stats(
                 &cmd.reference,
@@ -621,6 +840,19 @@ fn run_compare(cmd: CompareCmd) -> Result<()> {
     let distorted_input = parse_input_spec(distorted, &cmd.remote)?;
     let reference_is_video = is_video_input(&reference);
     let distorted_is_video = is_video_input(&distorted_input);
+    #[cfg(feature = "ffmpeg")]
+    if compare_uses_timestamp_options(&cmd)
+        && !(reference_is_video
+            && distorted_is_video
+            && reference.is_local()
+            && distorted_input.is_local()
+            && cmd.video_frame.is_none()
+            && cmd.video_frames.is_none())
+    {
+        bail!(
+            "timestamp alignment options require full comparison of two local videos; omit --video-frame/--video-frames"
+        )
+    }
     match (reference_is_video, distorted_is_video) {
         (false, false) => {
             let (report, stats) = compare_image_inputs(
@@ -707,6 +939,12 @@ fn run_compare(cmd: CompareCmd) -> Result<()> {
                         ffmpeg: cmd.ffmpeg,
                         ffprobe: cmd.ffprobe,
                         stream: cmd.stream,
+                        align: cmd.align,
+                        max_timestamp_delta: cmd.max_timestamp_delta,
+                        allow_reuse_distorted: cmd.allow_reuse_distorted,
+                        no_estimate_timestamp_transform: cmd.no_estimate_timestamp_transform,
+                        timestamp_scale: cmd.timestamp_scale,
+                        timestamp_offset: cmd.timestamp_offset,
                         json: cmd.json,
                         output: cmd.output,
                     })
@@ -723,6 +961,16 @@ fn run_compare(cmd: CompareCmd) -> Result<()> {
         }
         _ => bail!("reference and distorted must both be images or both be videos"),
     }
+}
+
+#[cfg(feature = "ffmpeg")]
+fn compare_uses_timestamp_options(cmd: &CompareCmd) -> bool {
+    cmd.align != VideoAlignmentArg::Decode
+        || cmd.max_timestamp_delta.is_some()
+        || cmd.allow_reuse_distorted
+        || cmd.no_estimate_timestamp_transform
+        || cmd.timestamp_scale.is_some()
+        || cmd.timestamp_offset.is_some()
 }
 
 fn run_image(cmd: ImageCmd) -> Result<()> {
@@ -755,6 +1003,312 @@ fn run_image(cmd: ImageCmd) -> Result<()> {
     }
     exit_if_gate_failed(&report);
     Ok(())
+}
+
+fn run_suite(cmd: SuiteCmd) -> Result<()> {
+    let reference = image_crate::load_image_path(&cmd.reference).with_context(|| {
+        format!(
+            "failed to decode reference image `{}`",
+            cmd.reference.display()
+        )
+    })?;
+    let loaded_candidates = cmd
+        .candidates
+        .iter()
+        .map(|path| {
+            image_crate::load_image_path(path)
+                .with_context(|| format!("failed to decode candidate image `{}`", path.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let candidates = cmd
+        .candidates
+        .iter()
+        .zip(&loaded_candidates)
+        .map(|(path, frame)| imq::ComparisonCandidate::new(path.to_string_lossy(), frame.as_view()))
+        .collect::<Vec<_>>();
+    let metrics = MetricSet::from_csv(&cmd.metrics)?;
+    let (rules, baseline_rules) = parse_suite_rules(&cmd.rules)?;
+    let metric_weights = cmd
+        .weights
+        .iter()
+        .map(|spec| {
+            let (metric, weight) = spec.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!("invalid metric weight `{spec}`; expected metric=value")
+            })?;
+            let metric = metric.trim();
+            if metric.is_empty() {
+                bail!("metric weight name cannot be empty");
+            }
+            let weight = weight
+                .trim()
+                .parse::<f64>()
+                .with_context(|| format!("invalid metric weight `{spec}`"))?;
+            Ok::<_, anyhow::Error>((metric.to_string(), weight))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+    let max_threads = if cmd.jobs == 0 {
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+    } else {
+        cmd.jobs
+    };
+    let baseline_candidate = match cmd.baseline.as_deref() {
+        Some(baseline) => Some(
+            resolve_baseline_label(baseline, &cmd.candidates).ok_or_else(|| {
+                anyhow::anyhow!("baseline candidate `{}` does not exist", baseline.display())
+            })?,
+        ),
+        None => None,
+    };
+    let options = imq::ComparisonSuiteOptions {
+        primary_metric: cmd.primary_metric,
+        baseline_candidate,
+        metric_weights,
+        rules,
+        baseline_rules,
+        failure_policy: if cmd.fail_fast {
+            imq::CandidateFailurePolicy::FailFast
+        } else {
+            imq::CandidateFailurePolicy::Continue
+        },
+        max_threads,
+        score_tolerance: imq::ScoreTolerance::new(cmd.rank_abs_tolerance, cmd.rank_rel_tolerance)?,
+    };
+    let report = imq::compare_candidate_suite(
+        Some(cmd.reference.to_string_lossy().into_owned()),
+        &reference.as_view(),
+        &candidates,
+        &metrics,
+        &options,
+    )?;
+    emit_suite_report(
+        &report,
+        output_format(cmd.json, cmd.format),
+        cmd.output.as_deref(),
+    )?;
+    if !report.passed {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Splits suite rules into absolute and baseline-relative rules.
+///
+/// Routing inspects only the right-hand side of the operator, so metric names
+/// that contain `baseline`, such as `baseline_ssim>=0.9`, stay absolute rules.
+fn parse_suite_rules(
+    rules: &[String],
+) -> Result<(
+    Vec<imq::MetricThresholdRule>,
+    Vec<imq::BaselineThresholdRule>,
+)> {
+    let mut absolute = Vec::new();
+    let mut baseline = Vec::new();
+    for rule in rules {
+        if rule_threshold_uses_baseline(rule) {
+            baseline.push(imq::BaselineThresholdRule::parse(rule)?);
+        } else {
+            absolute.push(imq::MetricThresholdRule::parse(rule)?);
+        }
+    }
+    Ok((absolute, baseline))
+}
+
+fn rule_threshold_uses_baseline(rule: &str) -> bool {
+    ["<=", ">=", "<", ">"]
+        .into_iter()
+        .find_map(|token| rule.split_once(token).map(|(_, rhs)| rhs))
+        .is_some_and(|rhs| rhs.trim().starts_with("baseline"))
+}
+
+/// Resolves the `--baseline` path to a candidate label.
+///
+/// Literal matches win; otherwise both sides are resolved against the
+/// filesystem (`.` and `..` included), so `a.png`, `./a.png`, and
+/// `sub/../a.png` select the same candidate even across symlinked parents.
+fn resolve_baseline_label(baseline: &Path, candidates: &[PathBuf]) -> Option<String> {
+    candidates
+        .iter()
+        .find(|candidate| candidate.as_path() == baseline)
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+        .or_else(|| {
+            let baseline_key = resolved_path_key(baseline)?;
+            candidates
+                .iter()
+                .find(|candidate| {
+                    resolved_path_key(candidate).is_some_and(|key| key == baseline_key)
+                })
+                .map(|candidate| candidate.to_string_lossy().into_owned())
+        })
+}
+
+fn resolved_path_key(path: &Path) -> Option<Vec<std::ffi::OsString>> {
+    let resolved = std::fs::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .ok()?;
+    let mut components: Vec<std::ffi::OsString> = Vec::new();
+    for component in resolved.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                components.pop();
+            }
+            other => components.push(other.as_os_str().to_os_string()),
+        }
+    }
+    Some(components)
+}
+
+#[cfg(feature = "gpu")]
+fn run_gpu(cmd: GpuCmd) -> Result<()> {
+    match cmd.command {
+        GpuSubcommand::Info(cmd) => run_gpu_info(cmd),
+        GpuSubcommand::Compare(cmd) => run_gpu_compare(cmd),
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn run_gpu_info(cmd: GpuInfoCmd) -> Result<()> {
+    let context = imq::gpu::GpuContext::new_with_options(gpu_context_options(&cmd.adapter))?;
+    let capabilities = context.capabilities();
+    let content = match cmd.format {
+        OutputFormatArg::Text => render_gpu_capabilities(capabilities),
+        OutputFormatArg::Json => serde_json::to_string_pretty(capabilities)?,
+        OutputFormatArg::Yaml => serde_yaml_ng::to_string(capabilities)?,
+        OutputFormatArg::Toml => toml::to_string_pretty(capabilities)?,
+        OutputFormatArg::Csv => csv_string([capabilities])?,
+    };
+    write_output(cmd.output.as_deref(), &content)
+}
+
+#[cfg(feature = "gpu")]
+fn run_gpu_compare(cmd: GpuCompareCmd) -> Result<()> {
+    let (error_metrics, include_wssim) = parse_gpu_metrics(&cmd.metrics)?;
+    let options = imq::gpu::GpuComparatorOptions {
+        context: gpu_context_options(&cmd.adapter),
+        fallback: match cmd.fallback {
+            GpuFallbackArg::Never => imq::gpu::GpuFallbackPolicy::Never,
+            GpuFallbackArg::Initialization => imq::gpu::GpuFallbackPolicy::InitializationOnly,
+            GpuFallbackArg::Any => imq::gpu::GpuFallbackPolicy::AnyGpuError,
+        },
+    };
+    let comparator = imq::gpu::GpuComparator::new_with_options(options)?;
+    let reference = image_crate::load_image_path(&cmd.reference).with_context(|| {
+        format!(
+            "failed to decode GPU reference image `{}`",
+            cmd.reference.display()
+        )
+    })?;
+    let loaded_candidates = cmd
+        .candidates
+        .iter()
+        .map(|candidate_path| {
+            image_crate::load_image_path(candidate_path).with_context(|| {
+                format!(
+                    "failed to decode GPU candidate image `{}`",
+                    candidate_path.display()
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let reference_view = reference.as_view();
+    let candidate_views = loaded_candidates
+        .iter()
+        .map(imq::FrameOwned::as_view)
+        .collect::<Vec<_>>();
+    let candidate_refs = candidate_views.iter().collect::<Vec<_>>();
+    let error_results = if error_metrics.is_empty() {
+        vec![None; candidate_refs.len()]
+    } else {
+        comparator
+            .compare_many_rgba8_in_domain(
+                &reference_view,
+                &candidate_refs,
+                &error_metrics,
+                match cmd.domain {
+                    GpuDomainArg::Color => imq::gpu::GpuErrorDomain::Color,
+                    GpuDomainArg::All => imq::gpu::GpuErrorDomain::All,
+                },
+            )?
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>()
+    };
+    let wssim_options = imq::gpu::GpuWindowedSsimOptions {
+        window_width: cmd.window,
+        window_height: cmd.window,
+        stride_x: cmd.window_stride,
+        stride_y: cmd.window_stride,
+    };
+    let comparisons = cmd
+        .candidates
+        .iter()
+        .zip(&candidate_views)
+        .zip(error_results)
+        .map(|((candidate_path, candidate_view), error_result)| {
+            let wssim_result = include_wssim
+                .then(|| {
+                    comparator.compare_windowed_ssim_rgba8(
+                        &reference_view,
+                        candidate_view,
+                        wssim_options,
+                    )
+                })
+                .transpose()?;
+            Ok::<_, anyhow::Error>(GpuCliComparison {
+                candidate: candidate_path.to_string_lossy().into_owned(),
+                error_result,
+                wssim_result,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let report = GpuCliReport {
+        capabilities: comparator.capabilities().cloned(),
+        initialization_error: comparator.initialization_error().map(str::to_string),
+        reference: cmd.reference.to_string_lossy().into_owned(),
+        comparisons,
+    };
+    emit_gpu_report(&report, cmd.format, cmd.output.as_deref())
+}
+
+#[cfg(feature = "gpu")]
+fn gpu_context_options(adapter: &GpuAdapterArgs) -> imq::gpu::GpuContextOptions {
+    imq::gpu::GpuContextOptions {
+        power_preference: match adapter.power {
+            GpuPowerArg::None => imq::gpu::GpuPowerPreference::None,
+            GpuPowerArg::Low => imq::gpu::GpuPowerPreference::LowPower,
+            GpuPowerArg::High => imq::gpu::GpuPowerPreference::HighPerformance,
+        },
+        force_fallback_adapter: adapter.fallback_adapter,
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn parse_gpu_metrics(input: &str) -> Result<(Vec<imq::gpu::GpuErrorMetric>, bool)> {
+    let mut error_metrics = Vec::new();
+    let mut include_wssim = false;
+    for metric in input
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        match metric.to_ascii_lowercase().as_str() {
+            "mse" | "mse:all" => error_metrics.push(imq::gpu::GpuErrorMetric::Mse),
+            "rmse" | "rmse:all" => error_metrics.push(imq::gpu::GpuErrorMetric::Rmse),
+            "psnr" | "psnr:all" => error_metrics.push(imq::gpu::GpuErrorMetric::Psnr),
+            "mae" | "mae:all" => error_metrics.push(imq::gpu::GpuErrorMetric::Mae),
+            "maxae" | "max_ae" | "max-error" | "maxae:all" => {
+                error_metrics.push(imq::gpu::GpuErrorMetric::MaxAbsoluteError);
+            }
+            "wssim" | "windowed-ssim" | "windowed_ssim" => include_wssim = true,
+            _ => bail!("unsupported GPU metric `{metric}`; expected mse,rmse,psnr,mae,maxae,wssim"),
+        }
+    }
+    if error_metrics.is_empty() && !include_wssim {
+        bail!("at least one GPU metric is required");
+    }
+    Ok((error_metrics, include_wssim))
 }
 
 fn compare_image_paths(
@@ -860,15 +1414,27 @@ fn evaluate_gate(
     report: &ComparisonReport,
     thresholds: ComparisonThresholds,
 ) -> Result<ComparisonGateReport> {
+    if thresholds
+        .fail_under
+        .is_some_and(|minimum| !minimum.is_finite())
+    {
+        bail!("--fail-under must be finite");
+    }
+    if thresholds
+        .max_selected_channel_delta
+        .is_some_and(|maximum| !maximum.is_finite())
+    {
+        bail!("--max-selected-channel-delta must be finite");
+    }
     let selected = selected_metric(report, thresholds.selected_metric.as_deref())?;
     let mut failures = Vec::new();
-    if let Some(minimum) = thresholds.fail_under {
-        if selected.score < minimum {
-            failures.push(format!(
-                "{} score {:.8} is below --fail-under {:.8}",
-                selected.name, selected.score, minimum
-            ));
-        }
+    if let Some(minimum) = thresholds.fail_under
+        && selected.score < minimum
+    {
+        failures.push(format!(
+            "{} score {:.8} is below --fail-under {:.8}",
+            selected.name, selected.score, minimum
+        ));
     }
     if let Some(max_delta) = thresholds.max_selected_channel_delta {
         let actual = selected
@@ -891,29 +1457,29 @@ fn evaluate_gate(
         }
     }
     if let Some(alpha) = report.alpha {
-        if let Some(max_delta) = thresholds.max_alpha_delta {
-            if alpha.max_delta > max_delta {
-                failures.push(format!(
-                    "alpha max delta {} exceeds --max-alpha-delta {}",
-                    alpha.max_delta, max_delta
-                ));
-            }
+        if let Some(max_delta) = thresholds.max_alpha_delta
+            && alpha.max_delta > max_delta
+        {
+            failures.push(format!(
+                "alpha max delta {} exceeds --max-alpha-delta {}",
+                alpha.max_delta, max_delta
+            ));
         }
-        if let Some(max_mismatches) = thresholds.max_alpha_mismatches {
-            if alpha.mismatch_count > max_mismatches {
-                failures.push(format!(
-                    "alpha mismatches {} exceeds --max-alpha-mismatches {}",
-                    alpha.mismatch_count, max_mismatches
-                ));
-            }
+        if let Some(max_mismatches) = thresholds.max_alpha_mismatches
+            && alpha.mismatch_count > max_mismatches
+        {
+            failures.push(format!(
+                "alpha mismatches {} exceeds --max-alpha-mismatches {}",
+                alpha.mismatch_count, max_mismatches
+            ));
         }
-        if let Some(max_mismatches) = thresholds.max_alpha_mismatches_beyond_one_lsb {
-            if alpha.mismatches_beyond_one_lsb > max_mismatches {
-                failures.push(format!(
-                    "alpha mismatches beyond one LSB {} exceeds --max-alpha-mismatches-beyond-one-lsb {}",
-                    alpha.mismatches_beyond_one_lsb, max_mismatches
-                ));
-            }
+        if let Some(max_mismatches) = thresholds.max_alpha_mismatches_beyond_one_lsb
+            && alpha.mismatches_beyond_one_lsb > max_mismatches
+        {
+            failures.push(format!(
+                "alpha mismatches beyond one LSB {} exceeds --max-alpha-mismatches-beyond-one-lsb {}",
+                alpha.mismatches_beyond_one_lsb, max_mismatches
+            ));
         }
     }
     Ok(ComparisonGateReport {
@@ -1251,6 +1817,7 @@ fn ssh_capture_stdout(
     remote_command: &str,
     remote: &RemoteOptions,
 ) -> Result<Vec<u8>> {
+    spec.validate()?;
     let mut command = ProcessCommand::new(&remote.ssh);
     command.arg("-T");
     if remote.batch_mode {
@@ -1269,26 +1836,53 @@ fn ssh_capture_stdout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = command
+    let child = command
         .spawn()
         .with_context(|| format!("failed to start `{}`", remote.ssh.display()))?;
+    let mut child = CapturedChild::new(child);
     let mut stdout = child
+        .child
         .stdout
         .take()
         .ok_or_else(|| anyhow::anyhow!("failed to capture ssh stdout"))?;
     let mut bytes = Vec::new();
-    stdout
-        .by_ref()
-        .take(remote.max_bytes as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    let mut stderr = String::new();
-    if let Some(mut child_stderr) = child.stderr.take() {
-        child_stderr.read_to_string(&mut stderr)?;
+    let read_limit = u64::try_from(remote.max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let read_result = stdout.by_ref().take(read_limit).read_to_end(&mut bytes);
+    drop(stdout);
+    if let Err(error) = read_result {
+        child.terminate();
+        let stderr = child.take_stderr();
+        bail!(
+            "failed to read ssh stdout for {}: {error}\n{}",
+            spec.uri(),
+            stderr.trim()
+        )
     }
-    let status = child.wait()?;
-    if bytes.len() > remote.max_bytes {
-        bail!("remote stream exceeded --remote-max-bytes")
+    let exceeded_limit = bytes.len() > remote.max_bytes;
+    if exceeded_limit {
+        child.terminate();
+        let stderr = child.take_stderr();
+        bail!(
+            "remote stream exceeded --remote-max-bytes for {}\n{}",
+            spec.uri(),
+            stderr.trim()
+        )
     }
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            child.terminate();
+            let stderr = child.take_stderr();
+            bail!(
+                "failed to wait for ssh command for {}: {error}\n{}",
+                spec.uri(),
+                stderr.trim()
+            )
+        }
+    };
+    let stderr = child.take_stderr();
     if !status.success() {
         bail!(
             "ssh command failed for {}: {status}\n{}",
@@ -1299,15 +1893,107 @@ fn ssh_capture_stdout(
     Ok(bytes)
 }
 
+struct CapturedChild {
+    child: Child,
+    stderr_reader: Option<JoinHandle<String>>,
+    reaped: bool,
+}
+
+impl CapturedChild {
+    fn new(mut child: Child) -> Self {
+        let stderr_reader = child.stderr.take().map(|stderr| {
+            std::thread::spawn(move || read_bounded_stderr_tail(stderr, REMOTE_STDERR_TAIL_BYTES))
+        });
+        Self {
+            child,
+            stderr_reader,
+            reaped: false,
+        }
+    }
+
+    fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        let status = self.child.wait()?;
+        self.reaped = true;
+        Ok(status)
+    }
+
+    fn terminate(&mut self) {
+        if !self.reaped {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.reaped = true;
+        }
+    }
+
+    fn take_stderr(&mut self) -> String {
+        self.stderr_reader
+            .take()
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for CapturedChild {
+    fn drop(&mut self) {
+        self.terminate();
+        if let Some(reader) = self.stderr_reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn read_bounded_stderr_tail(mut reader: impl Read, max_bytes: usize) -> String {
+    let mut tail = Vec::with_capacity(max_bytes.min(8192));
+    let mut chunk = [0u8; 8192];
+    let mut truncated = false;
+    let mut read_error = None;
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) if max_bytes == 0 => truncated |= read != 0,
+            Ok(read) if read >= max_bytes => {
+                truncated |= !tail.is_empty() || read > max_bytes;
+                tail.clear();
+                tail.extend_from_slice(&chunk[read - max_bytes..read]);
+            }
+            Ok(read) => {
+                let overflow = tail.len().saturating_add(read).saturating_sub(max_bytes);
+                if overflow != 0 {
+                    truncated = true;
+                    tail.copy_within(overflow.., 0);
+                    tail.truncate(tail.len() - overflow);
+                }
+                tail.extend_from_slice(&chunk[..read]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                read_error = Some(error);
+                break;
+            }
+        }
+    }
+    let mut output = String::new();
+    if truncated {
+        output.push_str("[stderr truncated; showing tail]\n");
+    }
+    if let Some(error) = read_error {
+        output.push_str(&format!("[failed to read stderr: {error}]\n"));
+    }
+    output.push_str(&String::from_utf8_lossy(&tail));
+    output
+}
+
+#[derive(Debug)]
 struct ManagedTempPath {
     path: PathBuf,
+    directory: PathBuf,
     keep: bool,
 }
 
 impl Drop for ManagedTempPath {
     fn drop(&mut self) {
         if !self.keep {
-            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_dir_all(&self.directory);
         }
     }
 }
@@ -1322,46 +2008,96 @@ fn scp_path_to_temp(
     remote: &RemoteOptions,
     kind: &str,
 ) -> Result<ManagedTempPath> {
-    let dir = remote
-        .copy_dir
-        .clone()
-        .unwrap_or_else(|| std::env::temp_dir().join("imq-remote"));
-    std::fs::create_dir_all(&dir)?;
-    let filename = format!(
-        "{}-{}-{}",
-        kind,
-        std::process::id(),
-        remote_path.rsplit('/').next().unwrap_or("input")
-    );
-    let path = dir.join(filename);
+    spec.validate()?;
+    let base_dir = remote.copy_dir.clone().unwrap_or_else(std::env::temp_dir);
+    std::fs::create_dir_all(&base_dir)?;
+    let directory = create_private_temp_dir(&base_dir, kind)?;
+    let path = directory.join("payload");
+    let mut temp = ManagedTempPath {
+        path,
+        directory,
+        keep: false,
+    };
     let mut command = ProcessCommand::new(&remote.scp);
     if let Some(port) = spec.port {
         command.args(["-P", &port.to_string()]);
     }
     command.arg(format!(
         "{}:{}",
-        spec.ssh_target(),
+        spec.scp_target(),
         imq::shell_quote_posix(remote_path)
     ));
-    command.arg(&path);
-    let output = command
-        .output()
+    command.arg(&temp.path);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let child = command
+        .spawn()
         .with_context(|| format!("failed to start `{}`", remote.scp.display()))?;
-    if !output.status.success() {
+    let mut child = CapturedChild::new(child);
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            child.terminate();
+            let stderr = child.take_stderr();
+            bail!(
+                "failed to wait for scp from {}: {error}\n{}",
+                spec.uri(),
+                stderr.trim()
+            )
+        }
+    };
+    let stderr = child.take_stderr();
+    if !status.success() {
         bail!(
             "scp failed for {}: {}\n{}",
             spec.uri(),
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
+            status,
+            stderr.trim()
         );
     }
+    temp.keep = remote.keep_temp;
     if remote.keep_temp {
-        eprintln!("kept remote copy temp: {}", path.display());
+        eprintln!("kept remote copy temp: {}", temp.path.display());
     }
-    Ok(ManagedTempPath {
-        path,
-        keep: remote.keep_temp,
-    })
+    Ok(temp)
+}
+
+fn create_private_temp_dir(base: &Path, kind: &str) -> Result<PathBuf> {
+    let safe_kind = kind
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    for _ in 0..128 {
+        let counter = REMOTE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let nonce = RandomState::new().hash_one((std::process::id(), counter, timestamp));
+        let path = base.join(format!("imq-{safe_kind}-{nonce:016x}"));
+        #[cfg(unix)]
+        let created = {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700).create(&path)
+        };
+        #[cfg(not(unix))]
+        let created = std::fs::create_dir(&path);
+        match created {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    bail!("failed to allocate a unique private remote-copy directory")
 }
 
 fn reject_double_stdin_specs(first: &InputSpec, second: Option<&InputSpec>) -> Result<()> {
@@ -1439,8 +2175,84 @@ impl RawPixelFormatArg {
 mod tests {
     use super::*;
 
+    fn sqlite_test_path(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("imq-{label}-{}-{nonce}.sqlite", std::process::id()))
+    }
+
     fn plane_bytes(frame: &imq::FrameOwned) -> &[u8] {
         &frame.owned_planes()[0].data
+    }
+
+    #[test]
+    fn suite_rules_route_by_threshold_side() {
+        let rules = [
+            "psnr>=35".to_string(),
+            "psnr>=baseline-0.5".to_string(),
+            "baseline_ssim>=0.9".to_string(),
+            "mse<=baseline*1.1".to_string(),
+        ];
+
+        let (absolute, baseline) = parse_suite_rules(&rules).unwrap();
+
+        assert_eq!(
+            absolute
+                .iter()
+                .map(|rule| rule.metric.as_str())
+                .collect::<Vec<_>>(),
+            ["psnr", "baseline_ssim"]
+        );
+        assert_eq!(absolute[0].threshold, 35.0);
+        assert_eq!(absolute[1].threshold, 0.9);
+        assert_eq!(
+            baseline
+                .iter()
+                .map(|rule| rule.metric.as_str())
+                .collect::<Vec<_>>(),
+            ["psnr", "mse"]
+        );
+        let scaled =
+            imq::BaselineThresholdRule::new("mse", imq::GateOperator::LessOrEqual, 1.1, 0.0);
+        assert_eq!(baseline[1], scaled);
+    }
+
+    #[test]
+    fn suite_rules_reject_invalid_thresholds() {
+        assert!(parse_suite_rules(&["psnr>=abc".to_string()]).is_err());
+        assert!(parse_suite_rules(&["psnr>=baseline=oops".to_string()]).is_err());
+    }
+
+    #[test]
+    fn resolves_baseline_flag_against_candidate_labels() {
+        let candidates = vec![
+            PathBuf::from("ref.png"),
+            PathBuf::from("./a.png"),
+            PathBuf::from("sub/b.png"),
+        ];
+
+        assert_eq!(
+            resolve_baseline_label(Path::new("sub/b.png"), &candidates).as_deref(),
+            Some("sub/b.png")
+        );
+        assert_eq!(
+            resolve_baseline_label(Path::new("./a.png"), &candidates).as_deref(),
+            Some("./a.png")
+        );
+        assert_eq!(
+            resolve_baseline_label(Path::new("a.png"), &candidates).as_deref(),
+            Some("./a.png")
+        );
+        assert_eq!(
+            resolve_baseline_label(Path::new("sub/../a.png"), &candidates).as_deref(),
+            Some("./a.png")
+        );
+        assert_eq!(
+            resolve_baseline_label(Path::new("missing.png"), &candidates),
+            None
+        );
     }
 
     #[test]
@@ -1521,6 +2333,318 @@ mod tests {
         )
         .unwrap();
         assert!(gate.passed);
+    }
+
+    #[test]
+    fn gate_rejects_non_finite_thresholds() {
+        let report = ComparisonReport::new(
+            imq::Dimensions::new(1, 1).unwrap(),
+            imq::FormatSpec::new(imq::PixelFormat::Rgba8),
+            imq::FormatSpec::new(imq::PixelFormat::Rgba8),
+            vec![MetricOutput::new(
+                "psnr",
+                40.0,
+                "dB",
+                imq::metrics::Direction::HigherIsBetter,
+            )],
+        );
+
+        for thresholds in [
+            ComparisonThresholds {
+                fail_under: Some(f64::NAN),
+                ..ComparisonThresholds::default()
+            },
+            ComparisonThresholds {
+                max_selected_channel_delta: Some(f64::INFINITY),
+                ..ComparisonThresholds::default()
+            },
+        ] {
+            assert!(evaluate_gate(&report, thresholds).is_err());
+        }
+    }
+
+    #[test]
+    fn comparison_csv_preserves_gate_decision() {
+        let report = ComparisonReport::new(
+            imq::Dimensions::new(1, 1).unwrap(),
+            imq::FormatSpec::new(imq::PixelFormat::Rgba8),
+            imq::FormatSpec::new(imq::PixelFormat::Rgba8),
+            vec![MetricOutput::new(
+                "psnr",
+                39.0,
+                "dB",
+                imq::metrics::Direction::HigherIsBetter,
+            )],
+        )
+        .with_gate(ComparisonGateReport {
+            thresholds: ComparisonThresholds {
+                fail_under: Some(40.0),
+                ..ComparisonThresholds::default()
+            },
+            passed: false,
+            failures: vec!["psnr below threshold".to_string()],
+        });
+
+        let csv = csv_string(comparison_csv_rows(&report).unwrap()).unwrap();
+        let mut reader = csv::Reader::from_reader(csv.as_bytes());
+        let headers = reader.headers().unwrap().clone();
+        let gate_index = headers.iter().position(|name| name == "gate_json").unwrap();
+        let record = reader.records().next().unwrap().unwrap();
+        let gate: serde_json::Value =
+            serde_json::from_str(record.get(gate_index).unwrap()).unwrap();
+
+        assert_eq!(gate["passed"], false);
+        assert_eq!(gate["thresholds"]["fail_under"], 40.0);
+        assert_eq!(gate["failures"][0], "psnr below threshold");
+    }
+
+    #[test]
+    fn sqlite_preserves_non_finite_scores_as_canonical_text() {
+        let path = sqlite_test_path("nonfinite");
+        let report = ComparisonReport::new(
+            imq::Dimensions::new(1, 1).unwrap(),
+            imq::FormatSpec::new(imq::PixelFormat::Rgba8),
+            imq::FormatSpec::new(imq::PixelFormat::Rgba8),
+            vec![
+                MetricOutput::new("finite", 1.25, "", imq::metrics::Direction::Neutral),
+                MetricOutput::new("nan", f64::NAN, "", imq::metrics::Direction::Neutral),
+                MetricOutput::new(
+                    "pos_inf",
+                    f64::INFINITY,
+                    "",
+                    imq::metrics::Direction::Neutral,
+                ),
+                MetricOutput::new(
+                    "neg_inf",
+                    f64::NEG_INFINITY,
+                    "",
+                    imq::metrics::Direction::Neutral,
+                ),
+            ],
+        );
+        write_sqlite_report(Some(&path), SqlReport::Image(&report)).unwrap();
+
+        let conn = open_sqlite(&path).unwrap();
+        let mut statement = conn
+            .prepare("SELECT name, typeof(score), score FROM imq_metrics ORDER BY id")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, rusqlite::types::Value>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows[0],
+            (
+                "finite".into(),
+                "real".into(),
+                rusqlite::types::Value::Real(1.25)
+            )
+        );
+        for (index, expected) in [(1, "NaN"), (2, "Infinity"), (3, "-Infinity")] {
+            assert_eq!(rows[index].1, "text");
+            assert_eq!(rows[index].2, rusqlite::types::Value::Text(expected.into()));
+        }
+        drop(statement);
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sqlite_report_and_metrics_roll_back_together() {
+        let path = sqlite_test_path("rollback");
+        let conn = open_sqlite(&path).unwrap();
+        init_sqlite(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_metric BEFORE INSERT ON imq_metrics BEGIN SELECT RAISE(ABORT, 'forced metric failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+        let report = ComparisonReport::new(
+            imq::Dimensions::new(1, 1).unwrap(),
+            imq::FormatSpec::new(imq::PixelFormat::Rgba8),
+            imq::FormatSpec::new(imq::PixelFormat::Rgba8),
+            vec![MetricOutput::new(
+                "mse",
+                0.0,
+                "code^2",
+                imq::metrics::Direction::LowerIsBetter,
+            )],
+        );
+        assert!(write_sqlite_report(Some(&path), SqlReport::Image(&report)).is_err());
+
+        let conn = open_sqlite(&path).unwrap();
+        let reports: i64 = conn
+            .query_row("SELECT COUNT(*) FROM imq_reports", [], |row| row.get(0))
+            .unwrap();
+        let metrics: i64 = conn
+            .query_row("SELECT COUNT(*) FROM imq_metrics", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!((reports, metrics), (0, 0));
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "ffmpeg")]
+    #[test]
+    fn video_cli_accepts_timestamp_alignment_controls() {
+        let cli = Cli::try_parse_from([
+            "imq",
+            "video",
+            "reference.mkv",
+            "candidate.mkv",
+            "--align",
+            "timestamp",
+            "--max-timestamp-delta",
+            "0.02",
+            "--allow-reuse-distorted",
+            "--timestamp-scale",
+            "1.001",
+            "--timestamp-offset",
+            "-0.25",
+        ])
+        .unwrap();
+        let Command::Video(cmd) = cli.command else {
+            panic!("expected video command")
+        };
+        assert_eq!(cmd.align, VideoAlignmentArg::Timestamp);
+        assert_eq!(cmd.max_timestamp_delta, Some(0.02));
+        assert!(cmd.allow_reuse_distorted);
+        assert_eq!(cmd.timestamp_scale, Some(1.001));
+        assert_eq!(cmd.timestamp_offset, Some(-0.25));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_capture_kills_child_when_byte_limit_is_exceeded() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = std::env::temp_dir().join(format!(
+            "imq-fake-ssh-limit-{}-{}.sh",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(
+            &script,
+            b"#!/bin/sh\nwhile :; do printf '0123456789abcdef'; printf 'diagnostic\\n' >&2; done\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let spec = SshInput {
+            user: None,
+            host: "example.com".to_string(),
+            port: None,
+            path: "/image.png".to_string(),
+        };
+        let options = RemoteOptions {
+            ssh: script.clone(),
+            max_bytes: 8,
+            ..RemoteOptions::default()
+        };
+        let error = ssh_capture_stdout(&spec, "ignored", &options).unwrap_err();
+        let _ = std::fs::remove_file(script);
+        assert!(error.to_string().contains("remote-max-bytes"));
+    }
+
+    #[test]
+    fn remote_stderr_capture_retains_only_the_bounded_tail() {
+        let mut input = vec![b'a'; REMOTE_STDERR_TAIL_BYTES + 1024];
+        input.extend_from_slice(b"tail-marker");
+
+        let captured = read_bounded_stderr_tail(input.as_slice(), REMOTE_STDERR_TAIL_BYTES);
+
+        assert!(captured.starts_with("[stderr truncated; showing tail]\n"));
+        assert!(captured.ends_with("tail-marker"));
+        assert!(captured.len() <= REMOTE_STDERR_TAIL_BYTES + 64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scp_copy_uses_private_unique_directory_and_removes_partials() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = create_private_temp_dir(&std::env::temp_dir(), "scp-test-root").unwrap();
+        let script = base.join("fake-scp.sh");
+        std::fs::write(
+            &script,
+            b"#!/bin/sh\ndestination=\nfor argument in \"$@\"; do destination=$argument; done\nprintf payload > \"$destination\"\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let spec = SshInput {
+            user: None,
+            host: "example.com".to_string(),
+            port: None,
+            path: "/../../escape.png".to_string(),
+        };
+        let options = RemoteOptions {
+            scp: script.clone(),
+            copy_dir: Some(base.clone()),
+            ..RemoteOptions::default()
+        };
+        let temp = scp_to_temp(&spec, &options, "input").unwrap();
+        let private_dir = temp.path.parent().unwrap().to_path_buf();
+        assert_eq!(temp.path.file_name().unwrap(), "payload");
+        assert_eq!(std::fs::read(&temp.path).unwrap(), b"payload");
+        assert_eq!(
+            std::fs::metadata(&private_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(private_dir.parent(), Some(base.as_path()));
+        drop(temp);
+        assert!(!private_dir.exists());
+
+        std::fs::write(
+            &script,
+            b"#!/bin/sh\ndestination=\nfor argument in \"$@\"; do destination=$argument; done\nprintf partial > \"$destination\"\nprintf 'copy failed marker\\n' >&2\nexit 7\n",
+        )
+        .unwrap();
+        let error = scp_to_temp(&spec, &options, "input").unwrap_err();
+        assert!(error.to_string().contains("copy failed marker"));
+        assert!(
+            std::fs::read_dir(&base)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .all(|entry| !entry.file_type().unwrap().is_dir())
+        );
+
+        let _ = std::fs::remove_file(script);
+        let _ = std::fs::remove_dir(base);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn parses_gpu_error_and_window_metrics() {
+        let (metrics, wssim) = parse_gpu_metrics("psnr,maxae,wssim").unwrap();
+        assert_eq!(
+            metrics,
+            vec![
+                imq::gpu::GpuErrorMetric::Psnr,
+                imq::gpu::GpuErrorMetric::MaxAbsoluteError,
+            ]
+        );
+        assert!(wssim);
+
+        let (metrics, wssim) = parse_gpu_metrics("wssim").unwrap();
+        assert!(metrics.is_empty());
+        assert!(wssim);
+        assert!(parse_gpu_metrics("ssim").is_err());
     }
 }
 
@@ -1774,30 +2898,90 @@ fn mean_pair_metric_outputs(frames: &[imq::FramePairReport]) -> Vec<MetricOutput
 #[cfg(feature = "ffmpeg")]
 fn run_video(cmd: VideoCmd) -> Result<()> {
     let metrics = MetricSet::from_csv(&cmd.metrics)?;
-    let mut ffmpeg = imq::video::FfmpegOptions {
+    let compare = imq::video::VideoCompareOptions {
+        every: cmd.every.max(1),
+        max_frames: cmd.max_frames,
+    };
+    let timestamp_options = match cmd.align {
+        VideoAlignmentArg::Decode => {
+            if cmd.max_timestamp_delta.is_some()
+                || cmd.allow_reuse_distorted
+                || cmd.no_estimate_timestamp_transform
+                || cmd.timestamp_scale.is_some()
+                || cmd.timestamp_offset.is_some()
+            {
+                bail!("timestamp alignment options require `--align timestamp`")
+            }
+            None
+        }
+        VideoAlignmentArg::Timestamp => {
+            let mut pairing = imq::TimestampPairingOptions::default();
+            if let Some(max_delta_seconds) = cmd.max_timestamp_delta {
+                if !max_delta_seconds.is_finite() || max_delta_seconds < 0.0 {
+                    bail!("--max-timestamp-delta must be finite and non-negative")
+                }
+                pairing.max_delta_seconds = max_delta_seconds;
+            }
+            pairing.allow_reuse_distorted = cmd.allow_reuse_distorted;
+
+            let transform = if cmd.timestamp_scale.is_some() || cmd.timestamp_offset.is_some() {
+                let scale = cmd.timestamp_scale.unwrap_or(1.0);
+                let offset_seconds = cmd.timestamp_offset.unwrap_or(0.0);
+                if !scale.is_finite() || scale <= 0.0 {
+                    bail!("--timestamp-scale must be finite and greater than zero")
+                }
+                if !offset_seconds.is_finite() {
+                    bail!("--timestamp-offset must be finite")
+                }
+                Some(imq::TimestampTransform {
+                    scale,
+                    offset_seconds,
+                })
+            } else {
+                None
+            };
+            Some(imq::video::TimestampVideoCompareOptions {
+                compare: compare.clone(),
+                pairing,
+                transform,
+                estimate_transform: !cmd.no_estimate_timestamp_transform,
+            })
+        }
+    };
+    let ffmpeg = imq::video::FfmpegOptions {
         ffmpeg: cmd.ffmpeg,
         ffprobe: cmd.ffprobe,
         stream_index: cmd.stream,
         scale: parse_optional_scale(cmd.width, cmd.height)?,
         input_args: Vec::new(),
     };
-    if ffmpeg.scale.is_none() {
-        ffmpeg.scale = None;
+    let format = output_format(cmd.json, cmd.output.format);
+    if let Some(options) = timestamp_options {
+        let report = imq::video::compare_videos_by_timestamp(
+            &cmd.reference,
+            &cmd.distorted,
+            &ffmpeg,
+            &options,
+            &metrics,
+        )
+        .with_context(|| "timestamp-aligned video comparison failed")?;
+        if report.alignment.pairs.is_empty() && options.compare.max_frames != Some(0) {
+            bail!(
+                "timestamp alignment accepted no frame pairs; increase --max-timestamp-delta or verify the timeline transform"
+            )
+        }
+        write_sqlite_report(
+            cmd.output.sqlite.as_deref(),
+            SqlReport::TimestampVideo(&report),
+        )?;
+        emit_timestamp_video_report(&report, format, &cmd.output)?;
+    } else {
+        let report =
+            imq::video::compare_videos(&cmd.reference, &cmd.distorted, &ffmpeg, &compare, &metrics)
+                .with_context(|| "video comparison failed")?;
+        write_sqlite_report(cmd.output.sqlite.as_deref(), SqlReport::Video(&report))?;
+        emit_video_report(&report, format, &cmd.output)?;
     }
-    let compare = imq::video::VideoCompareOptions {
-        every: cmd.every.max(1),
-        max_frames: cmd.max_frames,
-    };
-    let report =
-        imq::video::compare_videos(&cmd.reference, &cmd.distorted, &ffmpeg, &compare, &metrics)
-            .with_context(|| "video comparison failed")?;
-
-    write_sqlite_report(cmd.output.sqlite.as_deref(), SqlReport::Video(&report))?;
-    emit_video_report(
-        &report,
-        output_format(cmd.json, cmd.output.format),
-        &cmd.output,
-    )?;
     Ok(())
 }
 
@@ -1963,6 +3147,23 @@ struct ImageComparisonStats {
     distorted: ImageStatsReport,
 }
 
+#[cfg(feature = "gpu")]
+#[derive(Debug, Serialize)]
+struct GpuCliReport {
+    capabilities: Option<imq::gpu::GpuCapabilities>,
+    initialization_error: Option<String>,
+    reference: String,
+    comparisons: Vec<GpuCliComparison>,
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Debug, Serialize)]
+struct GpuCliComparison {
+    candidate: String,
+    error_result: Option<imq::gpu::GpuRgba8Comparison>,
+    wssim_result: Option<imq::gpu::GpuWindowedSsimComparison>,
+}
+
 #[derive(Debug, Serialize)]
 struct FormatsReport {
     formats: Vec<String>,
@@ -2043,6 +3244,61 @@ struct MetricCsvRow {
 }
 
 #[derive(Debug, Serialize)]
+struct ComparisonCsvRow {
+    report_kind: &'static str,
+    reference: String,
+    distorted: String,
+    width: u32,
+    height: u32,
+    scope: &'static str,
+    frame_index: Option<u64>,
+    pts_seconds: Option<f64>,
+    pair_index: Option<u64>,
+    reference_frame_index: Option<u64>,
+    distorted_frame_index: Option<u64>,
+    metric: String,
+    score: f64,
+    unit: String,
+    direction: String,
+    details_json: String,
+    gate_json: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SuiteCsvRow {
+    reference: String,
+    candidate: String,
+    candidate_passed: bool,
+    overall_rank: Option<usize>,
+    mean_rank: Option<f64>,
+    pareto_optimal: bool,
+    error: Option<String>,
+    gate_json: Option<String>,
+    baseline_gate_json: Option<String>,
+    metric: Option<String>,
+    score: Option<f64>,
+    unit: Option<String>,
+    direction: Option<String>,
+    metric_rank: Option<usize>,
+    baseline_delta: Option<f64>,
+    details_json: Option<String>,
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Debug, Serialize)]
+struct GpuCsvRow {
+    reference: String,
+    candidate: String,
+    execution: String,
+    fallback_reason: Option<String>,
+    metric: String,
+    score: f64,
+    unit: String,
+    direction: String,
+    details_json: String,
+}
+
+#[derive(Debug, Serialize)]
 struct ProbeCsvRow {
     input: String,
     width: u32,
@@ -2101,6 +3357,7 @@ struct MetricCsvContext {
 enum SqlReport<'a> {
     Image(&'a ComparisonReport),
     Video(&'a VideoReport),
+    TimestampVideo(&'a imq::video::TimestampVideoComparison),
     VideoPairs(&'a VideoFramePairComparisonReport),
 }
 
@@ -2136,9 +3393,40 @@ fn emit_comparison_report(
         OutputFormatArg::Json => serde_json::to_string_pretty(report)?,
         OutputFormatArg::Yaml => serde_yaml_ng::to_string(report)?,
         OutputFormatArg::Toml => toml::to_string_pretty(report)?,
-        OutputFormatArg::Csv => csv_string(comparison_csv_rows(report))?,
+        OutputFormatArg::Csv => csv_string(comparison_csv_rows(report)?)?,
     };
     write_output(output.output.as_deref(), &content)
+}
+
+fn emit_suite_report(
+    report: &imq::ComparisonSuiteReport,
+    format: OutputFormatArg,
+    output: Option<&Path>,
+) -> Result<()> {
+    let content = match format {
+        OutputFormatArg::Text => render_suite_text(report),
+        OutputFormatArg::Json => serde_json::to_string_pretty(report)?,
+        OutputFormatArg::Yaml => serde_yaml_ng::to_string(report)?,
+        OutputFormatArg::Toml => toml::to_string_pretty(report)?,
+        OutputFormatArg::Csv => csv_string(suite_csv_rows(report))?,
+    };
+    write_output(output, &content)
+}
+
+#[cfg(feature = "gpu")]
+fn emit_gpu_report(
+    report: &GpuCliReport,
+    format: OutputFormatArg,
+    output: Option<&Path>,
+) -> Result<()> {
+    let content = match format {
+        OutputFormatArg::Text => render_gpu_report(report),
+        OutputFormatArg::Json => serde_json::to_string_pretty(report)?,
+        OutputFormatArg::Yaml => serde_yaml_ng::to_string(report)?,
+        OutputFormatArg::Toml => toml::to_string_pretty(report)?,
+        OutputFormatArg::Csv => csv_string(gpu_csv_rows(report))?,
+    };
+    write_output(output, &content)
 }
 
 fn emit_image_comparison_stats_report(
@@ -2159,7 +3447,7 @@ fn emit_image_comparison_stats_report(
         OutputFormatArg::Yaml => serde_yaml_ng::to_string(report)?,
         OutputFormatArg::Toml => toml::to_string_pretty(report)?,
         OutputFormatArg::Csv => {
-            let mut csv = csv_string(comparison_csv_rows(&report.comparison))?;
+            let mut csv = csv_string(comparison_csv_rows(&report.comparison)?)?;
             csv.push('\n');
             csv.push_str(&csv_string(stats_csv_rows(&report.stats.reference))?);
             csv.push('\n');
@@ -2196,6 +3484,22 @@ fn emit_video_report(
         OutputFormatArg::Yaml => serde_yaml_ng::to_string(report)?,
         OutputFormatArg::Toml => toml::to_string_pretty(report)?,
         OutputFormatArg::Csv => csv_string(video_csv_rows(report))?,
+    };
+    write_output(output.output.as_deref(), &content)
+}
+
+#[cfg(feature = "ffmpeg")]
+fn emit_timestamp_video_report(
+    report: &imq::video::TimestampVideoComparison,
+    format: OutputFormatArg,
+    output: &OutputArgs,
+) -> Result<()> {
+    let content = match format {
+        OutputFormatArg::Text => render_timestamp_video_text(report),
+        OutputFormatArg::Json => serde_json::to_string_pretty(report)?,
+        OutputFormatArg::Yaml => serde_yaml_ng::to_string(report)?,
+        OutputFormatArg::Toml => toml::to_string_pretty(report)?,
+        OutputFormatArg::Csv => csv_string(timestamp_video_csv_rows(report))?,
     };
     write_output(output.output.as_deref(), &content)
 }
@@ -2372,6 +3676,157 @@ fn render_comparison_text(report: &ComparisonReport) -> String {
     output
 }
 
+fn render_suite_text(report: &imq::ComparisonSuiteReport) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "reference : {}\n",
+        report.reference.as_deref().unwrap_or("<none>")
+    ));
+    output.push_str(&format!(
+        "size      : {}x{}\n",
+        report.dimensions.width, report.dimensions.height
+    ));
+    output.push_str(&format!(
+        "suite     : {} ({} candidates)\n",
+        if report.passed { "passed" } else { "failed" },
+        report.candidates.len()
+    ));
+    if let Some(primary) = &report.primary_metric {
+        output.push_str(&format!("primary   : {primary}\n"));
+    } else {
+        output.push_str("primary   : consensus mean rank\n");
+    }
+    if let Some(baseline) = &report.baseline_candidate {
+        output.push_str(&format!("baseline  : {baseline}\n"));
+    }
+
+    for candidate in &report.candidates {
+        output.push_str(&format!(
+            "\n[rank {}] {}  status={}  pareto={}  mean_rank={}\n",
+            candidate
+                .overall_rank
+                .map(|rank| rank.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            candidate.label,
+            if candidate.passed() {
+                "passed"
+            } else {
+                "failed"
+            },
+            candidate.pareto_optimal,
+            candidate
+                .mean_rank
+                .map(|rank| format!("{rank:.4}"))
+                .unwrap_or_else(|| "-".to_string())
+        ));
+        if let Some(error) = &candidate.error {
+            output.push_str(&format!("error     : {error}\n"));
+            continue;
+        }
+        for metric in &candidate.metrics {
+            let rank = candidate
+                .metric_ranks
+                .get(&metric.name)
+                .map(|rank| rank.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let delta = candidate
+                .baseline_deltas
+                .get(&metric.name)
+                .map(|delta| format!(" delta={delta:+.8}"))
+                .unwrap_or_default();
+            output.push_str(&format!(
+                "  {:<24} {:>14.8} {:<18} rank={}{}\n",
+                metric.name, metric.score, metric.unit, rank, delta
+            ));
+        }
+        if let Some(gate) = &candidate.gate {
+            for failure in gate.failures() {
+                output.push_str(&format!("  gate failure: {}\n", failure.message));
+            }
+        }
+        if let Some(gate) = &candidate.baseline_gate {
+            for failure in gate.failures() {
+                output.push_str(&format!("  baseline gate failure: {}\n", failure.message));
+            }
+        }
+    }
+    output
+}
+
+#[cfg(feature = "gpu")]
+fn render_gpu_capabilities(capabilities: &imq::gpu::GpuCapabilities) -> String {
+    format!(
+        "adapter                  : {}\n\
+         backend                  : {}\n\
+         device type              : {}\n\
+         driver                   : {}\n\
+         driver info              : {}\n\
+         vendor/device            : {:#06x}/{:#06x}\n\
+         fallback adapter         : {}\n\
+         max buffer bytes         : {}\n\
+         max storage binding      : {}\n\
+         max workgroups/dimension : {}\n\
+         max rgba8 input pixels   : {}\n\
+         max error pixels         : {}\n\
+         max wssim windows        : {}\n",
+        capabilities.adapter_name,
+        capabilities.backend,
+        capabilities.device_type,
+        capabilities.driver,
+        capabilities.driver_info,
+        capabilities.vendor_id,
+        capabilities.device_id,
+        capabilities.fallback_adapter,
+        capabilities.max_buffer_size,
+        capabilities.max_storage_buffer_binding_size,
+        capabilities.max_compute_workgroups_per_dimension,
+        capabilities.max_rgba8_input_pixels,
+        capabilities.max_error_stats_pixels,
+        capabilities.max_windowed_ssim_windows,
+    )
+}
+
+#[cfg(feature = "gpu")]
+fn render_gpu_report(report: &GpuCliReport) -> String {
+    let mut output = String::new();
+    if let Some(capabilities) = &report.capabilities {
+        output.push_str(&render_gpu_capabilities(capabilities));
+    } else if let Some(error) = &report.initialization_error {
+        output.push_str(&format!("GPU unavailable          : {error}\n"));
+    }
+    output.push_str(&format!(
+        "reference                : {}\n",
+        report.reference
+    ));
+    for comparison in &report.comparisons {
+        output.push_str(&format!(
+            "\ncandidate                : {}\n",
+            comparison.candidate
+        ));
+        if let Some(result) = &comparison.error_result {
+            output.push_str(&format!(
+                "error execution          : {:?}\n",
+                result.execution
+            ));
+            if let Some(reason) = &result.fallback_reason {
+                output.push_str(&format!("error fallback reason    : {reason}\n"));
+            }
+            output.push_str(&render_metrics(&result.metrics));
+        }
+        if let Some(result) = &comparison.wssim_result {
+            output.push_str(&format!(
+                "wssim execution          : {:?}\n",
+                result.execution
+            ));
+            if let Some(reason) = &result.fallback_reason {
+                output.push_str(&format!("wssim fallback reason    : {reason}\n"));
+            }
+            output.push_str(&render_metrics(std::slice::from_ref(&result.metric)));
+        }
+    }
+    output
+}
+
 fn render_stats_text(report: &ImageStatsReport) -> String {
     let stats = &report.stats;
     let mut output = String::new();
@@ -2428,6 +3883,51 @@ fn render_video_text(report: &VideoReport) -> String {
     output.push_str("\nmean metrics\n");
     output.push_str(&render_metrics(&report.mean_metrics));
     output
+}
+
+#[cfg(feature = "ffmpeg")]
+fn render_timestamp_video_text(report: &imq::video::TimestampVideoComparison) -> String {
+    let alignment = &report.alignment;
+    let mut output = render_video_text(&report.video);
+    output.push_str("\ntimestamp alignment\n");
+    output.push_str(&format!(
+        "planned pairs         : {}\n",
+        alignment.pairs.len()
+    ));
+    output.push_str(&format!(
+        "unmatched reference   : {}\n",
+        alignment.unmatched_reference_indices.len()
+    ));
+    output.push_str(&format!(
+        "unmatched distorted   : {}\n",
+        alignment.unmatched_distorted_indices.len()
+    ));
+    output.push_str(&format!(
+        "timeline transform    : distorted * {:.12} {:+.12}s\n",
+        alignment.transform.scale, alignment.transform.offset_seconds
+    ));
+    output.push_str(&format!(
+        "mean signed residual  : {}\n",
+        format_optional_seconds(alignment.mean_signed_delta_seconds)
+    ));
+    output.push_str(&format!(
+        "mean absolute residual: {}\n",
+        format_optional_seconds(alignment.mean_absolute_delta_seconds)
+    ));
+    output.push_str(&format!(
+        "RMS residual          : {}\n",
+        format_optional_seconds(alignment.rms_delta_seconds)
+    ));
+    output.push_str(&format!(
+        "maximum residual      : {}\n",
+        format_optional_seconds(alignment.max_delta_seconds)
+    ));
+    output
+}
+
+#[cfg(feature = "ffmpeg")]
+fn format_optional_seconds(value: Option<f64>) -> String {
+    value.map_or_else(|| "n/a".to_string(), |value| format!("{value:.9}s"))
 }
 
 fn render_video_pair_text(report: &VideoFramePairComparisonReport) -> String {
@@ -2556,8 +4056,13 @@ fn bundle_info_csv_rows(report: &BundleInfoReport) -> Vec<BundleInfoCsvRow> {
         .collect()
 }
 
-fn comparison_csv_rows(report: &ComparisonReport) -> Vec<MetricCsvRow> {
-    metric_csv_rows(
+fn comparison_csv_rows(report: &ComparisonReport) -> Result<Vec<ComparisonCsvRow>> {
+    let gate_json = report
+        .gate
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    Ok(metric_csv_rows(
         &MetricCsvContext {
             report_kind: "image",
             reference: report.reference.clone().unwrap_or_default(),
@@ -2573,6 +4078,130 @@ fn comparison_csv_rows(report: &ComparisonReport) -> Vec<MetricCsvRow> {
         },
         &report.metrics,
     )
+    .into_iter()
+    .map(|row| ComparisonCsvRow {
+        report_kind: row.report_kind,
+        reference: row.reference,
+        distorted: row.distorted,
+        width: row.width,
+        height: row.height,
+        scope: row.scope,
+        frame_index: row.frame_index,
+        pts_seconds: row.pts_seconds,
+        pair_index: row.pair_index,
+        reference_frame_index: row.reference_frame_index,
+        distorted_frame_index: row.distorted_frame_index,
+        metric: row.metric,
+        score: row.score,
+        unit: row.unit,
+        direction: row.direction,
+        details_json: row.details_json,
+        gate_json: gate_json.clone(),
+    })
+    .collect())
+}
+
+fn suite_csv_rows(report: &imq::ComparisonSuiteReport) -> Vec<SuiteCsvRow> {
+    let reference = report.reference.clone().unwrap_or_default();
+    report
+        .candidates
+        .iter()
+        .flat_map(|candidate| {
+            if candidate.metrics.is_empty() {
+                return vec![SuiteCsvRow {
+                    reference: reference.clone(),
+                    candidate: candidate.label.clone(),
+                    candidate_passed: candidate.passed(),
+                    overall_rank: candidate.overall_rank,
+                    mean_rank: candidate.mean_rank,
+                    pareto_optimal: candidate.pareto_optimal,
+                    error: candidate.error.clone(),
+                    gate_json: candidate
+                        .gate
+                        .as_ref()
+                        .and_then(|gate| serde_json::to_string(gate).ok()),
+                    baseline_gate_json: candidate
+                        .baseline_gate
+                        .as_ref()
+                        .and_then(|gate| serde_json::to_string(gate).ok()),
+                    metric: None,
+                    score: None,
+                    unit: None,
+                    direction: None,
+                    metric_rank: None,
+                    baseline_delta: None,
+                    details_json: None,
+                }];
+            }
+            candidate
+                .metrics
+                .iter()
+                .map(|metric| SuiteCsvRow {
+                    reference: reference.clone(),
+                    candidate: candidate.label.clone(),
+                    candidate_passed: candidate.passed(),
+                    overall_rank: candidate.overall_rank,
+                    mean_rank: candidate.mean_rank,
+                    pareto_optimal: candidate.pareto_optimal,
+                    error: candidate.error.clone(),
+                    gate_json: candidate
+                        .gate
+                        .as_ref()
+                        .and_then(|gate| serde_json::to_string(gate).ok()),
+                    baseline_gate_json: candidate
+                        .baseline_gate
+                        .as_ref()
+                        .and_then(|gate| serde_json::to_string(gate).ok()),
+                    metric: Some(metric.name.clone()),
+                    score: Some(metric.score),
+                    unit: Some(metric.unit.clone()),
+                    direction: Some(format!("{:?}", metric.direction)),
+                    metric_rank: candidate.metric_ranks.get(&metric.name).copied(),
+                    baseline_delta: candidate.baseline_deltas.get(&metric.name).copied(),
+                    details_json: Some(
+                        imq::metric_details_to_json(&metric.details).unwrap_or_default(),
+                    ),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[cfg(feature = "gpu")]
+fn gpu_csv_rows(report: &GpuCliReport) -> Vec<GpuCsvRow> {
+    let mut rows = Vec::new();
+    for comparison in &report.comparisons {
+        if let Some(result) = &comparison.error_result {
+            for metric in &result.metrics {
+                rows.push(GpuCsvRow {
+                    reference: report.reference.clone(),
+                    candidate: comparison.candidate.clone(),
+                    execution: format!("{:?}", result.execution),
+                    fallback_reason: result.fallback_reason.clone(),
+                    metric: metric.name.clone(),
+                    score: metric.score,
+                    unit: metric.unit.clone(),
+                    direction: format!("{:?}", metric.direction),
+                    details_json: imq::metric_details_to_json(&metric.details).unwrap_or_default(),
+                });
+            }
+        }
+        if let Some(result) = &comparison.wssim_result {
+            let metric = &result.metric;
+            rows.push(GpuCsvRow {
+                reference: report.reference.clone(),
+                candidate: comparison.candidate.clone(),
+                execution: format!("{:?}", result.execution),
+                fallback_reason: result.fallback_reason.clone(),
+                metric: metric.name.clone(),
+                score: metric.score,
+                unit: metric.unit.clone(),
+                direction: format!("{:?}", metric.direction),
+                details_json: imq::metric_details_to_json(&metric.details).unwrap_or_default(),
+            });
+        }
+    }
+    rows
 }
 
 fn stats_csv_rows(report: &ImageStatsReport) -> Vec<StatsCsvRow> {
@@ -2615,9 +4244,13 @@ fn stats_csv_rows(report: &ImageStatsReport) -> Vec<StatsCsvRow> {
 }
 
 fn video_csv_rows(report: &VideoReport) -> Vec<MetricCsvRow> {
+    video_csv_rows_for_kind(report, "video")
+}
+
+fn video_csv_rows_for_kind(report: &VideoReport, report_kind: &'static str) -> Vec<MetricCsvRow> {
     let mean_rows = metric_csv_rows(
         &MetricCsvContext {
-            report_kind: "video",
+            report_kind,
             reference: report.reference.clone(),
             distorted: report.distorted.clone(),
             width: report.dimensions.width,
@@ -2634,7 +4267,7 @@ fn video_csv_rows(report: &VideoReport) -> Vec<MetricCsvRow> {
     let frame_rows = report.frames.iter().flat_map(|frame| {
         metric_csv_rows(
             &MetricCsvContext {
-                report_kind: "video",
+                report_kind,
                 reference: report.reference.clone(),
                 distorted: report.distorted.clone(),
                 width: report.dimensions.width,
@@ -2650,6 +4283,82 @@ fn video_csv_rows(report: &VideoReport) -> Vec<MetricCsvRow> {
         )
     });
     mean_rows.into_iter().chain(frame_rows).collect()
+}
+
+#[cfg(feature = "ffmpeg")]
+fn timestamp_video_csv_rows(report: &imq::video::TimestampVideoComparison) -> Vec<MetricCsvRow> {
+    let mut rows = video_csv_rows_for_kind(&report.video, "video_timestamp");
+    let alignment = &report.alignment;
+    let mut diagnostics = vec![
+        MetricOutput::new(
+            "alignment_planned_pairs",
+            alignment.pairs.len() as f64,
+            "frames",
+            imq::metrics::Direction::Neutral,
+        ),
+        MetricOutput::new(
+            "alignment_unmatched_reference_frames",
+            alignment.unmatched_reference_indices.len() as f64,
+            "frames",
+            imq::metrics::Direction::LowerIsBetter,
+        ),
+        MetricOutput::new(
+            "alignment_unmatched_distorted_frames",
+            alignment.unmatched_distorted_indices.len() as f64,
+            "frames",
+            imq::metrics::Direction::LowerIsBetter,
+        ),
+        MetricOutput::new(
+            "alignment_timestamp_scale",
+            alignment.transform.scale,
+            "ratio",
+            imq::metrics::Direction::Neutral,
+        ),
+        MetricOutput::new(
+            "alignment_timestamp_offset",
+            alignment.transform.offset_seconds,
+            "seconds",
+            imq::metrics::Direction::Neutral,
+        ),
+    ];
+    for (name, value) in [
+        (
+            "alignment_mean_signed_residual",
+            alignment.mean_signed_delta_seconds,
+        ),
+        (
+            "alignment_mean_absolute_residual",
+            alignment.mean_absolute_delta_seconds,
+        ),
+        ("alignment_rms_residual", alignment.rms_delta_seconds),
+        ("alignment_max_residual", alignment.max_delta_seconds),
+    ] {
+        if let Some(value) = value {
+            diagnostics.push(MetricOutput::new(
+                name,
+                value,
+                "seconds",
+                imq::metrics::Direction::LowerIsBetter,
+            ));
+        }
+    }
+    rows.extend(metric_csv_rows(
+        &MetricCsvContext {
+            report_kind: "video_timestamp",
+            reference: report.video.reference.clone(),
+            distorted: report.video.distorted.clone(),
+            width: report.video.dimensions.width,
+            height: report.video.dimensions.height,
+            scope: "alignment",
+            frame_index: None,
+            pts_seconds: None,
+            pair_index: None,
+            reference_frame_index: None,
+            distorted_frame_index: None,
+        },
+        &diagnostics,
+    ));
+    rows
 }
 
 fn video_pair_csv_rows(report: &VideoFramePairComparisonReport) -> Vec<MetricCsvRow> {
@@ -2709,7 +4418,7 @@ fn metric_csv_rows(ctx: &MetricCsvContext, metrics: &[MetricOutput]) -> Vec<Metr
             score: metric.score,
             unit: metric.unit.clone(),
             direction: format!("{:?}", metric.direction),
-            details_json: serde_json::to_string(&metric.details).unwrap_or_default(),
+            details_json: imq::metric_details_to_json(&metric.details).unwrap_or_default(),
         })
         .collect()
 }
@@ -2718,13 +4427,14 @@ fn write_sqlite_report(path: Option<&Path>, report: SqlReport<'_>) -> Result<()>
     let Some(path) = path else {
         return Ok(());
     };
-    let conn = open_sqlite(path)?;
+    let mut conn = open_sqlite(path)?;
     init_sqlite(&conn)?;
+    let tx = conn.transaction()?;
     match report {
         SqlReport::Image(report) => {
             let payload = serde_json::to_string(report)?;
             let report_id = insert_sqlite_report(
-                &conn,
+                &tx,
                 &SqlReportInsert {
                     kind: "image",
                     reference: report.reference.as_deref(),
@@ -2735,12 +4445,12 @@ fn write_sqlite_report(path: Option<&Path>, report: SqlReport<'_>) -> Result<()>
                     payload_json: &payload,
                 },
             )?;
-            insert_sqlite_metrics(&conn, report_id, "image", None, None, &report.metrics)?;
+            insert_sqlite_metrics(&tx, report_id, "image", None, None, &report.metrics)?;
         }
         SqlReport::Video(report) => {
             let payload = serde_json::to_string(report)?;
             let report_id = insert_sqlite_report(
-                &conn,
+                &tx,
                 &SqlReportInsert {
                     kind: "video",
                     reference: Some(&report.reference),
@@ -2751,10 +4461,10 @@ fn write_sqlite_report(path: Option<&Path>, report: SqlReport<'_>) -> Result<()>
                     payload_json: &payload,
                 },
             )?;
-            insert_sqlite_metrics(&conn, report_id, "mean", None, None, &report.mean_metrics)?;
+            insert_sqlite_metrics(&tx, report_id, "mean", None, None, &report.mean_metrics)?;
             for frame in &report.frames {
                 insert_sqlite_metrics(
-                    &conn,
+                    &tx,
                     report_id,
                     "frame",
                     Some(sql_u64(frame.frame_index)),
@@ -2763,10 +4473,92 @@ fn write_sqlite_report(path: Option<&Path>, report: SqlReport<'_>) -> Result<()>
                 )?;
             }
         }
+        SqlReport::TimestampVideo(report) => {
+            let payload = serde_json::to_string(report)?;
+            let video = &report.video;
+            let report_id = insert_sqlite_report(
+                &tx,
+                &SqlReportInsert {
+                    kind: "video_timestamp",
+                    reference: Some(&video.reference),
+                    distorted: Some(&video.distorted),
+                    width: video.dimensions.width,
+                    height: video.dimensions.height,
+                    compared_frames: Some(sql_u64(video.compared_frames)),
+                    payload_json: &payload,
+                },
+            )?;
+            insert_sqlite_metrics(&tx, report_id, "mean", None, None, &video.mean_metrics)?;
+            for frame in &video.frames {
+                insert_sqlite_metrics(
+                    &tx,
+                    report_id,
+                    "frame",
+                    Some(sql_u64(frame.frame_index)),
+                    frame.pts_seconds,
+                    &frame.metrics,
+                )?;
+            }
+            let alignment = &report.alignment;
+            let mut diagnostics = vec![
+                MetricOutput::new(
+                    "alignment_planned_pairs",
+                    alignment.pairs.len() as f64,
+                    "frames",
+                    imq::metrics::Direction::Neutral,
+                ),
+                MetricOutput::new(
+                    "alignment_unmatched_reference_frames",
+                    alignment.unmatched_reference_indices.len() as f64,
+                    "frames",
+                    imq::metrics::Direction::LowerIsBetter,
+                ),
+                MetricOutput::new(
+                    "alignment_unmatched_distorted_frames",
+                    alignment.unmatched_distorted_indices.len() as f64,
+                    "frames",
+                    imq::metrics::Direction::LowerIsBetter,
+                ),
+                MetricOutput::new(
+                    "alignment_timestamp_scale",
+                    alignment.transform.scale,
+                    "ratio",
+                    imq::metrics::Direction::Neutral,
+                ),
+                MetricOutput::new(
+                    "alignment_timestamp_offset",
+                    alignment.transform.offset_seconds,
+                    "seconds",
+                    imq::metrics::Direction::Neutral,
+                ),
+            ];
+            for (name, value) in [
+                (
+                    "alignment_mean_signed_residual",
+                    alignment.mean_signed_delta_seconds,
+                ),
+                (
+                    "alignment_mean_absolute_residual",
+                    alignment.mean_absolute_delta_seconds,
+                ),
+                ("alignment_rms_residual", alignment.rms_delta_seconds),
+                ("alignment_max_residual", alignment.max_delta_seconds),
+            ] {
+                if let Some(value) = value {
+                    diagnostics.push(MetricOutput::new(
+                        name,
+                        value,
+                        "seconds",
+                        imq::metrics::Direction::LowerIsBetter,
+                    ));
+                }
+            }
+            insert_sqlite_metrics(&tx, report_id, "alignment", None, None, &diagnostics)?;
+        }
         SqlReport::VideoPairs(report) => {
             let payload = serde_json::to_string(report)?;
             let report_id = insert_sqlite_report(
-                &conn,
+                &tx,
                 &SqlReportInsert {
                     kind: "video_pairs",
                     reference: Some(&report.reference),
@@ -2777,10 +4569,10 @@ fn write_sqlite_report(path: Option<&Path>, report: SqlReport<'_>) -> Result<()>
                     payload_json: &payload,
                 },
             )?;
-            insert_sqlite_metrics(&conn, report_id, "mean", None, None, &report.mean_metrics)?;
+            insert_sqlite_metrics(&tx, report_id, "mean", None, None, &report.mean_metrics)?;
             for pair in &report.pairs {
                 insert_sqlite_metrics(
-                    &conn,
+                    &tx,
                     report_id,
                     "pair",
                     Some(sql_u64(pair.label_frame_index.unwrap_or(pair.pair_index))),
@@ -2790,6 +4582,7 @@ fn write_sqlite_report(path: Option<&Path>, report: SqlReport<'_>) -> Result<()>
             }
         }
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -2807,10 +4600,10 @@ fn write_sqlite_probe(path: Option<&Path>, report: &ProbeReport) -> Result<()> {
             report.input.as_str(),
             i64::from(report.info.width),
             i64::from(report.info.height),
-            report.info.avg_frame_rate,
+            sqlite_optional_f64(report.info.avg_frame_rate),
             report.info.nb_frames.map(sql_u64),
             report.info.codec_name.as_deref(),
-            report.info.duration_seconds,
+            sqlite_optional_f64(report.info.duration_seconds),
             serde_json::to_string(report)?,
         ],
     )?;
@@ -2967,16 +4760,32 @@ fn insert_sqlite_metrics(
                 report_id,
                 scope,
                 frame_index,
-                pts_seconds,
+                sqlite_optional_f64(pts_seconds),
                 metric.name.as_str(),
-                metric.score,
+                sqlite_f64(metric.score),
                 metric.unit.as_str(),
                 format!("{:?}", metric.direction),
-                serde_json::to_string(&metric.details)?,
+                imq::metric_details_to_json(&metric.details)?,
             ],
         )?;
     }
     Ok(())
+}
+
+fn sqlite_f64(value: f64) -> rusqlite::types::Value {
+    if value.is_finite() {
+        rusqlite::types::Value::Real(value)
+    } else if value.is_nan() {
+        rusqlite::types::Value::Text("NaN".to_string())
+    } else if value.is_sign_positive() {
+        rusqlite::types::Value::Text("Infinity".to_string())
+    } else {
+        rusqlite::types::Value::Text("-Infinity".to_string())
+    }
+}
+
+fn sqlite_optional_f64(value: Option<f64>) -> rusqlite::types::Value {
+    value.map_or(rusqlite::types::Value::Null, sqlite_f64)
 }
 
 fn sql_u64(value: u64) -> i64 {
@@ -4079,10 +5888,10 @@ mod tui_app {
                         app.status = format!("Target: {}", app.active_slot.label());
                     }
                     KeyCode::Char(' ') => {
-                        if let Some(entry) = app.entries.get(app.selected).cloned() {
-                            if entry.is_image {
-                                app.toggle_target(entry.path);
-                            }
+                        if let Some(entry) = app.entries.get(app.selected).cloned()
+                            && entry.is_image
+                        {
+                            app.toggle_target(entry.path);
                         }
                     }
                     KeyCode::Char('r') => app.set_slot(Slot::Reference),
@@ -4783,10 +6592,10 @@ mod tui_app {
             return Ok(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
         }
         let candidate = reference.or(distorted);
-        if let Some(path) = candidate.and_then(Path::parent) {
-            if !path.as_os_str().is_empty() {
-                return Ok(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
-            }
+        if let Some(path) = candidate.and_then(Path::parent)
+            && !path.as_os_str().is_empty()
+        {
+            return Ok(path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
         }
         std::env::current_dir().context("failed to get current directory")
     }
@@ -4801,20 +6610,18 @@ mod tui_app {
     ) -> Result<Vec<FileEntry>> {
         let mut entries = Vec::new();
         let mut parent_added = false;
-        if show_dirs {
-            if let Some(parent) = cwd.parent() {
-                entries.push(FileEntry {
-                    path: parent.to_path_buf(),
-                    name: "..".to_string(),
-                    is_dir: true,
-                    is_image: false,
-                    is_video: false,
-                    is_other: false,
-                    extension: None,
-                    modified: None,
-                });
-                parent_added = true;
-            }
+        if show_dirs && let Some(parent) = cwd.parent() {
+            entries.push(FileEntry {
+                path: parent.to_path_buf(),
+                name: "..".to_string(),
+                is_dir: true,
+                is_image: false,
+                is_video: false,
+                is_other: false,
+                extension: None,
+                modified: None,
+            });
+            parent_added = true;
         }
         for item in
             fs::read_dir(cwd).with_context(|| format!("failed to read {}", cwd.display()))?

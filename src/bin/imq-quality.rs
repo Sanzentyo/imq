@@ -5,8 +5,12 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use imq::adapters::image_crate;
 use imq::diff::{DiffImageMode, DiffImageOptions, diff_image};
 use imq::external::ExternalMetricCommand;
-use imq::gate::{MetricThresholdRule, evaluate_thresholds};
+use imq::gate::{
+    BaselineThresholdRule, MetricThresholdRule, evaluate_baseline_thresholds, evaluate_thresholds,
+};
 use imq::metrics::{Direction, MetricSet};
+use imq::report::QualityGateReport;
+use std::fs;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -54,15 +58,22 @@ struct GateCmd {
     reference: PathBuf,
     /// Distorted/test still image.
     distorted: PathBuf,
+    /// Previous/baseline candidate compared against the same reference.
+    #[arg(long)]
+    baseline: Option<PathBuf>,
     /// Comma-separated metric list.
     #[arg(short, long, default_value = "psnr,ssim,wssim,ms-ssim,mse,mae,maxae")]
     metrics: String,
-    /// Threshold rule such as psnr>=40 or mae<=0.01. Repeat for multiple gates.
+    /// Threshold rule such as psnr>=40, mae:color.red_mae<=0.01, or psnr>=baseline-0.5.
+    /// Repeat for multiple gates. Baseline expressions require --baseline.
     #[arg(long = "rule", required = true)]
     rules: Vec<String>,
     /// Print JSON instead of text.
     #[arg(short, long)]
     json: bool,
+    /// Write a full structured JSON report including metrics and gate decisions.
+    #[arg(long)]
+    report: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -162,27 +173,105 @@ fn run_gate(command: GateCmd) -> Result<()> {
         .with_context(|| format!("failed to load {}", command.distorted.display()))?;
     let metric_set = MetricSet::from_csv(&command.metrics)?;
     let outputs = metric_set.compare(&reference.as_view(), &distorted.as_view())?;
-    let rules = command
-        .rules
-        .iter()
-        .map(|rule| MetricThresholdRule::parse(rule))
-        .collect::<imq::Result<Vec<_>>>()?;
-    let evaluation = evaluate_thresholds(&outputs, &rules);
+    let (absolute_rules, baseline_rules) = parse_gate_rules(&command.rules)?;
+    if !baseline_rules.is_empty() && command.baseline.is_none() {
+        bail!("baseline-relative rules require --baseline PATH")
+    }
+    let evaluation = evaluate_thresholds(&outputs, &absolute_rules);
+
+    let (baseline_label, baseline_format, baseline_outputs, baseline_evaluation) =
+        if let Some(path) = command
+            .baseline
+            .as_ref()
+            .filter(|_| !baseline_rules.is_empty())
+        {
+            let baseline = image_crate::load_image_path(path)
+                .with_context(|| format!("failed to load baseline {}", path.display()))?;
+            let baseline_outputs = metric_set.compare(&reference.as_view(), &baseline.as_view())?;
+            let baseline_evaluation =
+                evaluate_baseline_thresholds(&outputs, &baseline_outputs, &baseline_rules);
+            (
+                Some(path.display().to_string()),
+                Some(baseline.format()),
+                Some(baseline_outputs),
+                Some(baseline_evaluation),
+            )
+        } else {
+            (None, None, None, None)
+        };
+
+    let mut report = QualityGateReport::new(
+        command.reference.display().to_string(),
+        command.distorted.display().to_string(),
+        reference.dimensions(),
+        reference.format(),
+        distorted.format(),
+        outputs,
+        evaluation,
+    );
+    if let (Some(label), Some(format), Some(metrics), Some(evaluation)) = (
+        baseline_label,
+        baseline_format,
+        baseline_outputs,
+        baseline_evaluation,
+    ) {
+        report = report.with_baseline(label, format, metrics, evaluation);
+    }
+
+    if let Some(path) = &command.report {
+        fs::write(path, report.to_json_pretty()?)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
 
     if command.json {
-        println!("{}", serde_json::to_string_pretty(&evaluation)?);
+        if report.baseline_thresholds.is_some() {
+            println!("{}", report.to_json_pretty()?);
+        } else {
+            // Preserve the original JSON shape for absolute-only invocations.
+            println!("{}", serde_json::to_string_pretty(&report.thresholds)?);
+        }
     } else {
-        for check in &evaluation.checks {
+        for check in &report.thresholds.checks {
             let status = if check.passed { "PASS" } else { "FAIL" };
             println!("{status}: {}", check.message);
         }
+        if let Some(evaluation) = &report.baseline_thresholds {
+            for check in &evaluation.checks {
+                let status = if check.passed { "PASS" } else { "FAIL" };
+                println!("{status}: {}", check.message);
+            }
+        }
+        if let Some(path) = &command.report {
+            println!("wrote {}", path.display());
+        }
     }
 
-    if evaluation.passed {
+    if report.passed {
         Ok(())
     } else {
         bail!("quality gate failed")
     }
+}
+
+fn parse_gate_rules(
+    rules: &[String],
+) -> Result<(Vec<MetricThresholdRule>, Vec<BaselineThresholdRule>)> {
+    let mut absolute = Vec::new();
+    let mut baseline = Vec::new();
+    for rule in rules {
+        if rule_rhs(rule).is_some_and(|value| value.trim_start().starts_with("baseline")) {
+            baseline.push(BaselineThresholdRule::parse(rule)?);
+        } else {
+            absolute.push(MetricThresholdRule::parse(rule)?);
+        }
+    }
+    Ok((absolute, baseline))
+}
+
+fn rule_rhs(rule: &str) -> Option<&str> {
+    [">=", "<=", ">", "<"]
+        .into_iter()
+        .find_map(|operator| rule.split_once(operator).map(|(_, rhs)| rhs))
 }
 
 fn run_external(command: ExternalCmd) -> Result<()> {
@@ -202,4 +291,90 @@ fn run_external(command: ExternalCmd) -> Result<()> {
         print!("{}", run.stdout);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{Rgb, RgbImage};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn gate_cli_accepts_baseline_rules_and_report_path() {
+        let cli = Cli::try_parse_from([
+            "imq-quality",
+            "gate",
+            "reference.png",
+            "candidate.png",
+            "--baseline",
+            "previous.png",
+            "--rule",
+            "psnr>=baseline-0.5",
+            "--report",
+            "gate.json",
+        ])
+        .unwrap();
+        let Command::Gate(gate) = cli.command else {
+            panic!("expected gate command");
+        };
+        assert_eq!(gate.baseline, Some(PathBuf::from("previous.png")));
+        assert_eq!(gate.report, Some(PathBuf::from("gate.json")));
+    }
+
+    #[test]
+    fn partitions_absolute_and_baseline_rules() {
+        let rules = vec![
+            "ssim>=0.99".to_string(),
+            "mae:color.red_mae<=baseline*1.05".to_string(),
+        ];
+        let (absolute, baseline) = parse_gate_rules(&rules).unwrap();
+        assert_eq!(absolute.len(), 1);
+        assert_eq!(baseline.len(), 1);
+        assert_eq!(baseline[0].metric, "mae:color.red_mae");
+    }
+
+    #[test]
+    fn gate_writes_full_relative_report() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "imq-quality-report-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let reference = directory.join("reference.png");
+        let candidate = directory.join("candidate.png");
+        let baseline = directory.join("baseline.png");
+        let report = directory.join("report.json");
+        RgbImage::from_pixel(1, 1, Rgb([0, 0, 0]))
+            .save(&reference)
+            .unwrap();
+        RgbImage::from_pixel(1, 1, Rgb([11, 11, 11]))
+            .save(&candidate)
+            .unwrap();
+        RgbImage::from_pixel(1, 1, Rgb([10, 10, 10]))
+            .save(&baseline)
+            .unwrap();
+
+        run_gate(GateCmd {
+            reference,
+            distorted: candidate,
+            baseline: Some(baseline),
+            metrics: "mae:color".to_string(),
+            rules: vec!["mae:color.abs_error_p99<=baseline*1.2".to_string()],
+            json: false,
+            report: Some(report.clone()),
+        })
+        .unwrap();
+
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&report).unwrap()).unwrap();
+        assert_eq!(value["passed"], true);
+        assert_eq!(value["dimensions"]["width"], 1);
+        assert_eq!(value["candidate_format"]["pixel_format"], "Rgba8");
+        assert_eq!(value["candidate_metrics"][0]["name"], "mae:color");
+        assert_eq!(value["baseline_thresholds"]["checks"][0]["passed"], true);
+        fs::remove_dir_all(directory).unwrap();
+    }
 }
